@@ -1,0 +1,6 @@
+url: https://github.com/momo20012002/dsh-hmos-emulator
+name: momo20012002/dsh-hmos-emulator
+category: ui
+description:
+  en: 'A DSH better-sidebar tab that launches the HarmonyOS emulator, picks a HarmonyOS app project, and builds and deploys it to the emulator.'
+  zh: 'DSH better-sidebar 标签页:一键启动鸿蒙模拟器、构建并部署 HarmonyOS 应用到模拟器。'
