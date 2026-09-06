@@ -1,5 +1,3 @@
-// @ts-nocheck
-/* eslint-disable */
 /**
  * dsh-hmos-emulator — 宿主端(half)。
  *
@@ -20,6 +18,12 @@ import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
+
+/** 轻量 cordis 上下文类型:仅声明本插件用到的能力,避免依赖整个 DSH 类型图。 */
+export interface Ctx {
+  get(name: string): any
+  effect(callback: () => any, label?: string): void
+}
 
 export const name = 'dsh-hmos-emulator'
 
@@ -122,7 +126,7 @@ function resolveHdc() {
  * - spawn 层面失败(EPERM/ENOENT 等)在 output 中给出可读原因,code 为 null;
  * - 超时后杀掉进程树并标记 timedOut(模拟器冷启动/长构建常见)。
  */
-function runCli(argv, { cwd, timeoutMs = 120000 } = {}) {
+function runCli(argv: string[], { cwd, timeoutMs = 120000 }: { cwd?: string; timeoutMs?: number } = {}): Promise<{ code: number | null; timedOut: boolean; output: string }> {
   return new Promise((resolvePromise) => {
     let child
     try {
@@ -234,7 +238,7 @@ function scanProjects(root, maxDepth = 3) {
 // ── API 方法实现 ────────────────────────────────────────────────────────
 
 function createApi(config) {
-  const api = {}
+  const api: Record<string, (payload?: any) => Promise<any>> = {}
 
   api.toolchain = async () => {
     const sdk = process.env.DEVECO_SDK_HOME || config?.sdkHome || ''
@@ -376,7 +380,7 @@ function createApi(config) {
 
 // ── 路由装配 ────────────────────────────────────────────────────────────
 
-function readBody(req) {
+function readBody(req: any): Promise<string> {
   return new Promise((resolveBody, rejectBody) => {
     const chunks = []
     req.on('data', (chunk) => {
@@ -408,17 +412,17 @@ function writeError(res, error) {
   writeJson(res, status, { ok: false, error: { code, message } })
 }
 
-export function apply(ctx, config) {
+export function apply(ctx: Ctx, config?: any) {
   // 隔离:宿主 apply 的任何异常都只打日志,绝不抛出,避免中断 DSH composition 加载。
   try {
     const api = createApi(config ?? {})
     let registered = false
-    let timer = null
+    let timer: ReturnType<typeof setTimeout> | null = null
     let disposed = false
     const registerOnce = () => {
       if (disposed || registered) return
       try {
-        const ws = ctx.get('webServer')
+        const ws = ctx.get('webServer') as any
         if (ws === undefined || typeof ws.register !== 'function') {
           // 非阻塞等待:webServer 尚未就绪则稍后重试,绝不阻塞/中断启动链。
           timer = setTimeout(registerOnce, 700)

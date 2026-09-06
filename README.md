@@ -70,6 +70,8 @@ pnpm install
 
 改 `src/` 源码后,在插件目录执行 `pnpm install && pnpm build`(或 `node scripts/build.mjs`)重新生成 `lib/`。构建脚本用 esbuild 把客户端产物自动包成 `window.__ModuleLoader__.load` 形态——**不要手改为裸 ESM**(否则会被 client-modules loader 整链拒绝,报 `loaded without registering … via __ModuleLoader__.load`)。
 
+源码用 **TypeScript** 编写并带类型:宿主与客户端各用一个**本地轻量 `Ctx` 类型**(仅声明用到的 `get`/`effect`),避免为独立仓库引入整个 DSH 类型图(`@deepseek-ai/cordis`、`@types/react` 等),因此在任意环境 `pnpm install` 后 `pnpm typecheck`(tsc)即可通过,无需 `@ts-nocheck`。
+
 因 bundle 走 profile 的 link 依赖,改完需在 profile 目录 `pnpm install`(重建 link)并硬刷新浏览器;仅宿主侧改动需重启 `dsh web`。类型检查 `pnpm typecheck`(tsc),测试 `pnpm test`(vitest)。
 
 目录结构:

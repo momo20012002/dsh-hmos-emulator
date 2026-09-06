@@ -1,5 +1,5 @@
-// @ts-nocheck
 /* eslint-disable */
+    interface Ctx { get(name: string): any; effect(callback: () => any, label?: string): void }
     const { createElement: h, useEffect, useRef, useState } = require('react')
 
     // ── iconfont 图标(内联 SVG;渲染时统一 fill→currentColor 取主题色) ──
@@ -18,7 +18,7 @@
 
     const API = '/dsh-hmos-emulator/api'
 
-    async function rpc(method, body) {
+    async function rpc(method: string, body?: any) {
       let res
       try {
         res = await fetch(`${API}/${method}`, {
@@ -75,7 +75,7 @@
     })
 
     /** 内联 SVG 图标:统一取 currentColor,跟随主题。 */
-    function Icon({ src, size = 16 }) {
+    function Icon({ src, size = 16 }: { src: string; size?: number }) {
       const body = String(src).replace(/fill="[^"]*"/g, 'fill="currentColor"')
       return h('span', {
         style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: size, height: size, flex: '0 0 auto' },
@@ -83,7 +83,9 @@
       })
     }
     /** 带图标的按钮。 */
-    function Btn({ children, icon, primary, secondary, danger, ghost, disabled, onClick, style, title }) {
+    function Btn({ children, icon, primary, secondary, danger, ghost, disabled, onClick, style, title }: {
+      children?: any; icon?: string; primary?: boolean; secondary?: boolean; danger?: boolean; ghost?: boolean; disabled?: boolean; onClick?: any; style?: any; title?: string
+    }) {
       const base = primary ? btnPrimary : secondary ? btnSecondary : danger ? btnDanger : ghost ? btnGhost : btnSecondary
       return h('button', {
         style: { ...base, ...style, ...(disabled ? { opacity: .5, cursor: 'not-allowed' } : undefined) },
@@ -91,14 +93,16 @@
       }, icon ? h(Icon, { src: icon, size: 15 }) : null, children)
     }
     /** 区块卡片。 */
-    function Card({ title, children }) {
+    function Card({ title, children }: { title?: string; children?: any }) {
       return h('div', { style: card },
         title ? h('div', { style: { fontSize: 11, color: s.muted, letterSpacing: '.06em', textTransform: 'uppercase', marginBottom: 8 } }, title) : null,
         children)
     }
 
     /** 主题化下拉框:默认收起,点按钮打开;选项走深色主题,不出现原生白底。 */
-    function Dropdown({ value, placeholder, options, onChange }) {
+    function Dropdown({ value, placeholder, options, onChange }: {
+      value?: string; placeholder?: string; options?: { value: string; label: string; status?: string }[]; onChange?: (v: string) => void
+    }) {
       const [open, setOpen] = useState(false)
       const current = options.find((o) => o.value === value)
       return h('div', { style: { position: 'relative', flex: 1, minWidth: 0 } },
@@ -132,7 +136,7 @@
       )
     }
 
-    function Panel(props) {
+    function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx: Ctx }) {
       const { scope, ctx } = props
       const [tc, setTc] = useState(null)
       const [tcMsg, setTcMsg] = useState('')
@@ -427,7 +431,7 @@
       return h('div', { style: { padding: 8, color: s.fg } }, nodes)
     }
 
-    function apply(ctx) {
+    function apply(ctx: Ctx) {
       // 隔离:客户端 apply 的任何异常只打日志、绝不抛出,避免影响 DSH client loader。
       let disposed = false
       let registered = false

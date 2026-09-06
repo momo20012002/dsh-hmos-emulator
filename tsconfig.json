@@ -1,13 +1,14 @@
 {
   "compilerOptions": {
     "target": "ES2020",
+    "lib": ["ES2020", "DOM"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "strict": false,
     "skipLibCheck": true,
     "noEmit": true,
     "esModuleInterop": true,
-    "types": []
+    "types": ["node"]
   },
   "include": ["src", "test", "scripts"]
 }
