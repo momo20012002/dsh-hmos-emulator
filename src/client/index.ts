@@ -136,8 +136,8 @@
       )
     }
 
-    function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx: Ctx; visible?: boolean }) {
-      const { scope, ctx, visible = true } = props
+    function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx: Ctx }) {
+      const { scope, ctx } = props
       const [tc, setTc] = useState(null)
       const [tcMsg, setTcMsg] = useState('')
       const [project, setProject] = useState('')
@@ -211,27 +211,6 @@
         refresh()
       }, [])
 
-      // 模拟器可用时自动刷新设备:仅标签可见时每 8s 静默轮询,选中模拟器上线后自动选中。
-      const devRef = useRef({ device, instanceSel, instances })
-      useEffect(() => { devRef.current = { device, instanceSel, instances } }, [device, instanceSel, instances])
-      useEffect(() => {
-        if (!visible) return
-        const id = setInterval(async () => {
-          try {
-            const dev = await rpc('devices')
-            const list = dev.devices || []
-            setDevices(list)
-            const { device: cur, instanceSel: sel, instances } = devRef.current
-            const selSerial = sel ? instances.find((it) => it.name === sel)?.serial : undefined
-            if (list.length === 1 && !cur) setDevice(list[0])
-            else if (selSerial && list.includes(selSerial)) setDevice(selSerial)
-          } catch {
-            /* 静默:轮询失败不打扰 */
-          }
-        }, 8000)
-        return () => clearInterval(id)
-      }, [visible])
-
       // ── 应用工程选择 ─────────────────────────────────────────────────
       // 直接调用系统/宿主原生目录选择框。
       const pickNative = async () => {
@@ -280,12 +259,20 @@
         if (busy === 'scan') return
         setBusy('scan')
         try {
-          const v = await rpc('emu.list')
-          setInstances(v.instances || [])
+          const [v, dev] = await Promise.all([rpc('emu.list'), rpc('devices')])
+          const list = v.instances || []
+          setInstances(list)
           setEmuRaw(v.raw || '')
-          const first = (v.instances || [])[0]
+          const first = list[0]
+          const selName = instanceSel || (first ? first.name : '')
           if (first) setInstanceSel((prev) => prev || first.name)
           else pushLog('info', '未扫描到可用模拟器实例(可在 DevEco Device Manager 创建;若报授权请先在终端执行 devecocli emulator license accept)')
+          // 扫描也可用:同时刷新在线设备,并按选中模拟器自动选中其串号。
+          const devList = dev.devices || []
+          setDevices(devList)
+          const selSerial = list.find((it) => it.name === selName)?.serial
+          if (devList.length === 1 && !device) setDevice(devList[0])
+          else if (selSerial && devList.includes(selSerial)) setDevice(selSerial)
         } catch (error) {
           pushLog('err', `扫描失败:${error.message}`)
         } finally {
@@ -477,7 +464,7 @@
             icon: (size) => h(Icon, { src: IC.emulator, size: size || 16 }),
             order: 55,
             single: true,
-            component: (props) => h(Panel, { scope: props.scope, ctx, visible: props.visible }),
+            component: (props) => h(Panel, { scope: props.scope, ctx }),
           }), 'dsh-hmos-emulator: register tab')
         } catch (error) {
           console.error('[dsh-hmos-emulator] 客户端注册异常(已隔离,不影响 DSH):', error)
