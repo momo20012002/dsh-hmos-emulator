@@ -193,7 +193,6 @@
           setInstances(emu.instances || [])
           setInstanceSel((prev) => prev || ((emu.instances || [])[0]?.name || ''))
           setDevices(dev.devices || [])
-          setDevRaw(dev.raw || '')
           setScanRoot((prev) => prev || (scope && scope.cwd) || '')
           if (!device && dev.devices && dev.devices.length === 1) setDevice(dev.devices[0])
           pushLog('info', '已刷新:工具链就绪' + (toolchain.devecoCliJs ? '' : '(devecocli 未找到)'))
