@@ -2,6 +2,13 @@
 
 本文件记录 dsh-hmos-emulator 的有意义变更,遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [Semantic Versioning](https://semver.org/)。
 
+## [0.1.1] - 2026-09-07
+
+### Added
+
+- 面板顶部工具链缺失提醒横幅:未检测到 devecocli / hdc 时醒目提示 & 引导安装。
+- 「一键安装 devecocli」按钮(宿主执行 `npm i -g @deveco/deveco-cli`,成功后自动重新检测工具链)。
+
 ## [0.1.0] - 2026-09-07
 
 ### Added
