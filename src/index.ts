@@ -409,57 +409,66 @@ function writeError(res, error) {
 }
 
 export function apply(ctx, config) {
-  const api = createApi(config ?? {})
-  let registered = false
-  let timer = null
-  let disposed = false
-  const registerOnce = () => {
-    if (disposed || registered) return
-    const ws = ctx.get('webServer')
-    if (ws === undefined || typeof ws.register !== 'function') {
-      // 非阻塞等待:webServer 尚未就绪则稍后重试,绝不阻塞/中断启动链。
-      timer = setTimeout(registerOnce, 700)
-      return
-    }
-    registered = true
-    ctx.effect(() => ws.register({
-      kind: 'prefix',
-      path: API_PREFIX,
-      handler: async (req, res) => {
-        try {
-          if (req.method !== 'POST') {
-            writeJson(res, 405, { ok: false, error: { code: 'method', message: 'only POST' } })
-            return
-          }
-          const pathname = new URL(req.url ?? '/', 'http://dsh.internal').pathname
-          const method = pathname.slice(API_PREFIX.length).replace(/^\/+/, '').replace(/\/+$/, '')
-          const handler = METHODS.has(method) ? api[method] : undefined
-          if (handler === undefined) {
-            writeJson(res, 404, { ok: false, error: { code: 'not-found', message: `unknown method ${method}` } })
-            return
-          }
-          let payload = {}
-          const text = await readBody(req)
-          if (text.trim()) {
-            try {
-              payload = JSON.parse(text)
-            } catch {
-              writeJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'body is not valid JSON' } })
-              return
-            }
-          }
-          const value = await handler(payload)
-          writeOk(res, value)
-        } catch (error) {
-          writeError(res, error)
+  // 隔离:宿主 apply 的任何异常都只打日志,绝不抛出,避免中断 DSH composition 加载。
+  try {
+    const api = createApi(config ?? {})
+    let registered = false
+    let timer = null
+    let disposed = false
+    const registerOnce = () => {
+      if (disposed || registered) return
+      try {
+        const ws = ctx.get('webServer')
+        if (ws === undefined || typeof ws.register !== 'function') {
+          // 非阻塞等待:webServer 尚未就绪则稍后重试,绝不阻塞/中断启动链。
+          timer = setTimeout(registerOnce, 700)
+          return
         }
-      },
-    }), 'dsh-hmos-emulator: http api')
+        registered = true
+        ctx.effect(() => ws.register({
+          kind: 'prefix',
+          path: API_PREFIX,
+          handler: async (req, res) => {
+            try {
+              if (req.method !== 'POST') {
+                writeJson(res, 405, { ok: false, error: { code: 'method', message: 'only POST' } })
+                return
+              }
+              const pathname = new URL(req.url ?? '/', 'http://dsh.internal').pathname
+              const method = pathname.slice(API_PREFIX.length).replace(/^\/+/, '').replace(/\/+$/, '')
+              const handler = METHODS.has(method) ? api[method] : undefined
+              if (handler === undefined) {
+                writeJson(res, 404, { ok: false, error: { code: 'not-found', message: `unknown method ${method}` } })
+                return
+              }
+              let payload = {}
+              const text = await readBody(req)
+              if (text.trim()) {
+                try {
+                  payload = JSON.parse(text)
+                } catch {
+                  writeJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'body is not valid JSON' } })
+                  return
+                }
+              }
+              const value = await handler(payload)
+              writeOk(res, value)
+            } catch (error) {
+              writeError(res, error)
+            }
+          },
+        }), 'dsh-hmos-emulator: http api')
+      } catch (error) {
+        console.error('[dsh-hmos-emulator] 宿主路由注册异常(已隔离,不影响 DSH):', error)
+      }
+    }
+    registerOnce()
+    // 卸载时停止等待/清理已注册资源。
+    ctx.effect(() => () => {
+      disposed = true
+      if (timer) clearTimeout(timer)
+    })
+  } catch (error) {
+    console.error('[dsh-hmos-emulator] 宿主 apply 异常(已隔离,不影响 DSH 启动):', error)
   }
-  registerOnce()
-  // 卸载时停止等待/清理已注册资源。
-  ctx.effect(() => () => {
-    disposed = true
-    if (timer) clearTimeout(timer)
-  })
 }

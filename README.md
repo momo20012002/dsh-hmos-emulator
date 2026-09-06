@@ -93,6 +93,14 @@ dsh-hmos-emulator/
 └─ .gitignore
 ```
 
+## 稳定性(崩溃隔离)
+
+本插件做了**崩溃隔离**,保证即使自身出问题也**不影响 DeepSeek Harness 正常启动与运行**:
+
+- 宿主/客户端 `apply()` 全部包在 `try/catch` 里:任何异常只打印日志、绝不抛出,避免中断 DSH 的 composition / client loader 加载链。
+- 不使用硬依赖注入(`inject`)阻塞加载:宿主等待 `webServer`、客户端等待 `betterSidebar` 均用**非阻塞轮询**(服务就绪后才注册,缺失时静默等待/停止),绝不阻塞或拖垮启动。
+- HTTP 路由处理器已捕获所有异常并以统一错误信封返回,单次请求失败不影响其它功能。
+
 ## License
 
 MIT

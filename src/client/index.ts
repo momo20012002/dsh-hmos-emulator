@@ -427,21 +427,35 @@
       return h('div', { style: { padding: 8, color: s.fg } }, nodes)
     }
 
-    const inject = ['betterSidebar']
-
     function apply(ctx) {
-      const better = ctx.get('betterSidebar')
-      if (better === undefined || typeof better.registerTab !== 'function') {
-        console.warn('[dsh-hmos-emulator] 未检测到 dsh-better-sidebar 服务,跳过标签注册。')
-        return
+      // 隔离:客户端 apply 的任何异常只打日志、绝不抛出,避免影响 DSH client loader。
+      let disposed = false
+      let registered = false
+      let timer = null
+      let attempts = 0
+      const tryRegister = () => {
+        if (disposed || registered) return
+        try {
+          const better = ctx.get('betterSidebar')
+          if (better === undefined || typeof better.registerTab !== 'function') {
+            if (++attempts > 80) { console.warn('[dsh-hmos-emulator] 未检测到 dsh-better-sidebar 服务,停止等待。'); return }
+            timer = setTimeout(tryRegister, 700)
+            return
+          }
+          registered = true
+          ctx.effect(() => better.registerTab({
+            id: 'hmos:emulator',
+            title: () => '鸿蒙模拟器',
+            icon: (size) => h(Icon, { src: IC.emulator, size: size || 16 }),
+            order: 55,
+            single: true,
+            component: (props) => h(Panel, { scope: props.scope, ctx }),
+          }), 'dsh-hmos-emulator: register tab')
+        } catch (error) {
+          console.error('[dsh-hmos-emulator] 客户端注册异常(已隔离,不影响 DSH):', error)
+        }
       }
-      ctx.effect(() => better.registerTab({
-        id: 'hmos:emulator',
-        title: () => '鸿蒙模拟器',
-        icon: (size) => h(Icon, { src: IC.emulator, size: size || 16 }),
-        order: 55,
-        single: true,
-        component: (props) => h(Panel, { scope: props.scope, ctx }),
-      }), 'dsh-hmos-emulator: register tab')
+      tryRegister()
+      ctx.effect(() => () => { disposed = true; if (timer) clearTimeout(timer) })
     }
-module.exports = { apply, inject };
+module.exports = { apply };
