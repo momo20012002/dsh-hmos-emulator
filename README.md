@@ -1,132 +1,77 @@
-# dsh-hmos-emulator
+# 鸿蒙模拟器 · dsh-hmos-emulator
 
-DSH better-sidebar 标签页插件 —— 一键**启动鸿蒙模拟器**、把选定的 **HarmonyOS 应用工程构建并部署到模拟器**。应用工程通过面板内置的**文件浏览器**(路径输入 + 逐级浏览 + 一键扫描工程)选择。
+> DeepSeek Harness 侧边栏插件:一键启动鸿蒙模拟器,并将 HarmonyOS 应用构建、部署到模拟器。
 
-- 宿主端(`lib/host.js`,Node):调 `devecocli`/`hdc` 执行真实动作,经同源 HTTP JSON API(`/dsh-hmos-emulator/api/*`)暴露给浏览器。
-- 客户端(`lib/client.js`,Web):向 `ctx.betterSidebar.registerTab(...)` 注册「鸿蒙模拟器」标签;better-sidebar 未启用时安全跳过,不影响其他插件。
-- 零第三方运行时依赖:`node:` 内建 + `react`(peer)。
+![鸿蒙模拟器面板:模拟器实例 · 应用项目 · 部署目标 · 调试输出](assets/screenshots/screenshot-1.png)
 
-## 功能
+## 能做什么
 
-| 按钮/控件 | 底层动作 |
-|---|---|
-| 应用工程 `浏览…` / 路径输入 | 宿主 `node:fs` 逐级列目录;`▣`=含 `build-profile.json5` 的工程根;可双击下钻 |
-| `扫描工程` | 从当前目录起 ≤3 层递归查找鸿蒙工程根(自动跳过 `node_modules/oh_modules/.hvigor/.git` 等) |
-| `列出模拟器/刷新` | `devecocli emulator list`(原始输出如实回显,含授权等错误) |
-| `▶ 启动` | `devecocli emulator start <实例名>`(240s 超时;冷启动约 1–2 分钟) |
-| `■ 停止` | `devecocli emulator stop <名称或串号>` |
-| 部署设备下拉 | `hdc list targets` 解析在线设备(模拟器串号形如 `127.0.0.1:5555`) |
-| `🚀 构建并部署到所选设备` | 在工程目录执行 `devecocli run --device <设备>`(构建+安装+启动,20 分钟超时) |
-| 输出区 | 每次动作的原始输出(尾部 80 KB),成功/失败着色 |
+- **启动 / 停止模拟器**：一键启动或停止鸿蒙模拟器,自动列出可用实例与在线设备。
+- **选择应用项目**：文件浏览或一键扫描,自动识别鸿蒙工程。
+- **一键构建并部署**：将选定的应用构建、安装并启动到目标设备。
+- **全程可见**：每一步的输出与状态实时显示,成功 / 失败一目了然。
 
-## 工具链探测(无需配置即可用)
+## 依赖说明
 
-宿主端按顺序自动定位,找不到时面板会显示缺什么:
+本插件以「鸿蒙模拟器」标签页显示在侧边栏,依赖 [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar);未安装时,请参考其说明安装。
 
-- **devecocli**(node CLI 入口):① 环境变量 `DSH_HMOS_DEVECO_CLI` → ② PATH 上 `devecocli` 垫片反推 npm 全局目录 → ③ `npm root -g`。
-- **hdc**:① `DEVECO_SDK_HOME`(如 `<DevEco Studio 安装根>\sdk`)+ `default\openharmony\toolchains\hdc.exe` → ② PATH 上的 `hdc`。
-- 也可在 `cordis.patch.yml` 的行配置里显式给 `config.devecoCliJs` / `config.sdkHome`。
+## 安装
 
-## 安装(把插件挂到 web profile)
+前置条件:
 
-> 下列命令均在 **DSH web profile 目录**执行(Windows:`%USERPROFILE%\.dsh\profiles\web`),需要 `dsh` CLI;也可以直接手动改文件(见“手动安装”)。
+- 已安装 dsh 并正常运行(`dsh web`);Node.js ≥ 20、pnpm ≥ 10。
+- 已安装 DevEco Studio(提供模拟器、hdc 与 SDK)。
+- 已安装 [`devecocli`](https://www.npmjs.com/package/@deveco/deveco-cli) 命令行工具;如未安装,执行 `npm i -g @deveco/deveco-cli`,或装好插件后在面板点击「一键安装 devecocli」。
 
-### 方式 A:dsh CLI(推荐,自动追加依赖、bundle 列表并合并本插件的 `cordis.patch.yml`)
+### 方式一:npm 安装(推荐)
 
-```powershell
-cd %USERPROFILE%\.dsh\profiles\web
-dsh plugin --profile web add <dsh-hmos-emulator 仓库路径>
-pnpm install
-# 重启 dsh web(或浏览器硬刷新 Ctrl+Shift+R)
+```sh
+dsh plugin --profile web add dsh-hmos-emulator
 ```
 
-### 方式 B:手动
+### 方式二:从 GitHub 安装(免 npm)
 
-1. `%USERPROFILE%\.dsh\profiles\web\package.json`
-   - `dependencies` 增加:`"dsh-hmos-emulator": "link:<dsh-hmos-emulator 绝对路径>"`
-   - `dsh.profile.bundles` 数组追加:`"dsh-hmos-emulator"`
-2. 确认宿主行已挂载:本插件自带的 `cordis.patch.yml` 会被 profile 启动时合并;若你的 DSH 版本不合并包内 patch,则在 profile 的 `cordis.patch.yml` 里追加:
-
-```yaml
-- insert:
-    - id: hmos-emulator
-      name: dsh-hmos-emulator
+```sh
+dsh plugin --profile web add github:momo20012002/dsh-hmos-emulator
 ```
 
-3. `pnpm install` → 重启 `dsh web` / 浏览器硬刷新。
+### 方式三:本地挂载(开发)
 
-### 使用
+```sh
+git clone https://github.com/momo20012002/dsh-hmos-emulator.git
+cd dsh-hmos-emulator && pnpm install && pnpm build
+dsh plugin --profile web add .
+```
 
-刷新页面后打开 better-sidebar 的 `+` 菜单 → 「鸿蒙模拟器」(标签栏也可直接点)。首次进入会自动探测工具链并列出模拟器/设备。
+安装完成后,重启 `dsh web`(加载宿主端),再刷新浏览器页面(加载客户端),即可生效。
+
+卸载:
+
+```sh
+dsh plugin --profile web remove dsh-hmos-emulator
+```
+
+## 使用
+
+1. 打开侧边栏的 `+` 菜单 →「鸿蒙模拟器」。
+2. 点击「扫描可用」列出模拟器与在线设备,再点击「启动」启动模拟器。
+3. 在「应用项目」中浏览或扫描,选择鸿蒙工程。
+4. 点击「构建并部署」,等待完成。
+
+## 平台支持
+
+- 模拟器(启动 / 停止)仅在 **Windows 与 macOS** 上可用——DevEco 官方模拟器不支持 Linux。
+- 选择工程、连接设备、构建并部署在所有系统上均可用。
 
 ## 常见问题
 
-- **`devecocli emulator list/start` 报授权/协议未接受**:在 DSH 所在机器的终端手动执行一次 `devecocli emulator license accept`,接受后再回来点按钮。
-- **`spawn EPERM` / Emulator.exe 相关**:Deveco 模拟器工具未注册或 DevEco Studio 未装模拟器镜像;请用 DevEco Studio 的 Device Manager 确认实例存在,或先在终端跑 `devecocli emulator list` 看真实报错(面板会原样回显)。
-- **部署失败但输出没有具体错误**:devecocli 的 `run` 需要已签名的调试证书;多 `entry` 模块工程需要 `--module`(当前按钮固定走 `devecocli run --device <设备>`,如需高级参数可在面板日志给出的工程目录手动执行)。
-- **找不到 hdc**:设置环境变量 `DEVECO_SDK_HOME` 后重启 `dsh web`。
-
-## 开发/改动
-
-改 `src/` 源码后,在插件目录执行 `pnpm install && pnpm build`(或 `node scripts/build.mjs`)重新生成 `lib/`。构建脚本用 esbuild 把客户端产物自动包成 `window.__ModuleLoader__.load` 形态——**不要手改为裸 ESM**(否则会被 client-modules loader 整链拒绝,报 `loaded without registering … via __ModuleLoader__.load`)。
-
-源码用 **TypeScript** 编写并带类型:宿主与客户端各用一个**本地轻量 `Ctx` 类型**(仅声明用到的 `get`/`effect`),避免为独立仓库引入整个 DSH 类型图(`@deepseek-ai/cordis`、`@types/react` 等),因此在任意环境 `pnpm install` 后 `pnpm typecheck`(tsc)即可通过,无需 `@ts-nocheck`。
-
-## 开发规范(类型约定)
-
-- **上下文**:宿主/客户端 `apply(ctx)` 用本地 `Ctx` 接口(只 `get`/`effect`),**不** `import` `@deepseek-ai/cordis` 类型图。
-- **组件 props**:`Panel`/`Icon`/`Btn`/`Dropdown`/`Card` 用**内联对象类型**标注参数;内部可用 `any` 收窄(如 `h` 来自 `require('react')`,不做深入推导)。
-- **关键函数显式标注**:`rpc(method: string, body?: any)`、`runCli(argv, opts): Promise<{code,timedOut,output}>`、`readBody(req): Promise<string>`、`createApi(): Record<string,(payload?)=>Promise<any>>`。
-- **用类型而非 `@ts-nocheck`**:`pnpm typecheck`(tsc) 应为零错误;新增代码请保持类型标注。
-- peer(`dsh-better-sidebar`)由 DSH profile 提供,插件自身不安装——见 `pnpm-workspace.yaml`(`autoInstallPeers: false`)。
-
-因 bundle 走 profile 的 link 依赖,改完需在 profile 目录 `pnpm install`(重建 link)并硬刷新浏览器;仅宿主侧改动需重启 `dsh web`。类型检查 `pnpm typecheck`(tsc),测试 `pnpm test`(vitest)。
-
-目录结构:
-
-```
-dsh-hmos-emulator/
-├─ src/
-│  ├─ index.ts          # 宿主 half(name / apply):devecocli/hdc 执行 + fs 扫描 + HTTP JSON API
-│  └─ client/index.ts   # 浏览器 half(apply / inject):better-sidebar 标签 + React 面板
-├─ scripts/build.mjs    # esbuild 打包:src → lib(宿主 ESM + 客户端 __ModuleLoader__ 产物)
-├─ lib/
-│  ├─ index.js          # 宿主产物(ESM)
-│  ├─ client.js         # 客户端产物(__ModuleLoader__ 封装)
-│  └─ types/index.d.ts  # 类型声明
-├─ test/plugin.spec.mjs # vitest 冒烟:宿主导出、客户端 __ModuleLoader__ 注册
-├─ tsconfig.json        # 类型检查配置
-├─ package.json         # 入口/exports/dsh 元数据/scripts/devDeps
-├─ cordis.patch.yml     # 宿主行 mount(loader 自动合并)
-├─ CHANGELOG.md         # 版本变更记录(Keep a Changelog)
-├─ README.md
-├─ LICENSE
-└─ .gitignore
-```
-
-## 版本号迭代
-
-- 遵循 **SemVer**:`主.次.修`。
-  - **修(patch)**:bug 修复、文档/样式微调 → `0.1.x → 0.1.x+1`。
-  - **次(minor)**:新增功能(且向后兼容)→ `0.1.x → 0.2.x`。
-  - **主(major)**:破坏性变更 → `1.0.0`。
-- **每个版本**:更新 `CHANGELOG.md`(按 Added/Changed/Fixed 记录)、同步 `package.json` 的 `version`,打 `git tag v<版本>`。
-- 提交信息用 Conventional Commits(`feat:`/`fix:`/`chore:`/`build:`/`types:`/`ci:`),便于自动生成 CHANGELOG。
-- 打版示例:
-  ```bash
-  cd <本仓库路径>
-  npm version patch -m "chore: release %s"   # 或 minor/major
-  git push --follow-tags
-  ```
-
-## 稳定性(崩溃隔离)
-
-本插件做了**崩溃隔离**,保证即使自身出问题也**不影响 DeepSeek Harness 正常启动与运行**:
-
-- 宿主/客户端 `apply()` 全部包在 `try/catch` 里:任何异常只打印日志、绝不抛出,避免中断 DSH 的 composition / client loader 加载链。
-- 不使用硬依赖注入(`inject`)阻塞加载:宿主等待 `webServer`、客户端等待 `betterSidebar` 均用**非阻塞轮询**(服务就绪后才注册,缺失时静默等待/停止),绝不阻塞或拖垮启动。
-- HTTP 路由处理器已捕获所有异常并以统一错误信封返回,单次请求失败不影响其它功能。
+| 现象 | 处理 |
+|---|---|
+| 启动时提示授权 / 协议未接受 | 在终端执行 `devecocli emulator license accept` 后重试 |
+| 扫描不到模拟器实例 | 使用 DevEco Studio 的 Device Manager 确认实例存在,或在终端执行 `devecocli emulator list` 查看实际报错 |
+| 部署失败但无具体报错 | 在工程中配置签名后重试;多入口模块工程暂不支持,请在终端手动构建部署 |
+| 提示找不到 hdc | 设置环境变量 `DEVECO_SDK_HOME` 指向 DevEco Studio 的 SDK 目录,然后重启 `dsh web` |
 
 ## License
 
-MIT
+[MIT](LICENSE)
