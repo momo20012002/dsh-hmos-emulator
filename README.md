@@ -72,6 +72,14 @@ pnpm install
 
 源码用 **TypeScript** 编写并带类型:宿主与客户端各用一个**本地轻量 `Ctx` 类型**(仅声明用到的 `get`/`effect`),避免为独立仓库引入整个 DSH 类型图(`@deepseek-ai/cordis`、`@types/react` 等),因此在任意环境 `pnpm install` 后 `pnpm typecheck`(tsc)即可通过,无需 `@ts-nocheck`。
 
+## 开发规范(类型约定)
+
+- **上下文**:宿主/客户端 `apply(ctx)` 用本地 `Ctx` 接口(只 `get`/`effect`),**不** `import` `@deepseek-ai/cordis` 类型图。
+- **组件 props**:`Panel`/`Icon`/`Btn`/`Dropdown`/`Card` 用**内联对象类型**标注参数;内部可用 `any` 收窄(如 `h` 来自 `require('react')`,不做深入推导)。
+- **关键函数显式标注**:`rpc(method: string, body?: any)`、`runCli(argv, opts): Promise<{code,timedOut,output}>`、`readBody(req): Promise<string>`、`createApi(): Record<string,(payload?)=>Promise<any>>`。
+- **用类型而非 `@ts-nocheck`**:`pnpm typecheck`(tsc) 应为零错误;新增代码请保持类型标注。
+- peer(`dsh-better-sidebar`)由 DSH profile 提供,插件自身不安装——见 `pnpm-workspace.yaml`(`autoInstallPeers: false`)。
+
 因 bundle 走 profile 的 link 依赖,改完需在 profile 目录 `pnpm install`(重建 link)并硬刷新浏览器;仅宿主侧改动需重启 `dsh web`。类型检查 `pnpm typecheck`(tsc),测试 `pnpm test`(vitest)。
 
 目录结构:
