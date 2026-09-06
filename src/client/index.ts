@@ -279,6 +279,15 @@
           setBusy('')
         }
       }
+      // 启动/停止后刷新实例与设备,让「状态」徽标与「部署目标」及时更新。
+      const refreshInstAndDev = async () => {
+        try {
+          const [e, d] = await Promise.all([rpc('emu.list'), rpc('devices')])
+          setInstances(e.instances || [])
+          setEmuRaw(e.raw || '')
+          setDevices(d.devices || [])
+        } catch { /* 静默 */ }
+      }
       const emuStart = async () => {
         const target = instanceSel || emuTarget.trim()
         if (!target) { pushLog('err', '请先点“扫描可用”并选择实例,或手动输入实例名'); return }
@@ -286,7 +295,7 @@
         try {
           const value = await rpc('emu.start', { name: target })
           pushLog(value.code === 0 ? 'ok' : 'err', `启动模拟器[${target}] 退出码=${value.code ?? '-'}\n${value.output}`)
-          if (value.code === 0) pushLog('info', '模拟器冷启动约需 1–2 分钟,就绪后点“刷新”并在“部署目标”选择该设备')
+          if (value.code === 0) { pushLog('info', '模拟器冷启动约需 1–2 分钟,就绪后点“扫描可用”并选择设备'); await refreshInstAndDev() }
         } catch (error) {
           pushLog('err', `启动失败:${error.message}`)
         } finally {
@@ -300,6 +309,7 @@
         try {
           const value = await rpc('emu.stop', { target })
           pushLog(value.code === 0 ? 'ok' : 'err', `停止模拟器[${target}] 退出码=${value.code ?? '-'}\n${value.output}`)
+          if (value.code === 0) await refreshInstAndDev()
         } catch (error) {
           pushLog('err', `停止失败:${error.message}`)
         } finally {
@@ -344,7 +354,7 @@
             }),
             h(Btn, { icon: IC.scan, secondary: true, disabled: busy !== '', onClick: scanEmus }, busy === 'scan' ? '扫描中' : '扫描可用')),
           h(Btn, { icon: IC.play, primary: true, disabled: busy !== '' || (!instanceSel && !emuTarget.trim()), onClick: emuStart }, busy === 'start' ? '启动中' : '启动'),
-          h(Btn, { icon: IC.stop, danger: true, disabled: busy !== '', onClick: emuStop }, '停止')),
+          h(Btn, { icon: IC.stop, primary: true, disabled: busy !== '', onClick: emuStop }, '停止')),
         h('div', { style: row },
           h('span', { style: label }, '状态'),
           selInst ? h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: selInst.status === 'running' ? s.ok : s.faint } },
