@@ -70,6 +70,7 @@
     const btnSecondary = { ...btnBase, border: `1px solid ${s.border}`, color: s.fg, background: 'transparent' }
     const btnGhost = { ...btnBase, color: s.muted, background: 'transparent' }
     const btnDanger = { ...btnBase, border: `1px solid ${s.danger}`, color: s.danger, background: 'transparent' }
+    const btnDangerSolid = { ...btnBase, background: s.danger, color: '#fff' }
     const logLine = (kind) => ({
       fontSize: 11, lineHeight: 1.55, whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: s.fg,
     })
@@ -83,10 +84,10 @@
       })
     }
     /** 带图标的按钮。 */
-    function Btn({ children, icon, primary, secondary, danger, ghost, disabled, onClick, style, title }: {
-      children?: any; icon?: string; primary?: boolean; secondary?: boolean; danger?: boolean; ghost?: boolean; disabled?: boolean; onClick?: any; style?: any; title?: string
+    function Btn({ children, icon, primary, secondary, danger, dangerSolid, ghost, disabled, onClick, style, title }: {
+      children?: any; icon?: string; primary?: boolean; secondary?: boolean; danger?: boolean; dangerSolid?: boolean; ghost?: boolean; disabled?: boolean; onClick?: any; style?: any; title?: string
     }) {
-      const base = primary ? btnPrimary : secondary ? btnSecondary : danger ? btnDanger : ghost ? btnGhost : btnSecondary
+      const base = primary ? btnPrimary : secondary ? btnSecondary : dangerSolid ? btnDangerSolid : danger ? btnDanger : ghost ? btnGhost : btnSecondary
       return h('button', {
         style: { ...base, ...style, ...(disabled ? { opacity: .5, cursor: 'not-allowed' } : undefined) },
         disabled, onClick, title,
@@ -354,7 +355,7 @@
             }),
             h(Btn, { icon: IC.scan, secondary: true, disabled: busy !== '', onClick: scanEmus }, busy === 'scan' ? '扫描中' : '扫描可用')),
           h(Btn, { icon: IC.play, primary: true, disabled: busy !== '' || (!instanceSel && !emuTarget.trim()), onClick: emuStart }, busy === 'start' ? '启动中' : '启动'),
-          h(Btn, { icon: IC.stop, primary: true, disabled: busy !== '', onClick: emuStop }, '停止')),
+          h(Btn, { icon: IC.stop, dangerSolid: true, disabled: busy !== '', onClick: emuStop }, '停止')),
         h('div', { style: row },
           h('span', { style: label }, '状态'),
           selInst ? h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: selInst.status === 'running' ? s.ok : s.faint } },
