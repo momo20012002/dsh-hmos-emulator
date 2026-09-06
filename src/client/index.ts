@@ -136,8 +136,8 @@
       )
     }
 
-    function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx: Ctx }) {
-      const { scope, ctx } = props
+    function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx: Ctx; visible?: boolean }) {
+      const { scope, ctx, visible = true } = props
       const [tc, setTc] = useState(null)
       const [tcMsg, setTcMsg] = useState('')
       const [project, setProject] = useState('')
@@ -210,6 +210,27 @@
         mounted.current = true
         refresh()
       }, [])
+
+      // 模拟器可用时自动刷新设备:仅标签可见时每 8s 静默轮询,选中模拟器上线后自动选中。
+      const devRef = useRef({ device, instanceSel, instances })
+      useEffect(() => { devRef.current = { device, instanceSel, instances } }, [device, instanceSel, instances])
+      useEffect(() => {
+        if (!visible) return
+        const id = setInterval(async () => {
+          try {
+            const dev = await rpc('devices')
+            const list = dev.devices || []
+            setDevices(list)
+            const { device: cur, instanceSel: sel, instances } = devRef.current
+            const selSerial = sel ? instances.find((it) => it.name === sel)?.serial : undefined
+            if (list.length === 1 && !cur) setDevice(list[0])
+            else if (selSerial && list.includes(selSerial)) setDevice(selSerial)
+          } catch {
+            /* 静默:轮询失败不打扰 */
+          }
+        }, 8000)
+        return () => clearInterval(id)
+      }, [visible])
 
       // ── 应用工程选择 ─────────────────────────────────────────────────
       // 直接调用系统/宿主原生目录选择框。
@@ -456,7 +477,7 @@
             icon: (size) => h(Icon, { src: IC.emulator, size: size || 16 }),
             order: 55,
             single: true,
-            component: (props) => h(Panel, { scope: props.scope, ctx }),
+            component: (props) => h(Panel, { scope: props.scope, ctx, visible: props.visible }),
           }), 'dsh-hmos-emulator: register tab')
         } catch (error) {
           console.error('[dsh-hmos-emulator] 客户端注册异常(已隔离,不影响 DSH):', error)
