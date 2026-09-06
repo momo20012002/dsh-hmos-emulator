@@ -1,7 +1,7 @@
 {
   "name": "dsh-hmos-emulator",
   "version": "0.1.1",
-  "description": "DSH better-sidebar 标签页插件:一键启动鸿蒙模拟器、把选定的 HarmonyOS 应用工程构建并部署到模拟器。Project dir is picked via a built-in file-browser input.",
+  "description": "DSH better-sidebar 标签页插件:一键启动鸿蒙模拟器,将选定的 HarmonyOS 应用工程构建并部署到模拟器。",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",
@@ -19,7 +19,8 @@
     "lib",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "assets/screenshots"
   ],
   "dsh": {
     "bundle": {

@@ -19,7 +19,7 @@
 
 前置条件:
 
-- 已安装 dsh 并正常运行(`dsh web`);Node.js ≥ 20、pnpm ≥ 10。
+- 已安装 dsh 并正常运行(`dsh web`);Node.js ≥ 22(LTS 或更新)、pnpm ≥ 10。
 - 已安装 DevEco Studio(提供模拟器、hdc 与 SDK)。
 - 已安装 [`devecocli`](https://www.npmjs.com/package/@deveco/deveco-cli) 命令行工具;如未安装,执行 `npm i -g @deveco/deveco-cli`,或装好插件后在面板点击「一键安装 devecocli」。
 
