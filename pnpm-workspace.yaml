@@ -1,4 +1,6 @@
 packages:
   - .
+allowBuilds:
+  esbuild: true
 # 独立插件的 peer(如 dsh-better-sidebar)由 DSH profile 提供,不要在插件自身安装/拉取其整树。
 autoInstallPeers: false
