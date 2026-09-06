@@ -316,7 +316,8 @@ function createApi(config) {
       if (result.code === 0) {
         for (const line of raw.split(/\r?\n/)) {
           const token = line.trim().split(/\s+/)[0]
-          if (token && token.length > 0 && !/^target/i.test(token)) devices.push(token)
+          // 过滤表头 / 无设备的 “[Empty]” 占位行;只要真实串号(token 不含方括号)。
+          if (token && /^[\w.:-]+$/.test(token) && !/^target/i.test(token)) devices.push(token)
         }
       } else {
         hdcError = raw
