@@ -3,10 +3,12 @@
   "version": "0.1.0",
   "description": "DSH better-sidebar 标签页插件:一键启动鸿蒙模拟器、把选定的 HarmonyOS 应用工程构建并部署到模拟器。Project dir is picked via a built-in file-browser input.",
   "type": "module",
-  "main": "./lib/host.js",
+  "main": "./lib/index.js",
+  "types": "./lib/types/index.d.ts",
   "exports": {
     ".": {
-      "default": "./lib/host.js"
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
     },
     "./client": {
       "default": "./lib/client.js"
@@ -73,6 +75,17 @@
       "dsh": ">=0.1.0-rc.5",
       "node": ">=20"
     }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
   },
   "peerDependencies": {
     "dsh-better-sidebar": ">=0.12.0"

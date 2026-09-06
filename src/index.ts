@@ -1,3 +1,5 @@
+// @ts-nocheck
+/* eslint-disable */
 /**
  * dsh-hmos-emulator — 宿主端(half)。
  *

@@ -68,23 +68,29 @@ pnpm install
 
 ## 开发/改动
 
-纯 JS 源码,无需构建。改完 `lib/*.js` 后,因 bundle 走 profile 的 link 依赖,需在 profile 目录重新 `pnpm install`(重建 link)并硬刷新浏览器;仅宿主侧改动需重启 `dsh web`。
+改 `src/` 源码后,在插件目录执行 `pnpm install && pnpm build`(或 `node scripts/build.mjs`)重新生成 `lib/`。构建脚本用 esbuild 把客户端产物自动包成 `window.__ModuleLoader__.load` 形态——**不要手改为裸 ESM**(否则会被 client-modules loader 整链拒绝,报 `loaded without registering … via __ModuleLoader__.load`)。
 
-> ⚠️ **`lib/client.js` 必须是 DSH 客户端插件的官方产物形态**:整文件以
-> `window.__ModuleLoader__.load({ id: 'dsh-hmos-emulator', factory: (require) => { … return module.exports; } })`
-> 包裹、内部用 `require('react')`,结尾 `exports.apply = apply; return module.exports;`。
-> 不要改回裸 ESM(`import`/`export`),否则会被 client-modules loader 整链拒绝(报
-> `loaded without registering … via __ModuleLoader__.load`)。参照已装插件的 `lib/client.js`。
+因 bundle 走 profile 的 link 依赖,改完需在 profile 目录 `pnpm install`(重建 link)并硬刷新浏览器;仅宿主侧改动需重启 `dsh web`。类型检查 `pnpm typecheck`(tsc),测试 `pnpm test`(vitest)。
 
 目录结构:
 
 ```
 dsh-hmos-emulator/
-├─ package.json        # main=宿主,exports[./client]=浏览器 bundle,dsh.client.platform=web
-├─ cordis.patch.yml    # 宿主行 mount(loader 自动合并)
-├─ lib/host.js         # 宿主:工具链探测 + devecocli/hdc 执行 + fs 浏览 + HTTP JSON API
-├─ lib/client.js       # better-sidebar 标签注册 + React 面板
-└─ README.md
+├─ src/
+│  ├─ index.ts          # 宿主 half(name / apply):devecocli/hdc 执行 + fs 扫描 + HTTP JSON API
+│  └─ client/index.ts   # 浏览器 half(apply / inject):better-sidebar 标签 + React 面板
+├─ scripts/build.mjs    # esbuild 打包:src → lib(宿主 ESM + 客户端 __ModuleLoader__ 产物)
+├─ lib/
+│  ├─ index.js          # 宿主产物(ESM)
+│  ├─ client.js         # 客户端产物(__ModuleLoader__ 封装)
+│  └─ types/index.d.ts  # 类型声明
+├─ test/plugin.spec.mjs # vitest 冒烟:宿主导出、客户端 __ModuleLoader__ 注册
+├─ tsconfig.json        # 类型检查配置
+├─ package.json         # 入口/exports/dsh 元数据/scripts/devDeps
+├─ cordis.patch.yml     # 宿主行 mount(loader 自动合并)
+├─ README.md
+├─ LICENSE
+└─ .gitignore
 ```
 
 ## License
