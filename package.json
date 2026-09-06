@@ -50,11 +50,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/GITHUB_USERNAME/dsh-hmos-emulator.git"
+    "url": "git+https://github.com/momo20012002/dsh-hmos-emulator.git"
   },
-  "homepage": "https://github.com/GITHUB_USERNAME/dsh-hmos-emulator#readme",
+  "homepage": "https://github.com/momo20012002/dsh-hmos-emulator#readme",
   "bugs": {
-    "url": "https://github.com/GITHUB_USERNAME/dsh-hmos-emulator/issues"
+    "url": "https://github.com/momo20012002/dsh-hmos-emulator/issues"
   },
   "dshhub": {
     "schemaVersion": 1,
