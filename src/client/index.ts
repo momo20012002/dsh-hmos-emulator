@@ -74,6 +74,7 @@
     const logLine = (kind) => ({
       fontSize: 11, lineHeight: 1.55, whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: s.fg,
     })
+    const warnBox = { background: 'rgba(229,72,77,.12)', border: `1px solid ${s.danger}`, color: s.danger, borderRadius: 8, padding: 8, fontSize: 12, marginBottom: 10, lineHeight: 1.5 }
 
     /** 内联 SVG 图标:统一取 currentColor,跟随主题。 */
     function Icon({ src, size = 16 }: { src: string; size?: number }) {
@@ -350,6 +351,12 @@
           h('div', { style: { fontSize: 11, color: s.muted } }, 'DevEco 部署控制台')),
         h(Btn, { icon: IC.refresh, ghost: true, disabled: busy === 'refresh', onClick: refresh, title: '刷新' }, '刷新'),
       ))
+
+      // 工具链缺失提醒(可见横幅,别让用户到点了按钮才报错)
+      if (tc) {
+        if (!tc.devecoCliJs) nodes.push(h('div', { key: 'warnCli', style: warnBox }, '未检测到 devecocli:启动/部署功能不可用。请安装 @deveco/deveco-cli(`npm i -g @deveco/deveco-cli`),或设置环境变量 DSH_HMOS_DEVECO_CLI 后重启。'))
+        if (!tc.hdcExe) nodes.push(h('div', { key: 'warnHdc', style: warnBox }, '未检测到 hdc:请设置环境变量 DEVECO_SDK_HOME(指向 DevEco Studio SDK 目录)后重启 dsh web。'))
+      }
 
       // 模拟器实例
       nodes.push(h(Card, { key: 'emuCard', title: '模拟器实例' },
