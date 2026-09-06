@@ -195,7 +195,10 @@
           setInstanceSel((prev) => prev || ((emu.instances || [])[0]?.name || ''))
           setDevices(dev.devices || [])
           setScanRoot((prev) => prev || (scope && scope.cwd) || '')
-          if (!device && dev.devices && dev.devices.length === 1) setDevice(dev.devices[0])
+          if (dev.devices && dev.devices.length) {
+            const selSerial = instances.find((it) => it.name === instanceSel)?.serial
+            setDevice(pickDevice(dev.devices, selSerial))
+          }
           pushLog('info', '已刷新:工具链就绪' + (toolchain.devecoCliJs ? '' : '(devecocli 未找到)'))
         } catch (error) {
           pushLog('err', `刷新失败:${error.message}`)
@@ -256,6 +259,12 @@
       }
 
       // ── 模拟器/部署动作 ──────────────────────────────────────────────
+      // 选择部署目标:优先正在运行的模拟器串号,否则默认第一台。
+      const pickDevice = (list: string[], preferredSerial?: string) => {
+        if (!list || !list.length) return ''
+        if (preferredSerial && list.includes(preferredSerial)) return preferredSerial
+        return list[0]
+      }
       const scanEmus = async () => {
         if (busy === 'scan') return
         setBusy('scan')
@@ -272,8 +281,7 @@
           const devList = dev.devices || []
           setDevices(devList)
           const selSerial = list.find((it) => it.name === selName)?.serial
-          if (devList.length === 1 && !device) setDevice(devList[0])
-          else if (selSerial && devList.includes(selSerial)) setDevice(selSerial)
+          if (devList.length) setDevice(pickDevice(devList, selSerial))
         } catch (error) {
           pushLog('err', `扫描失败:${error.message}`)
         } finally {
@@ -404,24 +412,18 @@
         h('div', { style: { fontSize: 11, color: s.faint, margin: '-2px 0 8px' } }, '需包含 build-profile.json5 的项目根;点「扫描」列出子目录项目,或「浏览」直接选择'),
       ))
 
-      // 部署目标
+      // 部署目标(只读:通常只有一台运行中的模拟器,自动选中即可)
       const devInst = device ? instances.find((it) => it.serial === device) : undefined
       nodes.push(h(Card, { key: 'devCard', title: '部署目标' },
         h('div', { style: row },
           h('span', { style: label }, '设备'),
-          h(Dropdown, {
-            value: device, placeholder: devices.length ? '选择在线设备…' : '(无在线设备,先启动模拟器)',
-            options: devices.map((d) => {
-              const inst = instances.find((it) => it.serial === d)
-              return { value: d, label: inst ? `${inst.name} (${d})` : d, status: inst ? inst.status : undefined }
-            }),
-            onChange: setDevice,
-          })),
-        (devices.length
-          ? (device
-            ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, `已选择目标:${devInst ? `${devInst.name} ` : ''}${device}`)
-            : h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, `在线设备 ${devices.length} 台,请选择部署目标`))
-          : h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, '暂无在线设备;请先在「模拟器实例」启动模拟器,再点「刷新」')),
+          h('div', { style: { ...field, display: 'flex', alignItems: 'center', color: device ? s.fg : s.faint, cursor: 'default' } },
+            device ? (devInst ? `${devInst.name} (${device})` : device) : '暂无在线设备')),
+        (device
+          ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, '部署将发送到该设备(启动模拟器后自动更新)')
+          : (devices.length
+            ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, `检测到 ${devices.length} 台在线设备,已默认选第一台`)
+            : h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, '暂无在线设备;请先在「模拟器实例」启动模拟器'))),
       ))
 
       // 部署主按钮
