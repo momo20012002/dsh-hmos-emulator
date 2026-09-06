@@ -153,6 +153,7 @@
       const [manualType, setManualType] = useState('')
       const [manualOs, setManualOs] = useState('')
       const selInst = instances.find((it) => it.name === instanceSel)
+      const devInst = device ? instances.find((it) => it.serial === device) : undefined
       const toggleManual = () => {
         const next = !showManual
         setShowManual(next)
@@ -164,7 +165,6 @@
         }
       }
       const [devices, setDevices] = useState([])
-      const [devRaw, setDevRaw] = useState('')
       const [device, setDevice] = useState('')
       const [busy, setBusy] = useState('')
       const [logs, setLogs] = useState([])
@@ -399,7 +399,11 @@
             }),
             onChange: setDevice,
           })),
-        devRaw && devRaw !== emuRaw ? h('div', { style: { fontSize: 11, color: s.faint } }, `hdc: ${devRaw.slice(0, 160)}`) : null,
+        (devices.length
+          ? (device
+            ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, `已选择目标:${devInst ? `${devInst.name} ` : ''}${device}`)
+            : h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, `在线设备 ${devices.length} 台,请选择部署目标`))
+          : h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, '暂无在线设备;请先在「模拟器实例」启动模拟器,再点「刷新」')),
       ))
 
       // 部署主按钮
