@@ -1,0 +1,85 @@
+{
+  "name": "dsh-hmos-emulator",
+  "version": "0.1.0",
+  "description": "DSH better-sidebar 标签页插件:一键启动鸿蒙模拟器、把选定的 HarmonyOS 应用工程构建并部署到模拟器。Project dir is picked via a built-in file-browser input.",
+  "type": "module",
+  "main": "./lib/host.js",
+  "exports": {
+    ".": {
+      "default": "./lib/host.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "harmonyos",
+    "openharmony",
+    "emulator",
+    "deveco",
+    "hdc"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GITHUB_USERNAME/dsh-hmos-emulator.git"
+  },
+  "homepage": "https://github.com/GITHUB_USERNAME/dsh-hmos-emulator#readme",
+  "bugs": {
+    "url": "https://github.com/GITHUB_USERNAME/dsh-hmos-emulator/issues"
+  },
+  "dshhub": {
+    "schemaVersion": 1,
+    "displayName": "dsh-hmos-emulator",
+    "summary": "DSH better-sidebar 标签页:一键启动鸿蒙模拟器、把选定的 HarmonyOS 应用项目构建并部署到模拟器,项目目录可通过文件浏览器/扫描选择。",
+    "categories": [
+      "鸿蒙",
+      "Web UI",
+      "开发工具"
+    ],
+    "surfaces": [
+      "host",
+      "web"
+    ],
+    "capabilities": {
+      "provides": []
+    },
+    "compatibility": {
+      "dsh": ">=0.1.0-rc.5",
+      "node": ">=20"
+    }
+  },
+  "peerDependencies": {
+    "dsh-better-sidebar": ">=0.12.0"
+  },
+  "peerDependenciesMeta": {
+    "dsh-better-sidebar": {
+      "optional": true
+    }
+  }
+}
