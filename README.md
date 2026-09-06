@@ -98,10 +98,26 @@ dsh-hmos-emulator/
 ├─ tsconfig.json        # 类型检查配置
 ├─ package.json         # 入口/exports/dsh 元数据/scripts/devDeps
 ├─ cordis.patch.yml     # 宿主行 mount(loader 自动合并)
+├─ CHANGELOG.md         # 版本变更记录(Keep a Changelog)
 ├─ README.md
 ├─ LICENSE
 └─ .gitignore
 ```
+
+## 版本号迭代
+
+- 遵循 **SemVer**:`主.次.修`。
+  - **修(patch)**:bug 修复、文档/样式微调 → `0.1.x → 0.1.x+1`。
+  - **次(minor)**:新增功能(且向后兼容)→ `0.1.x → 0.2.x`。
+  - **主(major)**:破坏性变更 → `1.0.0`。
+- **每个版本**:更新 `CHANGELOG.md`(按 Added/Changed/Fixed 记录)、同步 `package.json` 的 `version`,打 `git tag v<版本>`。
+- 提交信息用 Conventional Commits(`feat:`/`fix:`/`chore:`/`build:`/`types:`/`ci:`),便于自动生成 CHANGELOG。
+- 打版示例:
+  ```bash
+  cd <本仓库路径>
+  npm version patch -m "chore: release %s"   # 或 minor/major
+  git push --follow-tags
+  ```
 
 ## 稳定性(崩溃隔离)
 
