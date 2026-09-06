@@ -153,7 +153,6 @@
       const [manualType, setManualType] = useState('')
       const [manualOs, setManualOs] = useState('')
       const selInst = instances.find((it) => it.name === instanceSel)
-      const devInst = device ? instances.find((it) => it.serial === device) : undefined
       const toggleManual = () => {
         const next = !showManual
         setShowManual(next)
@@ -388,6 +387,7 @@
       ))
 
       // 部署目标
+      const devInst = device ? instances.find((it) => it.serial === device) : undefined
       nodes.push(h(Card, { key: 'devCard', title: '部署目标' },
         h('div', { style: row },
           h('span', { style: label }, '设备'),
