@@ -4,7 +4,7 @@
  * 职责:把 better-sidebar 标签页里的按钮变成真实的本机动作——
  *  - 探测工具链(devecocli / hdc);
  *  - 启动/停止鸿蒙模拟器(devecocli emulator);
- *  - 列出已连接设备(hdc list targets);
+ *  - 列出已连接设备(devecocli device list --format json,跨平台);
  *  - 本地目录浏览 / 工程探测(node:fs),供“应用项目文件浏览器”使用;
  *  - 构建并把应用部署到模拟器(devecocli run --device)。
  *
@@ -104,11 +104,13 @@ function resolveDevecoCli() {
 }
 
 function resolveHdc() {
+  // hdc 二进制名随平台:Windows 为 .exe,macOS/Linux 无扩展名。
+  const suffix = process.platform === 'win32' ? 'hdc.exe' : 'hdc'
   const sdk = process.env.DEVECO_SDK_HOME || ''
   if (sdk) {
     for (const rel of [
-      join('default', 'openharmony', 'toolchains', 'hdc.exe'),
-      join('openharmony', 'toolchains', 'hdc.exe'),
+      join('default', 'openharmony', 'toolchains', suffix),
+      join('openharmony', 'toolchains', suffix),
     ]) {
       const p = join(sdk, rel)
       if (existsSync(p)) return p
@@ -242,6 +244,10 @@ function createApi(config) {
 
   api.toolchain = async () => {
     const sdk = process.env.DEVECO_SDK_HOME || config?.sdkHome || ''
+    // 提示里给出当前平台下 DevEco Studio SDK 的示例路径(避免硬编码 Windows 路径)。
+    const sdkExample = process.platform === 'win32'
+      ? '如 C:\\Program Files\\Huawei\\DevEco Studio\\sdk'
+      : '指向本机安装的 DevEco Studio SDK 目录(以实际安装为准)'
     return {
       platform: process.platform,
       home: homedir(),
@@ -251,7 +257,7 @@ function createApi(config) {
       sdkHome: sdk || null,
       hint:
         'devecocli 缺失时:安装 @deveco/deveco-cli 或设置环境变量 DSH_HMOS_DEVECO_CLI。' +
-        'hdc 缺失时:设置 DEVECO_SDK_HOME(如 C:\\Program Files\\Huawei\\DevEco Studio\\sdk)。',
+        `hdc 缺失时:设置 DEVECO_SDK_HOME(${sdkExample})后重启 dsh web。`,
     }
   }
 
@@ -317,26 +323,33 @@ function createApi(config) {
   }
 
   api.devices = async () => {
-    const hdc = resolveHdc()
+    const cli = resolveDevecoCli()
     const devices = []
     let raw = ''
-    let hdcError = null
-    if (hdc) {
-      const result = await runCli([hdc, 'list', 'targets'], { timeoutMs: 30000 })
+    let error = null
+    if (cli) {
+      // 用 devecocli 枚举设备(跨平台),而非硬编码 hdc 路径。
+      const result = await runCli([process.execPath, cli, 'device', 'list', '--format', 'json'], { timeoutMs: 30000 })
       raw = result.output
       if (result.code === 0) {
-        for (const line of raw.split(/\r?\n/)) {
-          const token = line.trim().split(/\s+/)[0]
-          // 过滤表头 / 无设备的 “[Empty]” 占位行;只要真实串号(token 不含方括号)。
-          if (token && /^[\w.:-]+$/.test(token) && !/^target/i.test(token)) devices.push(token)
+        try {
+          const arr = JSON.parse(result.output)
+          if (Array.isArray(arr)) {
+            for (const d of arr) {
+              const serial = typeof d === 'string' ? d : (d && (d.serial || d.name))
+              if (typeof serial === 'string' && /^[\w.:-]+$/.test(serial)) devices.push(serial)
+            }
+          }
+        } catch (e) {
+          error = `device list 解析失败:${e instanceof Error ? e.message : String(e)}`
         }
       } else {
-        hdcError = raw
+        error = raw
       }
     } else {
-      hdcError = '未找到 hdc(设置 DEVECO_SDK_HOME 后重试)'
+      error = '未找到 devecocli(见工具链提示)'
     }
-    return { devices, raw, hdcError, hdcExe: hdc ?? null }
+    return { devices, raw, hdcError: error, hdcExe: resolveHdc() ?? null }
   }
 
   api.browse = async (payload) => {
@@ -364,12 +377,18 @@ function createApi(config) {
     }
     const device = typeof payload?.device === 'string' && payload.device.trim() ? payload.device.trim() : null
     if (!device) throw Object.assign(new Error('请先“刷新设备”并选择一个模拟器设备'), { code: 'bad-request' })
-    // 设备在线预检:避免对已离线设备盲目发起数分钟的构建。
-    const hdc = resolveHdc()
-    if (hdc) {
-      const probe = await runCli([hdc, 'list', 'targets'], { timeoutMs: 15000 })
-      if (probe.code === 0 && !probe.output.includes(device)) {
-        throw Object.assign(new Error(`设备 ${device} 当前未在线——请先点“▶ 启动”模拟器(或连接设备),再点“⟳ 刷新”后重试`), { code: 'device-offline' })
+    // 设备在线预检(用 devecocli,跨平台):避免对已离线设备盲目发起数分钟的构建。
+    if (cli) {
+      const probe = await runCli([process.execPath, cli, 'device', 'list', '--format', 'json'], { timeoutMs: 15000 })
+      let online = false
+      if (probe.code === 0) {
+        try {
+          const arr = JSON.parse(probe.output)
+          online = Array.isArray(arr) && arr.some((d) => { const s = typeof d === 'string' ? d : (d && (d.serial || d.name)); return s === device })
+        } catch { /* 解析失败则跳过预检,交给 run 报错 */ }
+      }
+      if (!online) {
+        throw Object.assign(new Error(`设备 ${device} 当前未在线——请先点“▶ 启动”模拟器(或连接设备),再点“扫描可用”后重试`), { code: 'device-offline' })
       }
     }
     // devecocli run = 构建 + 安装 + 启动;长任务给足超时。
