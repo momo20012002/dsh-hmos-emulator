@@ -37,7 +37,7 @@ const API_PREFIX = '/dsh-hmos-emulator/api'
 /** 允许的 API 方法白名单(避免成为任意命令执行口)。 */
 const METHODS = new Set([
   'toolchain', 'emu.list', 'emu.start', 'emu.stop',
-  'devices', 'browse', 'scan', 'deploy',
+  'devices', 'browse', 'scan', 'deploy', 'deveco.install',
 ])
 /** 目录浏览/扫描时跳过的目录。 */
 const IGNORED_DIRS = new Set([
@@ -253,6 +253,17 @@ function createApi(config) {
         'devecocli 缺失时:安装 @deveco/deveco-cli 或设置环境变量 DSH_HMOS_DEVECO_CLI。' +
         'hdc 缺失时:设置 DEVECO_SDK_HOME(如 C:\\Program Files\\Huawei\\DevEco Studio\\sdk)。',
     }
+  }
+
+  api['deveco.install'] = async () => {
+    // 一键在用户机器全局安装 @deveco/deveco-cli(仅覆盖 CLI;hdc/模拟器仍需 DevEco Studio SDK)。
+    if (process.platform === 'win32') {
+      const cmd = process.env.ComSpec || 'cmd.exe'
+      const result = await runCli([cmd, '/c', 'npm', 'install', '-g', '@deveco/deveco-cli'], { timeoutMs: 240000 })
+      return { code: result.code, timedOut: result.timedOut, output: result.output, note: result.code === 0 ? 'devecocli 安装完成,请重启 dsh web 生效;hdc 仍需安装 DevEco Studio SDK 并设置 DEVECO_SDK_HOME。' : '安装失败,请查看输出;也可能是 npm 源/权限问题。' }
+    }
+    const result = await runCli(['npm', 'install', '-g', '@deveco/deveco-cli'], { timeoutMs: 240000 })
+    return { code: result.code, timedOut: result.timedOut, output: result.output, note: result.code === 0 ? 'devecocli 安装完成,请重启 dsh web 生效;hdc 仍需安装 DevEco Studio SDK 并设置 DEVECO_SDK_HOME。' : '安装失败,请查看输出;也可能是 npm 源/权限问题。' }
   }
 
   api['emu.list'] = async () => {

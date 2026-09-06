@@ -340,6 +340,23 @@
           setBusy('')
         }
       }
+      const installCli = async () => {
+        if (busy === 'cli') return
+        setBusy('cli')
+        try {
+          const v = await rpc('deveco.install')
+          pushLog(v.code === 0 ? 'ok' : 'err', `${v.note}\n${v.output}`)
+          if (v.code === 0) {
+            const t = await rpc('toolchain')
+            setTc(t)
+            pushLog('ok', '已重新检测工具链')
+          }
+        } catch (error) {
+          pushLog('err', `安装失败:${error.message}`)
+        } finally {
+          setBusy('')
+        }
+      }
 
       // ── 渲染 ─────────────────────────────────────────────────────────
       const nodes = []
@@ -354,7 +371,10 @@
 
       // 工具链缺失提醒(可见横幅,别让用户到点了按钮才报错)
       if (tc) {
-        if (!tc.devecoCliJs) nodes.push(h('div', { key: 'warnCli', style: warnBox }, '未检测到 devecocli:启动/部署功能不可用。请安装 @deveco/deveco-cli(`npm i -g @deveco/deveco-cli`),或设置环境变量 DSH_HMOS_DEVECO_CLI 后重启。'))
+        if (!tc.devecoCliJs) nodes.push(h('div', { key: 'warnCli', style: warnBox },
+          h('div', null, '未检测到 devecocli:启动/部署功能不可用。'),
+          h('div', { style: { fontSize: 11, marginTop: 2, marginBottom: 6, opacity: .85 } }, '建议安装 @deveco/deveco-cli(仅覆盖 CLI;hdc/模拟器仍需安装 DevEco Studio SDK 并设置 DEVECO_SDK_HOME)。'),
+          h(Btn, { secondary: true, disabled: busy === 'cli', onClick: installCli }, busy === 'cli' ? '安装中…' : '一键安装 devecocli')))
         if (!tc.hdcExe) nodes.push(h('div', { key: 'warnHdc', style: warnBox }, '未检测到 hdc:请设置环境变量 DEVECO_SDK_HOME(指向 DevEco Studio SDK 目录)后重启 dsh web。'))
       }
 
