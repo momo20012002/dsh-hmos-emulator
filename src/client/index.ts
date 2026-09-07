@@ -14,6 +14,7 @@
       folder: svg('0 0 1024 1024', '<path d="M855.04 385.024q19.456 2.048 38.912 10.24t33.792 23.04 21.504 37.376 2.048 54.272q-2.048 8.192-8.192 40.448t-14.336 74.24-18.432 86.528-19.456 76.288q-5.12 18.432-14.848 37.888t-25.088 35.328-36.864 26.112-51.2 10.24l-567.296 0q-21.504 0-44.544-9.216t-42.496-26.112-31.744-40.96-12.288-53.76l0-439.296q0-62.464 33.792-97.792t95.232-35.328l503.808 0q22.528 0 46.592 8.704t43.52 24.064 31.744 35.84 12.288 44.032l0 11.264-53.248 0q-40.96 0-95.744-0.512t-116.736-0.512-115.712-0.512-92.672-0.512l-47.104 0q-26.624 0-41.472 16.896t-23.04 44.544q-8.192 29.696-18.432 62.976t-18.432 61.952q-10.24 33.792-20.48 65.536-2.048 8.192-2.048 13.312 0 17.408 11.776 29.184t29.184 11.776q31.744 0 43.008-39.936l54.272-198.656q133.12 1.024 243.712 1.024l286.72 0z"/>'),
       clock: svg('0 0 1024 1024', '<path d="M511.913993 63.989249c-247.012263 0-447.924744 200.912481-447.924744 447.924744s200.912481 447.924744 447.924744 447.924744 447.924744-200.912481 447.924744-447.924744S758.926256 63.989249 511.913993 63.989249zM511.913993 895.677474c-211.577356 0-383.763481-172.186125-383.763481-383.763481 0-211.577356 172.014111-383.763481 383.763481-383.763481s383.763481 172.014111 383.763481 383.763481S723.491349 895.677474 511.913993 895.677474z"/><path d="M672.05913 511.913993l-159.973123 0L512.086007 288.123635c0-17.717453-14.277171-32.166639-31.994625-32.166639-17.717453 0-31.994625 14.449185-31.994625 32.166639l0 255.956996c0 17.717453 14.277171 31.994625 31.994625 31.994625l191.967747 0c17.717453 0 32.166639-14.277171 32.166639-31.994625C704.053754 526.191164 689.604569 511.913993 672.05913 511.913993z"/>'),
       chevron: svg('0 0 1024 1024', '<path d="M256 384l256 256 256-256H256z"/>'),
+      camera: svg('0 0 1024 1024', '<path d="M928 256H768l-64-96a64 64 0 0 0-53-28H373a64 64 0 0 0-53 28l-64 96H96a64 64 0 0 0-64 64v512a64 64 0 0 0 64 64h832a64 64 0 0 0 64-64V320a64 64 0 0 0-64-64zM512 800a224 224 0 1 1 0-448 224 224 0 0 1 0 448z m0-352a128 128 0 1 0 0 256 128 128 0 0 0 0-256z"/>'),
     }
 
     const API = '/dsh-hmos-emulator/api'
@@ -401,6 +402,22 @@
           setBusy('')
         }
       }
+      // 截图:经宿主调用 devecocli ui screenshot,PNG 存到 <工作区根>/screenshots。
+      const takeShot = async () => {
+        if (!device) { pushLog('err', '请先选择在线设备(部署目标)'); return }
+        setBusy('shot')
+        try {
+          const root = (scope && scope.cwd) || ''
+          const v = await rpc('screenshot', { device, root })
+          if (v && v.path) pushLog('ok', `截图已保存 → ${v.path}`)
+          else pushLog('info', '截图完成,但宿主未返回保存路径')
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error)
+          pushLog('err', `截图失败:${msg}${/unknown method|非 JSON/.test(msg) ? '(宿主端尚未加载新 API,请重启 dsh web 后重试)' : ''}`)
+        } finally {
+          setBusy('')
+        }
+      }
       const installCli = async () => {
         if (busy === 'cli') return
         setBusy('cli')
@@ -512,14 +529,21 @@
           h('span', { style: label }, '设备'),
           h('div', { style: { ...field, display: 'flex', alignItems: 'center', color: device ? s.fg : s.faint, cursor: 'default' } },
             device ? (devInst ? `${devInst.name} (${device})` : device) : '暂无在线设备')),
+        // 截图:紧贴设备行,与设备字段同高对齐;轻量描边,不抢部署主按钮。
+        h('div', { style: { marginTop: 8 } },
+          h(Btn, {
+            secondary: true, icon: IC.camera, disabled: busy !== '' || !device, onClick: takeShot,
+            style: { width: '100%' },
+            title: '用 devecocli 截取设备屏幕,PNG 保存到 <工作区>/screenshots',
+          }, busy === 'shot' ? '截图中…' : '截图当前设备屏幕')),
         (device
-          ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, '部署将发送到该设备(启动模拟器后自动更新)')
+          ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 6 } }, '部署将发送到该设备(启动模拟器后自动更新)')
           : (devices.length
-            ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, `检测到 ${devices.length} 台在线设备,已默认选第一台`)
-            : h('div', { style: { fontSize: 11, color: s.faint, marginTop: 4 } }, '暂无在线设备;请先在「模拟器实例」启动模拟器'))),
+            ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 6 } }, `检测到 ${devices.length} 台在线设备,已默认选第一台`)
+            : h('div', { style: { fontSize: 11, color: s.faint, marginTop: 6 } }, '暂无在线设备;请先在「模拟器实例」启动模拟器'))),
       ))
 
-      // 部署主按钮
+      // 部署主按钮(截图已移至「部署目标」卡片,见设备行下方)
       nodes.push(h('div', { key: 'deployBtn', style: { marginTop: 2 } },
         h(Btn, {
           primary: true, disabled: busy !== '', onClick: deploy, icon: IC.deploy,

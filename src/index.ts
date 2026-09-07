@@ -15,7 +15,7 @@
  * 因此与宿主进程共享同一套运行时实例,可在任意 host 上下文挂载。
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -37,7 +37,7 @@ const API_PREFIX = '/dsh-hmos-emulator/api'
 /** 允许的 API 方法白名单(避免成为任意命令执行口)。 */
 const METHODS = new Set([
   'toolchain', 'emu.list', 'emu.start', 'emu.stop',
-  'devices', 'browse', 'scan', 'project.info', 'deploy', 'device.ready', 'deveco.install',
+  'devices', 'browse', 'scan', 'project.info', 'deploy', 'device.ready', 'deveco.install', 'screenshot',
 ])
 /** 这些方法由处理函数直接写 res(流式),不套统一 JSON 信封。 */
 const STREAMING_METHODS = new Set(['deploy'])
@@ -475,8 +475,11 @@ function createApi(config) {
       ? '构建、安装、启动完成。(hvigor 的 “No signingConfigs” 只是警告,模拟器可装未签名 debug 包)'
       : '部署失败,请查看上方输出;常见原因:签名未配置 / 设备未就绪。'
     // 流式:边跑边推给 res(供面板实时显示)。
+    // cache-control 必须带 no-transform:DSH webServer 默认开 gzip(compression 中间件),
+    // 会把 text/plain chunked 响应代理进 zlib 且不自动 flush——日志会攒到结束才一次性到达,
+    // 退化为"非实时"。no-transform 是标准豁免,令中间件透传,响应保持 identity 逐行送达。
     if (res && typeof res.write === 'function') {
-      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache' })
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache, no-transform' })
       res.write(`[dsh-hmos-emulator] 部署 ${device}${chosen ? `(模块 ${chosen})` : ''}\n`)
       const { code, timedOut } = await runCliStream(cmd, {
         cwd: project,
@@ -511,6 +514,29 @@ function createApi(config) {
       } catch { /* 解析失败则视为不在线 */ }
     }
     return { online, serial, devices }
+  }
+
+  // 设备截屏:用 devecocli ui screenshot(官方命令,不直接走 hdc)。
+  //  --path 传完整 PNG 文件路径即可按给定名直接落盘(实测确认),免去解析自动命名。
+  api.screenshot = async (payload) => {
+    const cli = resolveDevecoCli()
+    if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
+    const device = typeof payload?.device === 'string' && payload.device.trim() ? payload.device.trim() : null
+    if (!device) throw Object.assign(new Error('缺少目标设备串号(先“刷新设备”并选择)'), { code: 'bad-request' })
+    const root = typeof payload?.root === 'string' && payload.root.trim() ? payload.root.trim() : null
+    if (!root || !existsSync(root)) throw Object.assign(new Error('缺少工作区根目录(截图存放于 <根>/screenshots)'), { code: 'bad-request' })
+    const dir = join(root, 'screenshots')
+    try { mkdirSync(dir, { recursive: true }) } catch (error) {
+      throw Object.assign(new Error(`无法创建截图目录 ${dir}:${error instanceof Error ? error.message : String(error)}`), { code: 'fs-error' })
+    }
+    const safe = device.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 24)
+    const file = join(dir, `hmos-shot-${Date.now()}-${safe}.png`)
+    const result = await runCli([process.execPath, cli, 'ui', 'screenshot', '--device', device, '--path', file], { timeoutMs: 60000 })
+    if (result.code !== 0 || !existsSync(file)) {
+      const why = result.timedOut ? '超时' : result.code === 0 ? '未生成文件' : `退出码 ${result.code}`
+      throw new Error(`截图失败(${why}):\n${result.output}`)
+    }
+    return { path: file, device }
   }
 
   return api
