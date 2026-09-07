@@ -15,7 +15,7 @@
  * 因此与宿主进程共享同一套运行时实例,可在任意 host 上下文挂载。
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -37,8 +37,10 @@ const API_PREFIX = '/dsh-hmos-emulator/api'
 /** 允许的 API 方法白名单(避免成为任意命令执行口)。 */
 const METHODS = new Set([
   'toolchain', 'emu.list', 'emu.start', 'emu.stop',
-  'devices', 'browse', 'scan', 'deploy', 'deveco.install',
+  'devices', 'browse', 'scan', 'project.info', 'deploy', 'device.ready', 'deveco.install',
 ])
+/** 这些方法由处理函数直接写 res(流式),不套统一 JSON 信封。 */
+const STREAMING_METHODS = new Set(['deploy'])
 /** 目录浏览/扫描时跳过的目录。 */
 const IGNORED_DIRS = new Set([
   'node_modules', 'oh_modules', '.git', '.hvigor', '.idea', '.ohpm',
@@ -171,6 +173,49 @@ function runCli(argv: string[], { cwd, timeoutMs = 120000 }: { cwd?: string; tim
   })
 }
 
+/**
+ * 流式执行命令:每产生一段输出就回调 onChunk(供部署日志实时推送)。
+ * 返回 { code, timedOut };不缓存整段输出,适合长任务。
+ */
+function runCliStream(argv: string[], { cwd, timeoutMs = 120000, onChunk }: { cwd?: string; timeoutMs?: number; onChunk?: (chunk: string) => void } = {}): Promise<{ code: number | null; timedOut: boolean }> {
+  return new Promise((resolvePromise) => {
+    let child
+    try {
+      child = spawn(argv[0], argv.slice(1), {
+        cwd,
+        env: process.env,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (error) {
+      onChunk?.(`无法启动进程:${error instanceof Error ? error.message : String(error)}\n`)
+      resolvePromise({ code: null, timedOut: false })
+      return
+    }
+    let settled = false
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      try { child.kill() } catch { /* 忽略 */ }
+    }, timeoutMs)
+    child.stdout?.on('data', (chunk) => onChunk?.(String(chunk)))
+    child.stderr?.on('data', (chunk) => onChunk?.(String(chunk)))
+    child.on('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      onChunk?.(`进程启动失败(${error.message})\n`)
+      resolvePromise({ code: null, timedOut })
+    })
+    child.on('close', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolvePromise({ code, timedOut })
+    })
+  })
+}
+
 // ── 本地文件系统(应用项目选择器用) ────────────────────────────────────
 
 /** 把任意输入规整为存在的绝对目录(逐级上溯,最多 6 层)。 */
@@ -237,10 +282,34 @@ function scanProjects(root, maxDepth = 3) {
   return found
 }
 
+// ── 工程信息(多模块部署用) ──────────────────────────────────────────────
+
+/** 极简 JSON5→JSON:去掉 // 与 /* *\/ 注释、给裸键加引号、删行尾逗号,再 JSON.parse。 */
+function stripJson5(text: string): string {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+    .replace(/([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)/g, '$1"$2"$3')
+    .replace(/,\s*([}\]])/g, '$1')
+}
+
+/** 读取鸿蒙工程的入口模块名(build-profile.json5 的 modules[].name)。解析失败返回 []。 */
+function readModules(project: string): string[] {
+  const file = join(project, PROJECT_MARK)
+  if (!existsSync(file)) return []
+  try {
+    const cfg = JSON.parse(stripJson5(readFileSync(file, 'utf8')))
+    const mods = Array.isArray(cfg?.modules) ? cfg.modules : []
+    return mods.map((m) => (m && typeof m.name === 'string' ? m.name : '')).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
 // ── API 方法实现 ────────────────────────────────────────────────────────
 
 function createApi(config) {
-  const api: Record<string, (payload?: any) => Promise<any>> = {}
+  const api: Record<string, (payload?: any, res?: any) => Promise<any>> = {}
 
   api.toolchain = async () => {
     const sdk = process.env.DEVECO_SDK_HOME || config?.sdkHome || ''
@@ -367,7 +436,13 @@ function createApi(config) {
     return { root, projects: paths }
   }
 
-  api.deploy = async (payload) => {
+  api['project.info'] = async (payload) => {
+    const project = typeof payload?.projectPath === 'string' ? resolve(payload.projectPath) : ''
+    if (!project || !existsSync(project)) throw Object.assign(new Error('应用工程路径不存在'), { code: 'bad-request' })
+    return { modules: readModules(project) }
+  }
+
+  api.deploy = async (payload, res) => {
     const cli = resolveDevecoCli()
     if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
     const project = typeof payload?.projectPath === 'string' ? resolve(payload.projectPath) : ''
@@ -388,22 +463,54 @@ function createApi(config) {
         } catch { /* 解析失败则跳过预检,交给 run 报错 */ }
       }
       if (!online) {
-        throw Object.assign(new Error(`设备 ${device} 当前未在线——请先点“▶ 启动”模拟器(或连接设备),再点“扫描可用”后重试`), { code: 'device-offline' })
+        throw Object.assign(new Error(`设备 ${device} 当前未在线——请先点“启动”模拟器(或连接设备),再点“扫描可用”后重试`), { code: 'device-offline' })
       }
     }
-    // devecocli run = 构建 + 安装 + 启动;长任务给足超时。
-    const result = await runCli(
-      [process.execPath, cli, 'run', '--device', device],
-      { cwd: project, timeoutMs: 20 * 60 * 1000 },
-    )
-    return {
-      code: result.code,
-      timedOut: result.timedOut,
-      output: result.output,
-      note: result.code === 0
-        ? '构建、安装、启动完成。(hvigor 的 “No signingConfigs” 只是警告,模拟器可装未签名 debug 包)'
-        : '部署失败,请查看上方输出;常见原因:签名未配置 / 多个 entry 模块(需指定 --module)/ 设备未就绪。',
+    // 多入口模块:检测 modules,自动指定 --module(默认 entry,否则第一个)。
+    const modules = readModules(project)
+    const chosen = payload?.module ? String(payload.module) : modules.includes('entry') ? 'entry' : modules[0]
+    const cmd = [process.execPath, cli, 'run', '--device', device]
+    if (chosen) cmd.push('--module', chosen)
+    const note = (code: number | null) => code === 0
+      ? '构建、安装、启动完成。(hvigor 的 “No signingConfigs” 只是警告,模拟器可装未签名 debug 包)'
+      : '部署失败,请查看上方输出;常见原因:签名未配置 / 设备未就绪。'
+    // 流式:边跑边推给 res(供面板实时显示)。
+    if (res && typeof res.write === 'function') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache' })
+      res.write(`[dsh-hmos-emulator] 部署 ${device}${chosen ? `(模块 ${chosen})` : ''}\n`)
+      const { code, timedOut } = await runCliStream(cmd, {
+        cwd: project,
+        timeoutMs: 20 * 60 * 1000,
+        onChunk: (chunk) => { try { res.write(chunk) } catch { /* 客户端已断开 */ } },
+      })
+      res.write(`\n${note(code)}\n`)
+      res.write(`[HMOS_EXIT]=${code ?? -1}\n`)
+      res.end()
+      return
     }
+    // 非流式(向下兼容/测试用):攒整段返回。
+    const result = await runCli(cmd, { cwd: project, timeoutMs: 20 * 60 * 1000 })
+    return { code: result.code, timedOut: result.timedOut, output: result.output, note: note(result.code) }
+  }
+
+  api['device.ready'] = async (payload) => {
+    const cli = resolveDevecoCli()
+    if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
+    const serial = typeof payload?.serial === 'string' && payload.serial.trim() ? payload.serial.trim() : null
+    if (!serial) throw Object.assign(new Error('缺少设备串号'), { code: 'bad-request' })
+    const probe = await runCli([process.execPath, cli, 'device', 'list', '--format', 'json'], { timeoutMs: 15000 })
+    let devices: string[] = []
+    let online = false
+    if (probe.code === 0) {
+      try {
+        const arr = JSON.parse(probe.output)
+        devices = (Array.isArray(arr) ? arr : [])
+          .map((d) => (typeof d === 'string' ? d : (d && (d.serial || d.name))))
+          .filter((s) => typeof s === 'string' && /^[\w.:-]+$/.test(s))
+        online = devices.includes(serial)
+      } catch { /* 解析失败则视为不在线 */ }
+    }
+    return { online, serial, devices }
   }
 
   return api
@@ -485,6 +592,19 @@ export function apply(ctx: Ctx, config?: any) {
                   writeJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'body is not valid JSON' } })
                   return
                 }
+              }
+              // 流式方法:处理函数直接写 res(自己管理头/结束),错误按是否已发头处理。
+              if (STREAMING_METHODS.has(method)) {
+                try {
+                  await handler(payload, res)
+                } catch (error) {
+                  if (!res.headersSent) writeError(res, error)
+                  else {
+                    try { res.write(`\n[HMOS_EXIT]=-2\n`) } catch { /* 忽略 */ }
+                    try { res.end() } catch { /* 忽略 */ }
+                  }
+                }
+                return
               }
               const value = await handler(payload)
               writeOk(res, value)

@@ -145,6 +145,8 @@
       const [project, setProject] = useState('')
       const [scanRoot, setScanRoot] = useState('')
       const [projectOptions, setProjectOptions] = useState([])
+      const [modules, setModules] = useState([])
+      const [moduleSel, setModuleSel] = useState('')
       const [emuRaw, setEmuRaw] = useState('')
       const [emuTarget, setEmuTarget] = useState('')
       const [instances, setInstances] = useState([])
@@ -224,7 +226,7 @@
           const ui = ctx.get('uiWorkspace')
           if (ui && typeof ui.pickDirectory === 'function') {
             const p = await ui.pickDirectory()
-            if (p) { setProject(p); pushLog('ok', `已选择项目:${p}`) }
+            if (p) { setProject(p); loadProjectInfo(p); pushLog('ok', `已选择项目:${p}`) }
           } else {
             pushLog('err', '系统目录选择不可用,请用「扫描」或直接粘贴路径')
           }
@@ -245,7 +247,9 @@
           if (value.projects && value.projects.length) {
             pushLog('info', `扫描「${value.root}」发现 ${value.projects.length} 个项目,已默认选中第一个`)
             setProject(value.projects[0])
+            loadProjectInfo(value.projects[0])
           } else {
+            setModules([]); setModuleSel('')
             pushLog('info', `“${value.root}”下(≤3 层)未发现鸿蒙项目`)
           }
         } catch (error) {
@@ -254,8 +258,19 @@
           setBusy('')
         }
       }
+      // 读取所选工程的入口模块(用于多模块部署时指定 --module)。
+      const loadProjectInfo = async (proj) => {
+        if (!proj) return
+        try {
+          const info = await rpc('project.info', { projectPath: proj })
+          const mods = info.modules || []
+          setModules(mods)
+          setModuleSel((prev) => (prev && mods.includes(prev) ? prev : mods.includes('entry') ? 'entry' : mods[0] || ''))
+        } catch { /* 模块读取失败不阻塞 */ }
+      }
       const pickProject = (path) => {
         setProject(path)
+        loadProjectInfo(path)
         pushLog('ok', `已选择项目:${path}`)
       }
 
@@ -332,10 +347,56 @@
         setBusy('deploy')
         pushLog('info', `开始构建并部署 → ${project} @ ${device}(构建可能需要数分钟)`)
         try {
-          const value = await rpc('deploy', { projectPath: project, device })
-          pushLog(value.code === 0 ? 'ok' : 'err', `${value.note}\n${value.output}`)
+          const res = await fetch(`${API}/deploy`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ projectPath: project, device, module: modules.length > 1 ? moduleSel : undefined }),
+          })
+          if (res.status !== 200) {
+            let msg = `HTTP ${res.status}`
+            try { const j = await res.json(); if (j && j.error && j.error.message) msg = j.error.message } catch { /* 非 JSON */ }
+            pushLog('err', `部署失败:${msg}`)
+            return
+          }
+          if (!res.body) { pushLog('err', '宿主未返回可读内容'); return }
+          const reader = res.body.getReader()
+          const dec = new TextDecoder()
+          let buf = ''
+          let exitCode = null
+          const flushLine = (line) => {
+            if (!line) return
+            if (line.startsWith('[HMOS_EXIT]=')) { exitCode = Number(line.slice(12)); return }
+            // 清除 ANSI 颜色码(如 \u001b[33m)、\r,再去掉行尾空白,让日志干净可读。
+            const clean = line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').replace(/\r/g, '').replace(/\s+$/, '')
+            if (clean.trim()) pushLog('raw', clean)
+          }
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buf += dec.decode(value, { stream: true })
+            const lines = buf.split('\n')
+            buf = lines.pop() || ''
+            for (const l of lines) flushLine(l.replace(/\r$/, ''))
+          }
+          if (buf.trim()) flushLine(buf.replace(/\r/g, ''))
+          pushLog(exitCode === 0 ? 'ok' : 'err', exitCode === 0 ? '部署完成' : `部署结束(退出码 ${exitCode ?? '未知'})`)
         } catch (error) {
-          pushLog('err', `部署失败:${error.message}`)
+          pushLog('err', `部署失败:${error instanceof Error ? error.message : String(error)}`)
+        } finally {
+          setBusy('')
+        }
+      }
+      // 模拟器冷启动后,手动检测其串号是否已上线(非轮询)。
+      const checkReady = async () => {
+        const serial = (selInst && selInst.serial) || manualSerial.trim()
+        if (!serial) { pushLog('err', '请先选择模拟器实例或填写串号'); return }
+        setBusy('ready')
+        try {
+          const r = await rpc('device.ready', { serial })
+          if (r.online) { pushLog('ok', `设备 ${serial} 已就绪`); setDevices(r.devices || []); setDevice(r.serial) }
+          else pushLog('info', `设备 ${serial} 尚未上线,请稍后再试`)
+        } catch (error) {
+          pushLog('err', `就绪检测失败:${error instanceof Error ? error.message : String(error)}`)
         } finally {
           setBusy('')
         }
@@ -397,6 +458,7 @@
             h('span', { style: { width: 8, height: 8, borderRadius: '50%', background: selInst.status === 'running' ? s.ok : s.danger } }),
             selInst.status === 'running' ? '运行中' : '已停止') : h('span', { style: { fontSize: 11, color: s.faint } }, '未实例'),
           h('div', { style: { flex: 1 } }),
+          h(Btn, { secondary: true, disabled: busy !== '', onClick: checkReady, title: '检测模拟器串号是否已上线' }, '检测就绪'),
           h(Btn, { ghost: true, disabled: busy !== '', onClick: toggleManual }, showManual ? '收起手动输入' : '手动输入'),
           h(Btn, { ghost: true, disabled: busy !== '', onClick: () => setShowRaw((v) => !v) }, showRaw ? '收起原始输出' : '原始输出')),
         showManual ? h('div', { key: 'manual', style: { marginTop: 4 } },
@@ -436,6 +498,10 @@
             onChange: setProject,
           }),
           h(Btn, { icon: IC.scan, secondary: true, disabled: busy !== '', onClick: runScan }, busy === 'scan' ? '扫描中' : '扫描')),
+        modules.length > 1 ? h('div', { style: row, key: 'moduleRow' },
+          h('span', { style: label }, '入口模块'),
+          h(Dropdown, { value: moduleSel, placeholder: '选择入口模块', options: modules.map((m) => ({ value: m, label: m })), onChange: setModuleSel }),
+        ) : null,
         h('div', { style: { fontSize: 11, color: s.faint, margin: '-2px 0 8px' } }, '需包含 build-profile.json5 的项目根;点「扫描」列出子目录项目,或「浏览」直接选择'),
       ))
 
