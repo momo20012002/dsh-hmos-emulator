@@ -339,7 +339,16 @@
         try {
           const value = await rpc('emu.start', { name: target })
           pushLog(value.code === 0 ? 'ok' : 'err', `启动模拟器[${target}] 退出码=${value.code ?? '-'}\n${value.output}`)
-          if (value.code === 0) { pushLog('info', '模拟器冷启动约需 1–2 分钟,就绪后点“扫描可用”并选择设备'); await refreshInstAndDev() }
+          if (value.code === 0) {
+            // 宿主端已自动等待设备上线:就绪则直接切到该设备,省去手动“检测就绪”。
+            if (value.ready && value.serial) {
+              pushLog('ok', `设备已就绪:${value.serial}`)
+              setDevice(value.serial)
+            } else {
+              pushLog('info', '启动命令已返回,但设备尚未上线(可稍后点“检测就绪”)')
+            }
+            await refreshInstAndDev()
+          }
         } catch (error) {
           pushLog('err', `启动失败:${error.message}`)
         } finally {

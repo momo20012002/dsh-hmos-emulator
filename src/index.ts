@@ -306,6 +306,68 @@ function readModules(project: string): string[] {
   }
 }
 
+// ── 模拟器启动辅助(镜像预检 / 就绪轮询) ────────────────────────────────
+
+/** 解析 devecocli 的 --format json 数组输出;失败返回 []。 */
+function parseJsonArray(output) {
+  try {
+    const arr = JSON.parse(output)
+    return Array.isArray(arr) ? arr : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 启动前预检:该实例所需系统镜像是否已被 devecocli 判定为「已下载」。
+ * 未下载时抛出带可执行修复命令的错误(code=image-missing),
+ * 免得把 devecocli 的原始报错(cannot be found, download it again)直接丢给用户。
+ * 查询失败或信息不足时不阻断,交给 start 自身报错。
+ */
+async function ensureImageReady(cli, name) {
+  const list = await runCli([process.execPath, cli, 'emulator', 'list', '--format', 'json'], { timeoutMs: 30000 })
+  const inst = list.code === 0 ? parseJsonArray(list.output).find((it) => it && it.name === name) : undefined
+  const os = inst && typeof inst.osVersion === 'string' ? inst.osVersion : ''
+  if (!os) return
+  const dt = inst && typeof inst.deviceType === 'string' && inst.deviceType ? inst.deviceType : 'phone'
+  const imgs = await runCli([process.execPath, cli, 'emulator', 'image', 'list', '--all', '--format', 'json'], { timeoutMs: 60000 })
+  if (imgs.code !== 0) return
+  const ready = parseJsonArray(imgs.output).some((it) => it
+    && it.osVersion === os
+    && String(it.downloaded).toLowerCase() === 'true'
+    && String(it.deviceType || '').toLowerCase() === dt.toLowerCase())
+  if (ready) return
+  throw Object.assign(
+    new Error(`模拟器「${name}」的系统镜像 ${os} 未下载(或未被 devecocli 识别)。请先执行:\n  devecocli emulator image download --device-type ${dt} --os-version "${os}"\n下载完成后再启动。`),
+    { code: 'image-missing' },
+  )
+}
+
+/**
+ * 启动后等待设备真正上线:轮询实例 serial 与设备列表,直到在线或超时。
+ * 返回 { ready, serial }(serial 在轮询过程中一旦拿到即回传)。
+ */
+async function waitDeviceReady(cli, name, timeoutMs = 120000, intervalMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  let serial = null
+  while (Date.now() < deadline) {
+    const probe = await runCli([process.execPath, cli, 'emulator', 'list', '--format', 'json'], { timeoutMs: 15000 })
+    if (probe.code === 0) {
+      const inst = parseJsonArray(probe.output).find((it) => it && it.name === name)
+      const s = inst && typeof inst.serial === 'string' && inst.serial ? inst.serial : null
+      if (s) {
+        serial = s
+        const dev = await runCli([process.execPath, cli, 'device', 'list', '--format', 'json'], { timeoutMs: 15000 })
+        const online = dev.code === 0 && parseJsonArray(dev.output)
+          .some((x) => (typeof x === 'string' ? x : (x && (x.serial || x.name))) === s)
+        if (online) return { ready: true, serial: s }
+      }
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, intervalMs))
+  }
+  return { ready: false, serial }
+}
+
 // ── API 方法实现 ────────────────────────────────────────────────────────
 
 function createApi(config) {
@@ -378,8 +440,16 @@ function createApi(config) {
     if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
     const name = typeof payload?.name === 'string' && payload.name.trim() ? payload.name.trim() : null
     if (!name) throw Object.assign(new Error('缺少模拟器实例名(先执行“列出模拟器”查看实例名)'), { code: 'bad-request' })
-    const result = await runCli([process.execPath, cli, 'emulator', 'start', name], { timeoutMs: 240000 })
-    return { code: result.code, timedOut: result.timedOut, output: result.output }
+    // 预检系统镜像:缺失时直接给出可执行的下载命令(而不是让用户面对原始报错)。
+    await ensureImageReady(cli, name)
+    const argv = [process.execPath, cli, 'emulator', 'start', name]
+    // 无图形界面的 Linux 环境必须加 -noWindow(官方约束),否则启动必失败。
+    if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) argv.push('-noWindow')
+    const result = await runCli(argv, { timeoutMs: 240000 })
+    if (result.code !== 0) return { code: result.code, timedOut: result.timedOut, output: result.output, ready: false, serial: null }
+    // 启动成功后自动等待设备上线(替代手动点“检测就绪”)。
+    const { ready, serial } = await waitDeviceReady(cli, name)
+    return { code: result.code, timedOut: result.timedOut, output: result.output, ready, serial }
   }
 
   api['emu.stop'] = async (payload) => {
@@ -572,7 +642,7 @@ function writeOk(res, value) {
 function writeError(res, error) {
   const code = error && error.code ? error.code : 'internal'
   const message = error instanceof Error ? error.message : String(error)
-  const status = code === 'bad-request' || code === 'toolchain' || code === 'fs-error' ? 400 : 500
+  const status = code === 'bad-request' || code === 'toolchain' || code === 'fs-error' || code === 'image-missing' ? 400 : 500
   writeJson(res, status, { ok: false, error: { code, message } })
 }
 
