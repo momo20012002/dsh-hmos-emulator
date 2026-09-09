@@ -95,10 +95,13 @@
         disabled, onClick, title,
       }, icon ? h(Icon, { src: icon, size: 15 }) : null, children)
     }
-    /** 区块卡片。 */
-    function Card({ title, children }: { title?: string; children?: any }) {
-      return h('div', { style: card },
-        title ? h('div', { style: { fontSize: 11, color: s.muted, letterSpacing: '.06em', textTransform: 'uppercase', marginBottom: 8 } }, title) : null,
+    /** 区块卡片。action 渲染在标题行右侧(如右上角关闭按钮);style 可覆盖卡片样式。 */
+    function Card({ title, action, style, children }: { title?: string; action?: any; style?: any; children?: any }) {
+      return h('div', { style: { ...card, ...style } },
+        (title || action) ? h('div', { style: { display: 'flex', alignItems: 'center', marginBottom: 8 } },
+          title ? h('span', { style: { fontSize: 11, color: s.muted, letterSpacing: '.06em', textTransform: 'uppercase' } }, title) : null,
+          h('div', { style: { flex: 1 } }),
+          action || null) : null,
         children)
     }
 
@@ -139,19 +142,30 @@
       )
     }
 
+    // 最近截图做模块级缓存:面板若被重新挂载,仍能恢复显示。
+    let lastShot = null
+
     function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx: Ctx }) {
       const { scope, ctx } = props
+      // 记住上次选择(项目/扫描目录/实例/模块),减少重复操作。
+      const LS_PREFIX = 'dsh-hmos-emulator:'
+      const lsGet = (k) => { try { return localStorage.getItem(LS_PREFIX + k) || '' } catch { return '' } }
+      const lsSet = (k, v) => { try { localStorage.setItem(LS_PREFIX + k, v) } catch { /* 忽略 */ } }
       const [tc, setTc] = useState(null)
       const [tcMsg, setTcMsg] = useState('')
-      const [project, setProject] = useState('')
-      const [scanRoot, setScanRoot] = useState('')
+      const [project, setProject] = useState(() => lsGet('project'))
+      const [scanRoot, setScanRoot] = useState(() => lsGet('scanRoot'))
       const [projectOptions, setProjectOptions] = useState([])
       const [modules, setModules] = useState([])
-      const [moduleSel, setModuleSel] = useState('')
+      const [moduleSel, setModuleSel] = useState(() => lsGet('module'))
       const [emuRaw, setEmuRaw] = useState('')
       const [emuTarget, setEmuTarget] = useState('')
       const [instances, setInstances] = useState([])
-      const [instanceSel, setInstanceSel] = useState('')
+      const [instanceSel, setInstanceSel] = useState(() => lsGet('instance'))
+      const [shot, setShotState] = useState(lastShot)
+      const [copied, setCopied] = useState(false)
+      // 写入 state 的同时更新模块级缓存(面板重挂载后可恢复)。
+      const setShot = (v) => { lastShot = v; setShotState(v) }
       const [showRaw, setShowRaw] = useState(false)
       const [showManual, setShowManual] = useState(false)
       const [manualSerial, setManualSerial] = useState('')
@@ -170,9 +184,8 @@
       }
       const [devices, setDevices] = useState([])
       const [device, setDevice] = useState('')
-      // 「部署目标」设备直接派生自所选模拟器实例:该实例运行中有串号时以其为准,
-      // 否则回退到自动/手动选定的 device。这样点选下拉后设备行必然同步(不依赖异步时序)。
-      const targetDevice = (selInst && selInst.serial) || device
+      // 「部署目标」设备:显式选定(自动/手动/设备下拉)优先,否则跟随所选实例的串号。
+      const targetDevice = device || (selInst && selInst.serial) || ''
       const [busy, setBusy] = useState('')
       const [logs, setLogs] = useState([])
       const logBox = useRef(null)
@@ -221,6 +234,13 @@
         mounted.current = true
         refresh()
       }, [])
+      // 持久化上次选择,下次打开面板自动恢复。
+      useEffect(() => {
+        lsSet('project', project)
+        lsSet('scanRoot', scanRoot)
+        lsSet('instance', instanceSel)
+        lsSet('module', moduleSel)
+      }, [project, scanRoot, instanceSel, moduleSel])
 
       // ── 应用工程选择 ─────────────────────────────────────────────────
       // 直接调用系统/宿主原生目录选择框。
@@ -300,6 +320,12 @@
           pushLog('err', `同步模拟器状态失败:${error.message}`)
         }
       }
+      // 设备下拉:显式选择部署设备,并同步「模拟器」下拉到对应实例(若已知)。
+      const pickDeviceTarget = (serial) => {
+        setDevice(serial)
+        const name = instances.find((it) => it.serial === serial)?.name
+        if (name) setInstanceSel(name)
+      }
       const scanEmus = async () => {
         if (busy === 'scan') return
         setBusy('scan')
@@ -336,6 +362,8 @@
         const target = instanceSel || emuTarget.trim()
         if (!target) { pushLog('err', '请先点“扫描可用”并选择实例,或手动输入实例名'); return }
         setBusy('start')
+        // 冷启动 1–2 分钟:每 15s 提示一次进度,避免看起来卡住。
+        const tick = setInterval(() => pushLog('info', '仍在等待设备上线…'), 15000)
         try {
           const value = await rpc('emu.start', { name: target })
           pushLog(value.code === 0 ? 'ok' : 'err', `启动模拟器[${target}] 退出码=${value.code ?? '-'}\n${value.output}`)
@@ -352,6 +380,7 @@
         } catch (error) {
           pushLog('err', `启动失败:${error.message}`)
         } finally {
+          clearInterval(tick)
           setBusy('')
         }
       }
@@ -435,9 +464,11 @@
         setBusy('shot')
         try {
           const root = (scope && scope.cwd) || ''
-          const v = await rpc('screenshot', { device: targetDevice, root })
-          if (v && v.path) pushLog('ok', `截图已保存 → ${v.path}`)
-          else pushLog('info', '截图完成,但宿主未返回保存路径')
+          const v = await rpc('screenshot', { device: targetDevice, root, preview: true })
+          if (v && v.path) {
+            pushLog('ok', `截图已保存 → ${v.path}`)
+            setShot({ path: v.path, dataUrl: v.dataUrl || null })
+          } else pushLog('info', '截图完成,但宿主未返回保存路径')
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error)
           pushLog('err', `截图失败:${msg}${/unknown method|非 JSON/.test(msg) ? '(宿主端尚未加载新 API,请重启 dsh web 后重试)' : ''}`)
@@ -463,6 +494,59 @@
         }
       }
 
+      // 路径短显示:保留末两段(文件名可见),完整路径放 title。
+      const shortPath = (p) => {
+        const parts = String(p).split(/[\\/]/)
+        return parts.length > 2 ? `…\\${parts.slice(-2).join('\\')}` : String(p)
+      }
+      // 面板内容可上下拖动:在空白处按下并拖动即滚动内容(按钮/输入不受影响)。
+      const onPanelDragStart = (e) => {
+        if (e.target !== e.currentTarget) return
+        const el = e.currentTarget
+        const startY = e.clientY
+        const startTop = el.scrollTop
+        const move = (ev) => { el.scrollTop = startTop - (ev.clientY - startY) }
+        const up = () => {
+          window.removeEventListener('mousemove', move)
+          window.removeEventListener('mouseup', up)
+        }
+        window.addEventListener('mousemove', move)
+        window.addEventListener('mouseup', up)
+      }
+      // 复制文本到剪贴板:成功后按钮短暂变为「已复制 ✓」作为视觉反馈。
+      const copyText = (text) => {
+        const done = () => {
+          setCopied(true)
+          setTimeout(() => setCopied(false), 1800)
+        }
+        try {
+          navigator.clipboard.writeText(text)
+            .then(done)
+            .catch(() => pushLog('err', '复制失败(浏览器未授权剪贴板)'))
+        } catch {
+          pushLog('err', '复制失败(浏览器不支持剪贴板 API)')
+        }
+      }
+
+      // 更新 devecocli(devecocli update);版本落后时用户可一键处理。
+      const updateCli = async () => {
+        if (busy === 'cli-up') return
+        setBusy('cli-up')
+        try {
+          const v = await rpc('deveco.update')
+          pushLog(v.code === 0 ? 'ok' : 'err', `${v.note}\n${v.output}`)
+          if (v.code === 0) {
+            const t = await rpc('toolchain')
+            setTc(t)
+            pushLog('ok', '已重新检测工具链')
+          }
+        } catch (error) {
+          pushLog('err', `更新失败:${error.message}`)
+        } finally {
+          setBusy('')
+        }
+      }
+
       // ── 渲染 ─────────────────────────────────────────────────────────
       const nodes = []
       // 顶栏
@@ -473,6 +557,14 @@
           h('div', { style: { fontSize: 11, color: s.muted } }, 'DevEco 部署控制台')),
         h(Btn, { icon: IC.refresh, ghost: true, disabled: busy === 'refresh', onClick: refresh, title: '刷新' }, '刷新'),
       ))
+
+      // devecocli 版本行(可一键更新,避免 CLI 与 IDE 工具链版本不同步踩坑)
+      if (tc && tc.devecoCliJs) {
+        nodes.push(h('div', { key: 'cliVer', style: { display: 'flex', alignItems: 'center', gap: 6, margin: '-4px 0 8px', fontSize: 11, color: s.faint } },
+          h('span', null, `devecocli ${tc.devecoCliVersion || '版本未知'}`),
+          h(Btn, { ghost: true, disabled: busy !== '', onClick: updateCli, style: { padding: '2px 8px' } }, busy === 'cli-up' ? '更新中…' : '更新'),
+        ))
+      }
 
       // 工具链缺失提醒(可见横幅,别让用户到点了按钮才报错)
       if (tc) {
@@ -549,13 +641,22 @@
         h('div', { style: { fontSize: 11, color: s.faint, margin: '-2px 0 8px' } }, '需包含 build-profile.json5 的项目根;点「扫描」列出子目录项目,或「浏览」直接选择'),
       ))
 
-      // 部署目标(只读:随所选模拟器实例实时同步)
-      const devInst = targetDevice ? instances.find((it) => it.serial === targetDevice) : undefined
+      // 部署目标:单台设备只读展示;多台在线时可下拉选择。
+      const devLabel = (serial) => {
+        const n = instances.find((it) => it.serial === serial)?.name
+        return n ? `${n} (${serial})` : serial
+      }
       nodes.push(h(Card, { key: 'devCard', title: '部署目标' },
         h('div', { style: row },
           h('span', { style: label }, '设备'),
-          h('div', { style: { ...field, display: 'flex', alignItems: 'center', color: targetDevice ? s.fg : s.faint, cursor: 'default' } },
-            targetDevice ? (devInst ? `${devInst.name} (${targetDevice})` : targetDevice) : '暂无在线设备')),
+          devices.length > 1
+            ? h(Dropdown, {
+              value: targetDevice, placeholder: '选择在线设备…',
+              options: devices.map((d) => ({ value: d, label: devLabel(d) })),
+              onChange: pickDeviceTarget,
+            })
+            : h('div', { style: { ...field, display: 'flex', alignItems: 'center', color: targetDevice ? s.fg : s.faint, cursor: 'default' } },
+              targetDevice ? devLabel(targetDevice) : '暂无在线设备')),
         // 截图:紧贴设备行,与设备字段同高对齐;轻量描边,不抢部署主按钮。
         h('div', { style: { marginTop: 8 } },
           h(Btn, {
@@ -596,7 +697,37 @@
 
       if (tcMsg) nodes.push(h('div', { key: 'tcerr', style: { color: s.danger, fontSize: 12, marginTop: 6 } }, tcMsg))
 
-      return h('div', { style: { padding: 8, color: s.fg } }, nodes)
+      // 最近截图:内嵌在面板底部(与其它卡片同款),关闭按钮在右上角。
+      if (shot) nodes.push(h(Card, {
+        key: 'shotCard', title: '最近截图', style: { marginTop: 12 },
+        action: h(Btn, { ghost: true, style: { padding: '0 6px', fontSize: 14, lineHeight: 1 }, onClick: () => setShot(null), title: '关闭' }, '×'),
+      },
+        h('div', {
+          style: {
+            background: 'rgba(0,0,0,.35)', border: `1px solid ${s.border}`, borderRadius: 8,
+            padding: 6, display: 'flex', justifyContent: 'center', alignItems: 'center',
+          },
+        },
+          shot.dataUrl
+            ? h('img', { src: shot.dataUrl, style: { maxWidth: '100%', maxHeight: 240, objectFit: 'contain', borderRadius: 6, display: 'block' } })
+            : h('div', { style: { fontSize: 11, color: s.faint, padding: '18px 0' } }, '(预览不可用,文件已保存)')),
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 } },
+          h('span', {
+            title: shot.path,
+            style: { flex: 1, minWidth: 0, fontSize: 10, color: s.faint, fontFamily: 'ui-monospace, Consolas, "Courier New", monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+          }, shortPath(shot.path)),
+          h(Btn, {
+            secondary: true,
+            style: { padding: '4px 10px', color: copied ? s.ok : s.fg, border: `1px solid ${copied ? s.ok : s.border}` },
+            onClick: () => copyText(shot.path),
+          }, copied ? '已复制 ✓' : '复制路径')),
+      ))
+
+      // 面板可上下拖动滚动(空白处按下拖动);内容超出时也可用滚轮/滚动条。
+      return h('div', {
+        onMouseDown: onPanelDragStart,
+        style: { padding: 8, color: s.fg, height: '100%', overflowY: 'auto', boxSizing: 'border-box' },
+      }, nodes)
     }
 
     function apply(ctx: Ctx) {

@@ -37,7 +37,7 @@ const API_PREFIX = '/dsh-hmos-emulator/api'
 /** 允许的 API 方法白名单(避免成为任意命令执行口)。 */
 const METHODS = new Set([
   'toolchain', 'emu.list', 'emu.start', 'emu.stop',
-  'devices', 'browse', 'scan', 'project.info', 'deploy', 'device.ready', 'deveco.install', 'screenshot',
+  'devices', 'browse', 'scan', 'project.info', 'deploy', 'device.ready', 'deveco.install', 'deveco.update', 'screenshot',
 ])
 /** 这些方法由处理函数直接写 res(流式),不套统一 JSON 信封。 */
 const STREAMING_METHODS = new Set(['deploy'])
@@ -308,9 +308,17 @@ function readModules(project: string): string[] {
 
 // ── 模拟器启动辅助(镜像预检 / 就绪轮询) ────────────────────────────────
 
-/** 解析 devecocli 的 --format json 数组输出;失败返回 []。 */
-function parseJsonArray(output) {
+/** 读取 PNG 为 data URL(供面板内预览);失败返回 null。 */
+function readDataUrl(file) {
   try {
+    return `data:image/png;base64,${readFileSync(file).toString('base64')}`
+  } catch {
+    return null
+  }
+}
+
+/** 解析 devecocli 的 --format json 数组输出;失败返回 []。 */
+function parseJsonArray(output) {  try {
     const arr = JSON.parse(output)
     return Array.isArray(arr) ? arr : []
   } catch {
@@ -375,6 +383,13 @@ function createApi(config) {
 
   api.toolchain = async () => {
     const sdk = process.env.DEVECO_SDK_HOME || config?.sdkHome || ''
+    const cliPath = resolveDevecoCli()
+    // 本地 devecocli 版本(供面板展示/判断是否需要更新)。
+    let cliVersion = null
+    if (cliPath) {
+      const v = await runCli([process.execPath, cliPath, '--version'], { timeoutMs: 20000 })
+      if (v.code === 0) cliVersion = (v.output.trim().split(/\r?\n/)[0] || '') || null
+    }
     // 提示里给出当前平台下 DevEco Studio SDK 的示例路径(避免硬编码 Windows 路径)。
     const sdkExample = process.platform === 'win32'
       ? '如 C:\\Program Files\\Huawei\\DevEco Studio\\sdk'
@@ -383,12 +398,25 @@ function createApi(config) {
       platform: process.platform,
       home: homedir(),
       node: process.execPath,
-      devecoCliJs: resolveDevecoCli() ?? null,
+      devecoCliJs: cliPath ?? null,
+      devecoCliVersion: cliVersion,
       hdcExe: resolveHdc() ?? null,
       sdkHome: sdk || null,
       hint:
         'devecocli 缺失时:安装 @deveco/deveco-cli 或设置环境变量 DSH_HMOS_DEVECO_CLI。' +
         `hdc 缺失时:设置 DEVECO_SDK_HOME(${sdkExample})后重启 dsh web。`,
+    }
+  }
+
+  api['deveco.update'] = async () => {
+    const cli = resolveDevecoCli()
+    if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
+    const result = await runCli([process.execPath, cli, 'update'], { timeoutMs: 240000 })
+    return {
+      code: result.code,
+      timedOut: result.timedOut,
+      output: result.output,
+      note: result.code === 0 ? 'devecocli 已更新;若宿主端路径变化,建议重启 dsh web。' : '更新失败,请查看输出(可能是 npm 源/网络问题)。',
     }
   }
 
@@ -606,7 +634,7 @@ function createApi(config) {
       const why = result.timedOut ? '超时' : result.code === 0 ? '未生成文件' : `退出码 ${result.code}`
       throw new Error(`截图失败(${why}):\n${result.output}`)
     }
-    return { path: file, device }
+    return { path: file, device, dataUrl: payload?.preview ? readDataUrl(file) : null }
   }
 
   return api
