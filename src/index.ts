@@ -740,14 +740,15 @@ function createToolDefs(api) {
 
   const emuUi = {
     name: 'emu_ui',
-    description: 'Inspect and drive the emulator screen via devecocli ui. layout = compact control tree lines (type [x1,y1,x2,y2] "text" clickable); click = tap by label (runs layout and taps that node center, one call), by x/y, or by layout node id; text/swipe = input; screenshot = save a PNG and return its path (view with read_image).',
+    description: 'Inspect and drive the emulator screen via devecocli ui. layout = compact control tree lines (type [x1,y1,x2,y2] "text" clickable); click = tap by label (runs layout and taps that node center, one call), or by x/y; text/swipe = input; screenshot = save a PNG and return its path (view with read_image).',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['layout', 'click', 'text', 'swipe', 'screenshot'], description: 'UI action' },
         device: { type: 'string', description: 'Target serial; defaults to the first running emulator' },
-        id: { type: 'string', description: 'layout node id for click (only if the CLI reports one)' },
         label: { type: 'string', description: 'click: text of a layout node; the tool runs layout, finds it, and taps its center (one call instead of layout + click)' },
+        thenLayout: { type: 'boolean', description: 'click: after tapping, take a fresh layout and return it as tree (verifies the result without a second call)' },
+        waitMs: { type: 'integer', description: 'click + thenLayout: delay before the fresh layout, ms (default 600, max 5000)' },
         x: { type: 'integer', description: 'click x, or swipe start x' },
         y: { type: 'integer', description: 'click y, or swipe start y' },
         x2: { type: 'integer', description: 'swipe end x' },
@@ -777,21 +778,36 @@ function createToolDefs(api) {
       }
       if (action === 'click') {
         let argv = ['ui', 'click', '--device', device]
-        if (args?.id !== undefined && args.id !== '') argv.push('--id', String(args.id))
-        else if (Number.isFinite(args?.x) && Number.isFinite(args?.y)) argv.push(String(args.x), String(args.y))
-        else if (typeof args?.label === 'string' && args.label.trim()) {
+        let point = null
+        let matched = ''
+        if (Number.isFinite(args?.x) && Number.isFinite(args?.y)) {
+          point = { x: args.x, y: args.y }
+          argv.push(String(args.x), String(args.y))
+        } else if (typeof args?.label === 'string' && args.label.trim()) {
           // Resolve a label to its center in one call: avoids a layout round-trip before click.
           const lr = await run(['ui', 'layout', '--device', device], 30000)
           if (lr.code !== 0) return { ok: false, device, error: tailText(lr.output, 6) }
           const line = lr.output.split(/\r?\n/).find((l) => l.includes(args.label))
           const m = line ? line.match(/\[(\d+),(\d+),(\d+),(\d+)\]/) : null
           if (!m) return { ok: false, device, error: `no layout node matching "${args.label}"` }
-          const cx = Math.round((Number(m[1]) + Number(m[3])) / 2)
-          const cy = Math.round((Number(m[2]) + Number(m[4])) / 2)
-          argv = ['ui', 'click', String(cx), String(cy), '--device', device]
-        } else return { ok: false, error: 'click needs label, id, or x/y' }
+          point = { x: Math.round((Number(m[1]) + Number(m[3])) / 2), y: Math.round((Number(m[2]) + Number(m[4])) / 2) }
+          matched = line.trim()
+          argv = ['ui', 'click', String(point.x), String(point.y), '--device', device]
+        } else return { ok: false, error: 'click needs label or x/y' }
         const r = await run(argv, 20000)
-        return { ok: r.code === 0, device, error: r.code === 0 ? '' : tailText(r.output, 4) }
+        if (r.code !== 0) return { ok: false, device, error: tailText(r.output, 4) }
+        const result: any = { ok: true, device, x: point.x, y: point.y }
+        if (matched) result.matched = matched
+        // thenLayout verifies the tap in the same call: a fresh layout after a short settle delay.
+        if (args?.thenLayout) {
+          const wait = Number.isFinite(args?.waitMs) ? Math.max(0, Math.min(5000, args.waitMs)) : 600
+          if (wait > 0) await new Promise((resolveWait) => setTimeout(resolveWait, wait))
+          const after = await run(['ui', 'layout', '--device', device], 30000)
+          result.tree = after.code === 0
+            ? after.output.split(/\r?\n/).filter((l) => l.trim() !== '' && !/Dumping layout/i.test(l)).join('\n')
+            : tailText(after.output, 4)
+        }
+        return result
       }
       if (action === 'text') {
         const value = typeof args?.text === 'string' ? args.text : ''
