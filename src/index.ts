@@ -640,6 +640,149 @@ function createApi(config) {
   return api
 }
 
+// ── Model Tools (AI-friendly: two thin wrappers, tiny resident schema) ───
+
+/** Tool output is compact JSON (no indentation) to save tokens. */
+const TOOL_OUT_SCHEMA = { type: 'object', additionalProperties: true }
+const toolRender = (args, value) => [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }]
+
+/** Keep the last n non-empty lines (trims command output before it reaches context). */
+function tailText(text, n) {
+  const lines = String(text || '').split(/\r?\n/).filter((l) => l.trim() !== '')
+  return lines.slice(-n).join('\n')
+}
+
+/** Serial of the first running emulator (default target for emu_ui). */
+async function firstRunningSerial(cli) {
+  const r = await runCli([process.execPath, cli, 'emulator', 'list', '--format', 'json'], { timeoutMs: 20000 })
+  const inst = parseJsonArray(r.output).find((it) => it && typeof it.serial === 'string' && it.serial && /running/i.test(String(it.status)))
+  return inst ? inst.serial : ''
+}
+
+/**
+ * Two model tools:
+ *  - emu    : instance list/start/stop (reuses image precheck + readiness polling)
+ *  - emu_ui : inspect/drive the screen through devecocli ui (compact layout tree, label click)
+ */
+function createToolDefs(api) {
+  const emu = {
+    name: 'emu',
+    description: 'Control HarmonyOS emulators through devecocli: list instances, start (pre-checks the system image, waits until the device is online), stop. Use emu_ui for screen inspection/interaction.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'start', 'stop'], description: 'list = instances; start = launch and wait until online; stop = shut down' },
+        name: { type: 'string', description: 'Emulator instance name (required for start/stop)' },
+      },
+      required: ['action'],
+    },
+    output: { schema: TOOL_OUT_SCHEMA, render: toolRender },
+    async execute(args) {
+      const cli = resolveDevecoCli()
+      if (!cli) return { ok: false, error: 'devecocli not found; install @deveco/deveco-cli or set DSH_HMOS_DEVECO_CLI' }
+      const action = String(args?.action || '')
+      if (action === 'list') {
+        const r = await runCli([process.execPath, cli, 'emulator', 'list', '--format', 'json'], { timeoutMs: 30000 })
+        const instances = parseJsonArray(r.output).map((it) => ({ name: it.name, status: it.status, serial: it.serial ?? null, osVersion: it.osVersion }))
+        return { ok: r.code === 0, instances, error: r.code === 0 ? '' : tailText(r.output, 5) }
+      }
+      const name = typeof args?.name === 'string' && args.name.trim() ? args.name.trim() : ''
+      if (!name) return { ok: false, error: 'name is required for start/stop' }
+      if (action === 'start') {
+        try { await ensureImageReady(cli, name) } catch (error) { return { ok: false, stage: 'image', error: error instanceof Error ? error.message : String(error) } }
+        const argv = [process.execPath, cli, 'emulator', 'start', name]
+        if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) argv.push('-noWindow')
+        const r = await runCli(argv, { timeoutMs: 240000 })
+        if (r.code !== 0) return { ok: false, stage: 'start', code: r.code, error: tailText(r.output, 8) }
+        const { ready, serial } = await waitDeviceReady(cli, name)
+        return { ok: true, ready, serial }
+      }
+      if (action === 'stop') {
+        const r = await runCli([process.execPath, cli, 'emulator', 'stop', name], { timeoutMs: 60000 })
+        return { ok: r.code === 0, code: r.code, error: r.code === 0 ? '' : tailText(r.output, 5) }
+      }
+      return { ok: false, error: `unknown action ${action}` }
+    },
+  }
+
+  const emuUi = {
+    name: 'emu_ui',
+    description: 'Inspect and drive the emulator screen via devecocli ui. layout = compact control tree lines (type [x1,y1,x2,y2] "text" clickable); click = tap by label (runs layout and taps that node center, one call), by x/y, or by layout node id; text/swipe = input; screenshot = save a PNG and return its path (view with read_image).',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['layout', 'click', 'text', 'swipe', 'screenshot'], description: 'UI action' },
+        device: { type: 'string', description: 'Target serial; defaults to the first running emulator' },
+        id: { type: 'string', description: 'layout node id for click (only if the CLI reports one)' },
+        label: { type: 'string', description: 'click: text of a layout node; the tool runs layout, finds it, and taps its center (one call instead of layout + click)' },
+        x: { type: 'integer', description: 'click x, or swipe start x' },
+        y: { type: 'integer', description: 'click y, or swipe start y' },
+        x2: { type: 'integer', description: 'swipe end x' },
+        y2: { type: 'integer', description: 'swipe end y' },
+        text: { type: 'string', description: 'text to input' },
+        depth: { type: 'integer', description: 'layout tree depth (0 = unlimited); use to narrow large trees' },
+        root: { type: 'string', description: 'screenshot root dir (PNG goes to <root>/screenshots); defaults to process cwd' },
+      },
+      required: ['action'],
+    },
+    output: { schema: TOOL_OUT_SCHEMA, render: toolRender },
+    async execute(args) {
+      const cli = resolveDevecoCli()
+      if (!cli) return { ok: false, error: 'devecocli not found; install @deveco/deveco-cli or set DSH_HMOS_DEVECO_CLI' }
+      const action = String(args?.action || '')
+      const device = (typeof args?.device === 'string' && args.device.trim() ? args.device.trim() : '') || await firstRunningSerial(cli)
+      if (!device) return { ok: false, error: 'no running emulator; start one with emu {action:"start", name:"<instance>"}' }
+      const run = (argv, timeoutMs) => runCli([process.execPath, cli, ...argv], { timeoutMs })
+
+      if (action === 'layout') {
+        const argv = ['ui', 'layout', '--device', device]
+        if (Number.isFinite(args?.depth)) argv.push('--depth', String(args.depth))
+        const r = await run(argv, 30000)
+        if (r.code !== 0) return { ok: false, device, error: tailText(r.output, 6) }
+        const tree = r.output.split(/\r?\n/).filter((l) => l.trim() !== '' && !/Dumping layout/i.test(l)).join('\n')
+        return { ok: true, device, tree: tree.length > 6000 ? `${tree.slice(0, 6000)}\n…(truncated; pass depth to narrow)` : tree }
+      }
+      if (action === 'click') {
+        let argv = ['ui', 'click', '--device', device]
+        if (args?.id !== undefined && args.id !== '') argv.push('--id', String(args.id))
+        else if (Number.isFinite(args?.x) && Number.isFinite(args?.y)) argv.push(String(args.x), String(args.y))
+        else if (typeof args?.label === 'string' && args.label.trim()) {
+          // Resolve a label to its center in one call: avoids a layout round-trip before click.
+          const lr = await run(['ui', 'layout', '--device', device], 30000)
+          if (lr.code !== 0) return { ok: false, device, error: tailText(lr.output, 6) }
+          const line = lr.output.split(/\r?\n/).find((l) => l.includes(args.label))
+          const m = line ? line.match(/\[(\d+),(\d+),(\d+),(\d+)\]/) : null
+          if (!m) return { ok: false, device, error: `no layout node matching "${args.label}"` }
+          const cx = Math.round((Number(m[1]) + Number(m[3])) / 2)
+          const cy = Math.round((Number(m[2]) + Number(m[4])) / 2)
+          argv = ['ui', 'click', String(cx), String(cy), '--device', device]
+        } else return { ok: false, error: 'click needs label, id, or x/y' }
+        const r = await run(argv, 20000)
+        return { ok: r.code === 0, device, error: r.code === 0 ? '' : tailText(r.output, 4) }
+      }
+      if (action === 'text') {
+        const value = typeof args?.text === 'string' ? args.text : ''
+        if (!value) return { ok: false, error: 'text is required' }
+        const r = await run(['ui', 'text', value, '--device', device], 20000)
+        return { ok: r.code === 0, device, error: r.code === 0 ? '' : tailText(r.output, 4) }
+      }
+      if (action === 'swipe') {
+        if (![args?.x, args?.y, args?.x2, args?.y2].every((n) => Number.isFinite(n))) return { ok: false, error: 'swipe needs x, y, x2, y2' }
+        const r = await run(['ui', 'swipe', String(args.x), String(args.y), String(args.x2), String(args.y2), '--device', device], 20000)
+        return { ok: r.code === 0, device, error: r.code === 0 ? '' : tailText(r.output, 4) }
+      }
+      if (action === 'screenshot') {
+        const root = typeof args?.root === 'string' && args.root.trim() ? args.root.trim() : process.cwd()
+        const value = await api.screenshot({ device, root })
+        return { ok: true, path: value.path, device: value.device }
+      }
+      return { ok: false, error: `unknown action ${action}` }
+    },
+  }
+
+  return [emu, emuUi]
+}
+
 // ── 路由装配 ────────────────────────────────────────────────────────────
 
 function readBody(req: any): Promise<string> {
@@ -742,10 +885,34 @@ export function apply(ctx: Ctx, config?: any) {
       }
     }
     registerOnce()
+    // Register model tools the same non-blocking way (no inject, to avoid aborting composition).
+    const defs = createToolDefs(api)
+    let toolsRegistered = false
+    let toolsTimer: ReturnType<typeof setTimeout> | null = null
+    const registerTools = () => {
+      if (disposed || toolsRegistered) return
+      try {
+        const tools = ctx.get('tools') as any
+        if (tools === undefined || typeof tools.register !== 'function') {
+          toolsTimer = setTimeout(registerTools, 700)
+          return
+        }
+        toolsRegistered = true
+        const disposers = []
+        for (const def of defs) disposers.push(tools.register(def))
+        ctx.effect(() => () => {
+          for (const d of disposers) { try { if (typeof d === 'function') d() } catch { /* ignore */ } }
+        }, 'dsh-hmos-emulator: model tools')
+      } catch (error) {
+        console.error('[dsh-hmos-emulator] Model Tool 注册异常(已隔离,不影响 DSH):', error)
+      }
+    }
+    registerTools()
     // 卸载时停止等待/清理已注册资源。
     ctx.effect(() => () => {
       disposed = true
       if (timer) clearTimeout(timer)
+      if (toolsTimer) clearTimeout(toolsTimer)
     })
   } catch (error) {
     console.error('[dsh-hmos-emulator] 宿主 apply 异常(已隔离,不影响 DSH 启动):', error)
