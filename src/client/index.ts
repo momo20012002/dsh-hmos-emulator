@@ -170,6 +170,9 @@
       }
       const [devices, setDevices] = useState([])
       const [device, setDevice] = useState('')
+      // 「部署目标」设备直接派生自所选模拟器实例:该实例运行中有串号时以其为准,
+      // 否则回退到自动/手动选定的 device。这样点选下拉后设备行必然同步(不依赖异步时序)。
+      const targetDevice = (selInst && selInst.serial) || device
       const [busy, setBusy] = useState('')
       const [logs, setLogs] = useState([])
       const logBox = useRef(null)
@@ -282,6 +285,21 @@
         if (preferredSerial && list.includes(preferredSerial)) return preferredSerial
         return list[0]
       }
+      // 选择模拟器实例:点击即实时拉取一次实例状态,并把「部署目标」设备同步为该实例串号。
+      // 不能只依赖旧的 instances/devices state(启动后未重新扫描时 serial 可能仍为 null)。
+      const pickInstance = async (name) => {
+        setInstanceSel(name)
+        try {
+          const v = await rpc('emu.list')
+          const list = v.instances || []
+          setInstances(list)
+          const serial = list.find((it) => it.name === name)?.serial
+          if (serial) setDevice(serial)
+          else pushLog('info', `${name} 未运行(先点“启动”),部署目标保持 ${device || '无'}`)
+        } catch (error) {
+          pushLog('err', `同步模拟器状态失败:${error.message}`)
+        }
+      }
       const scanEmus = async () => {
         if (busy === 'scan') return
         setBusy('scan')
@@ -344,14 +362,14 @@
       }
       const deploy = async () => {
         if (!project.trim()) { pushLog('err', '请先在“应用项目”选择项目'); return }
-        if (!device) { pushLog('err', '请先在“部署目标”选择在线设备'); return }
+        if (!targetDevice) { pushLog('err', '请先在“部署目标”选择在线设备'); return }
         setBusy('deploy')
-        pushLog('info', `开始构建并部署 → ${project} @ ${device}(构建可能需要数分钟)`)
+        pushLog('info', `开始构建并部署 → ${project} @ ${targetDevice}(构建可能需要数分钟)`)
         try {
           const res = await fetch(`${API}/deploy`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ projectPath: project, device, module: modules.length > 1 ? moduleSel : undefined }),
+            body: JSON.stringify({ projectPath: project, device: targetDevice, module: modules.length > 1 ? moduleSel : undefined }),
           })
           if (res.status !== 200) {
             let msg = `HTTP ${res.status}`
@@ -404,11 +422,11 @@
       }
       // 截图:经宿主调用 devecocli ui screenshot,PNG 存到 <工作区根>/screenshots。
       const takeShot = async () => {
-        if (!device) { pushLog('err', '请先选择在线设备(部署目标)'); return }
+        if (!targetDevice) { pushLog('err', '请先选择在线设备(部署目标)'); return }
         setBusy('shot')
         try {
           const root = (scope && scope.cwd) || ''
-          const v = await rpc('screenshot', { device, root })
+          const v = await rpc('screenshot', { device: targetDevice, root })
           if (v && v.path) pushLog('ok', `截图已保存 → ${v.path}`)
           else pushLog('info', '截图完成,但宿主未返回保存路径')
         } catch (error) {
@@ -464,7 +482,7 @@
             h(Dropdown, {
               value: instanceSel, placeholder: instances.length ? '选择模拟器实例…' : '(先点“扫描可用”)',
               options: instances.map((it) => ({ value: it.name, label: it.name, status: it.status })),
-              onChange: setInstanceSel,
+              onChange: pickInstance,
             }),
             h(Btn, { icon: IC.scan, secondary: true, disabled: busy !== '', onClick: scanEmus }, busy === 'scan' ? '扫描中' : '扫描可用')),
           h(Btn, { icon: IC.play, primary: true, disabled: busy !== '' || (!instanceSel && !emuTarget.trim()), onClick: emuStart }, busy === 'start' ? '启动中' : '启动'),
@@ -522,21 +540,21 @@
         h('div', { style: { fontSize: 11, color: s.faint, margin: '-2px 0 8px' } }, '需包含 build-profile.json5 的项目根;点「扫描」列出子目录项目,或「浏览」直接选择'),
       ))
 
-      // 部署目标(只读:通常只有一台运行中的模拟器,自动选中即可)
-      const devInst = device ? instances.find((it) => it.serial === device) : undefined
+      // 部署目标(只读:随所选模拟器实例实时同步)
+      const devInst = targetDevice ? instances.find((it) => it.serial === targetDevice) : undefined
       nodes.push(h(Card, { key: 'devCard', title: '部署目标' },
         h('div', { style: row },
           h('span', { style: label }, '设备'),
-          h('div', { style: { ...field, display: 'flex', alignItems: 'center', color: device ? s.fg : s.faint, cursor: 'default' } },
-            device ? (devInst ? `${devInst.name} (${device})` : device) : '暂无在线设备')),
+          h('div', { style: { ...field, display: 'flex', alignItems: 'center', color: targetDevice ? s.fg : s.faint, cursor: 'default' } },
+            targetDevice ? (devInst ? `${devInst.name} (${targetDevice})` : targetDevice) : '暂无在线设备')),
         // 截图:紧贴设备行,与设备字段同高对齐;轻量描边,不抢部署主按钮。
         h('div', { style: { marginTop: 8 } },
           h(Btn, {
-            secondary: true, icon: IC.camera, disabled: busy !== '' || !device, onClick: takeShot,
+            secondary: true, icon: IC.camera, disabled: busy !== '' || !targetDevice, onClick: takeShot,
             style: { width: '100%' },
             title: '用 devecocli 截取设备屏幕,PNG 保存到 <工作区>/screenshots',
           }, busy === 'shot' ? '截图中…' : '截图当前设备屏幕')),
-        (device
+        (targetDevice
           ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 6 } }, '部署将发送到该设备(启动模拟器后自动更新)')
           : (devices.length
             ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 6 } }, `检测到 ${devices.length} 台在线设备,已默认选第一台`)
