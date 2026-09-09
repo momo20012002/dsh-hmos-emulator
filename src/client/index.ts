@@ -2,7 +2,7 @@
     interface Ctx { get(name: string): any; effect(callback: () => any, label?: string): void }
     const { createElement: h, useEffect, useRef, useState } = require('react')
 
-    // ── iconfont 图标(内联 SVG;渲染时统一 fill→currentColor 取主题色) ──
+    // ── Inline SVG icons; fill is forced to currentColor so they follow the theme ──
     const svg = (vb, body) => `<svg viewBox="${vb}" xmlns="http://www.w3.org/2000/svg" fill="currentColor">${body}</svg>`
     const IC = {
       emulator: svg('0 0 1024 1024', '<path d="M768 264.32c-21.12-11.52-42.24-21.76-64-28.8-30.72-11.52-61.44-18.56-91.52-17.92h-3.2c-159.36 3.84-348.8 187.52-348.8 223.36 0 36.48 176.64 227.2 352 224.64 30.656-0.704 61.44-7.04 91.52-17.344 21.76-7.68 43.52-17.28 64-28.8 111.36-59.52 196.48-159.36 196.48-178.56 0-18.496-88.96-116.416-196.48-176.576z m0 214.4c-9.6 35.2-32.64 65.28-64 85.12-25.6 17.28-57.6 26.88-91.52 26.88-88.96 0-160.64-67.2-160.64-149.76s71.68-149.12 160.64-149.12c33.92 0 65.92 9.6 91.52 26.88 31.36 19.84 54.4 49.92 64 85.12a140.544 140.544 0 0 1 0 74.88z"/><path d="M546.944 441.728c0 33.408 28.864 60.608 65.28 60.608 35.904 0 65.152-27.2 65.152-60.608 0-33.6-29.248-60.608-65.152-60.608-36.416 0-65.28 26.944-65.28 60.608z"/><path d="M768 128.64V128c0-35.2-28.8-64-64-64H192c-35.2 0-64 28.8-64 64v768c0 35.2 28.8 64 64 64h512c35.2 0 64-28.8 64-64v-192H192V183.04c0-30.08 23.04-55.04 51.2-55.04M448 771.84c24.96 0 44.8 20.48 44.8 45.44 0 24.384-19.84 44.8-44.8 44.8s-44.8-20.416-44.8-44.8c0-24.96 19.84-45.44 44.8-45.44z m320-535.04v-1.28h-2.56c0.64 0.64 1.92 0.64 2.56 1.28z"/>'),
@@ -41,7 +41,7 @@
       throw new Error(message)
     }
 
-    // ── 设计系统(产品化,跟随 DSH 主题变量,明暗两态可用) ────────────────
+    // ── Design tokens (follow DSH theme variables; usable in light and dark) ──
     const s = {
       fg: 'var(--dsh-fg, #e6e6e6)',
       muted: 'var(--dsh-muted, rgba(148,148,160,.9))',
@@ -77,7 +77,7 @@
     })
     const warnBox = { background: 'rgba(229,72,77,.12)', border: `1px solid ${s.danger}`, color: s.danger, borderRadius: 8, padding: 8, fontSize: 12, marginBottom: 10, lineHeight: 1.5 }
 
-    /** 内联 SVG 图标:统一取 currentColor,跟随主题。 */
+    /** Inline SVG icon forced to currentColor so it follows the theme. */
     function Icon({ src, size = 16 }: { src: string; size?: number }) {
       const body = String(src).replace(/fill="[^"]*"/g, 'fill="currentColor"')
       return h('span', {
@@ -85,7 +85,7 @@
         dangerouslySetInnerHTML: { __html: body },
       })
     }
-    /** 带图标的按钮。 */
+    /** Button with an optional leading icon. */
     function Btn({ children, icon, primary, secondary, danger, dangerSolid, ghost, disabled, onClick, style, title }: {
       children?: any; icon?: string; primary?: boolean; secondary?: boolean; danger?: boolean; dangerSolid?: boolean; ghost?: boolean; disabled?: boolean; onClick?: any; style?: any; title?: string
     }) {
@@ -95,7 +95,7 @@
         disabled, onClick, title,
       }, icon ? h(Icon, { src: icon, size: 15 }) : null, children)
     }
-    /** 区块卡片。action 渲染在标题行右侧(如右上角关闭按钮);style 可覆盖卡片样式。 */
+    /** Card block. action renders at the right of the title row; style overrides the card. */
     function Card({ title, action, style, children }: { title?: string; action?: any; style?: any; children?: any }) {
       return h('div', { style: { ...card, ...style } },
         (title || action) ? h('div', { style: { display: 'flex', alignItems: 'center', marginBottom: 8 } },
@@ -105,7 +105,7 @@
         children)
     }
 
-    /** 主题化下拉框:默认收起,点按钮打开;选项走深色主题,不出现原生白底。 */
+    /** Themed dropdown: closed by default, opens on click; the list uses the dark surface. */
     function Dropdown({ value, placeholder, options, onChange }: {
       value?: string; placeholder?: string; options?: { value: string; label: string; status?: string }[]; onChange?: (v: string) => void
     }) {
@@ -142,15 +142,15 @@
       )
     }
 
-    // 最近截图做模块级缓存:面板若被重新挂载,仍能恢复显示。
+    // Keep the last screenshot in module scope so it survives a panel remount.
     let lastShot = null
 
     function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx: Ctx }) {
       const { scope, ctx } = props
-      // 记住上次选择(项目/扫描目录/实例/模块),减少重复操作。
+      // Persist the last selection (project / scan dir / instance / module) to avoid re-picking.
       const LS_PREFIX = 'dsh-hmos-emulator:'
       const lsGet = (k) => { try { return localStorage.getItem(LS_PREFIX + k) || '' } catch { return '' } }
-      const lsSet = (k, v) => { try { localStorage.setItem(LS_PREFIX + k, v) } catch { /* 忽略 */ } }
+      const lsSet = (k, v) => { try { localStorage.setItem(LS_PREFIX + k, v) } catch { /* ignore */ } }
       const [tc, setTc] = useState(null)
       const [tcMsg, setTcMsg] = useState('')
       const [project, setProject] = useState(() => lsGet('project'))
@@ -164,10 +164,10 @@
       const [instanceSel, setInstanceSel] = useState(() => lsGet('instance'))
       const [shot, setShotState] = useState(lastShot)
       const [copied, setCopied] = useState(false)
-      // 截图预览视图:缩放与平移合并为一个原子状态(以鼠标位置为中心缩放需同时更新二者)。
+      // Screenshot viewport: zoom and pan share one atomic state (cursor-anchored zoom updates both).
       const [shotView, setShotView] = useState({ zoom: 1, x: 0, y: 0 })
       const shotBoxRef = useRef(null)
-      // 写入 state 的同时更新模块级缓存(面板重挂载后可恢复)。
+      // Update the module cache together with the state so a remount can restore it.
       const setShot = (v) => { lastShot = v; setShotState(v) }
       const [showRaw, setShowRaw] = useState(false)
       const [showManual, setShowManual] = useState(false)
@@ -187,7 +187,7 @@
       }
       const [devices, setDevices] = useState([])
       const [device, setDevice] = useState('')
-      // 「部署目标」设备:显式选定(自动/手动/设备下拉)优先,否则跟随所选实例的串号。
+      // Deploy target: an explicit pick (auto/manual/device dropdown) wins, else the instance serial.
       const targetDevice = device || (selInst && selInst.serial) || ''
       const [busy, setBusy] = useState('')
       const [logs, setLogs] = useState([])
@@ -237,27 +237,28 @@
         mounted.current = true
         refresh()
       }, [])
-      // 持久化上次选择,下次打开面板自动恢复。
+      // Restore the persisted selection when the panel opens again.
       useEffect(() => {
         lsSet('project', project)
         lsSet('scanRoot', scanRoot)
         lsSet('instance', instanceSel)
         lsSet('module', moduleSel)
       }, [project, scanRoot, instanceSel, moduleSel])
-      // 截图预览:滚轮以鼠标位置为中心缩放(需非 passive 监听才能阻止面板随之滚动)。
+      // Screenshot preview: wheel zoom anchored at the cursor. A non-passive listener is
+      // required, otherwise the panel would scroll while zooming.
       useEffect(() => {
         const el = shotBoxRef.current
         if (!el || !shot) return
         const onWheel = (e) => {
           e.preventDefault()
           const rect = el.getBoundingClientRect()
-          // 鼠标相对容器中心的坐标
+          // cursor position relative to the box center
           const mx = e.clientX - rect.left - rect.width / 2
           const my = e.clientY - rect.top - rect.height / 2
           setShotView((v) => {
             const zoom = Math.min(4, Math.max(0.25, Math.round(v.zoom * (e.deltaY < 0 ? 1.1 : 0.9) * 100) / 100))
             const k = zoom / v.zoom
-            // 保持鼠标下的图像点不动:offset' = m*(1-k) + k*offset
+            // keep the image point under the cursor fixed: offset' = m*(1-k) + k*offset
             return { zoom, x: mx * (1 - k) + k * v.x, y: my * (1 - k) + k * v.y }
           })
         }
@@ -265,8 +266,8 @@
         return () => el.removeEventListener('wheel', onWheel)
       }, [shot])
 
-      // ── 应用工程选择 ─────────────────────────────────────────────────
-      // 直接调用系统/宿主原生目录选择框。
+      // ── Project selection ───────────────────────────────────────────────
+      // Use the host-native directory picker.
       const pickNative = async () => {
         setBusy('browse')
         try {
@@ -283,7 +284,7 @@
           setBusy('')
         }
       }
-      // 扫描「扫描目录」下的工程,填充工程下拉框。
+      // Scan the root for projects and fill the project dropdown.
       const runScan = async () => {
         const root = scanRoot.trim()
         if (!root) { pushLog('err', '请先填写扫描目录'); return }
@@ -305,7 +306,7 @@
           setBusy('')
         }
       }
-      // 读取所选工程的入口模块(用于多模块部署时指定 --module)。
+      // Read entry modules of the selected project (used to pass --module when deploying).
       const loadProjectInfo = async (proj) => {
         if (!proj) return
         try {
@@ -313,7 +314,7 @@
           const mods = info.modules || []
           setModules(mods)
           setModuleSel((prev) => (prev && mods.includes(prev) ? prev : mods.includes('entry') ? 'entry' : mods[0] || ''))
-        } catch { /* 模块读取失败不阻塞 */ }
+        } catch { /* a module read failure must not block the flow */ }
       }
       const pickProject = (path) => {
         setProject(path)
@@ -321,15 +322,15 @@
         pushLog('ok', `已选择项目:${path}`)
       }
 
-      // ── 模拟器/部署动作 ──────────────────────────────────────────────
-      // 选择部署目标:优先正在运行的模拟器串号,否则默认第一台。
+      // ── Emulator / deploy actions ───────────────────────────────────────
+      // Pick the deploy target: prefer the running emulator serial, else the first device.
       const pickDevice = (list: string[], preferredSerial?: string) => {
         if (!list || !list.length) return ''
         if (preferredSerial && list.includes(preferredSerial)) return preferredSerial
         return list[0]
       }
-      // 选择模拟器实例:点击即实时拉取一次实例状态,并把「部署目标」设备同步为该实例串号。
-      // 不能只依赖旧的 instances/devices state(启动后未重新扫描时 serial 可能仍为 null)。
+      // Selecting an instance refetches its state so the deploy target follows its serial; the
+      // cached instances may still hold a null serial when the emulator was started afterwards.
       const pickInstance = async (name) => {
         setInstanceSel(name)
         try {
@@ -343,7 +344,7 @@
           pushLog('err', `同步模拟器状态失败:${error.message}`)
         }
       }
-      // 设备下拉:显式选择部署设备,并同步「模拟器」下拉到对应实例(若已知)。
+      // Device dropdown: pick a deploy device and sync the instance dropdown when it is known.
       const pickDeviceTarget = (serial) => {
         setDevice(serial)
         const name = instances.find((it) => it.serial === serial)?.name
@@ -361,7 +362,7 @@
           const selName = instanceSel || (first ? first.name : '')
           if (first) setInstanceSel((prev) => prev || first.name)
           else pushLog('info', '未扫描到可用模拟器实例(可在 DevEco Device Manager 创建;若报授权请先在终端执行 devecocli emulator license accept)')
-          // 扫描也可用:同时刷新在线设备,并按选中模拟器自动选中其串号。
+          // Scanning also refreshes online devices and selects the serial of the chosen instance.
           const devList = dev.devices || []
           setDevices(devList)
           const selSerial = list.find((it) => it.name === selName)?.serial
@@ -372,26 +373,26 @@
           setBusy('')
         }
       }
-      // 启动/停止后刷新实例与设备,让「状态」徽标与「部署目标」及时更新。
+      // Refresh instances and devices after start/stop so the badge and target stay current.
       const refreshInstAndDev = async () => {
         try {
           const [e, d] = await Promise.all([rpc('emu.list'), rpc('devices')])
           setInstances(e.instances || [])
           setEmuRaw(e.raw || '')
           setDevices(d.devices || [])
-        } catch { /* 静默 */ }
+        } catch { /* silent */ }
       }
       const emuStart = async () => {
         const target = instanceSel || emuTarget.trim()
         if (!target) { pushLog('err', '请先点“扫描可用”并选择实例,或手动输入实例名'); return }
         setBusy('start')
-        // 冷启动 1–2 分钟:每 15s 提示一次进度,避免看起来卡住。
+        // Cold boot takes 1-2 minutes: log progress every 15s so it does not look stuck.
         const tick = setInterval(() => pushLog('info', '仍在等待设备上线…'), 15000)
         try {
           const value = await rpc('emu.start', { name: target })
           pushLog(value.code === 0 ? 'ok' : 'err', `启动模拟器[${target}] 退出码=${value.code ?? '-'}\n${value.output}`)
           if (value.code === 0) {
-            // 宿主端已自动等待设备上线:就绪则直接切到该设备,省去手动“检测就绪”。
+            // The host already waited for the device: switch to it when ready.
             if (value.ready && value.serial) {
               pushLog('ok', `设备已就绪:${value.serial}`)
               setDevice(value.serial)
@@ -434,7 +435,7 @@
           })
           if (res.status !== 200) {
             let msg = `HTTP ${res.status}`
-            try { const j = await res.json(); if (j && j.error && j.error.message) msg = j.error.message } catch { /* 非 JSON */ }
+            try { const j = await res.json(); if (j && j.error && j.error.message) msg = j.error.message } catch { /* not JSON */ }
             pushLog('err', `部署失败:${msg}`)
             return
           }
@@ -446,7 +447,7 @@
           const flushLine = (line) => {
             if (!line) return
             if (line.startsWith('[HMOS_EXIT]=')) { exitCode = Number(line.slice(12)); return }
-            // 清除 ANSI 颜色码(如 \u001b[33m)、\r,再去掉行尾空白,让日志干净可读。
+            // Strip ANSI color codes and \r, then trailing spaces, so the log stays readable.
             const clean = line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').replace(/\r/g, '').replace(/\s+$/, '')
             if (clean.trim()) pushLog('raw', clean)
           }
@@ -466,7 +467,7 @@
           setBusy('')
         }
       }
-      // 模拟器冷启动后,手动检测其串号是否已上线(非轮询)。
+      // Manually check whether the instance serial came online (no polling).
       const checkReady = async () => {
         const serial = (selInst && selInst.serial) || manualSerial.trim()
         if (!serial) { pushLog('err', '请先选择模拟器实例或填写串号'); return }
@@ -481,7 +482,8 @@
           setBusy('')
         }
       }
-      // 截图:经宿主调用 devecocli ui screenshot,PNG 存到 <工作区根>/screenshots。
+      // Screenshot: the host runs devecocli ui screenshot and stores the PNG under
+      // <workspace>/screenshots.
       const takeShot = async () => {
         if (!targetDevice) { pushLog('err', '请先选择在线设备(部署目标)'); return }
         setBusy('shot')
@@ -518,12 +520,12 @@
         }
       }
 
-      // 路径短显示:保留末两段(文件名可见),完整路径放 title。
+      // Shorten the path to its last two segments (keeps the file name); full path in title.
       const shortPath = (p) => {
         const parts = String(p).split(/[\\/]/)
         return parts.length > 2 ? `…\\${parts.slice(-2).join('\\')}` : String(p)
       }
-      // 截图图片:按住拖动平移(阻止冒泡,避免同时触发面板拖动滚动)。
+      // Screenshot image: drag to pan (stop propagation so the panel drag-scroll does not fire).
       const onShotImgDragStart = (e) => {
         if (!shot) return
         e.preventDefault()
@@ -539,7 +541,7 @@
         window.addEventListener('mousemove', move)
         window.addEventListener('mouseup', up)
       }
-      // 面板内容可上下拖动:在空白处按下并拖动即滚动内容(按钮/输入不受影响)。
+      // Panel content can be drag-scrolled vertically from empty space (buttons/inputs unaffected).
       const onPanelDragStart = (e) => {
         if (e.target !== e.currentTarget) return
         const el = e.currentTarget
@@ -553,7 +555,7 @@
         window.addEventListener('mousemove', move)
         window.addEventListener('mouseup', up)
       }
-      // 复制文本到剪贴板:成功后按钮短暂变为「已复制 ✓」作为视觉反馈。
+      // Copy to clipboard: the button briefly shows a copied state as feedback.
       const copyText = (text) => {
         const done = () => {
           setCopied(true)
@@ -568,7 +570,7 @@
         }
       }
 
-      // 更新 devecocli(devecocli update);版本落后时用户可一键处理。
+      // Update devecocli (devecocli update) so an outdated CLI can be fixed in one click.
       const updateCli = async () => {
         if (busy === 'cli-up') return
         setBusy('cli-up')
@@ -587,9 +589,9 @@
         }
       }
 
-      // ── 渲染 ─────────────────────────────────────────────────────────
+      // ── Render ──────────────────────────────────────────────────────────
       const nodes = []
-      // 顶栏
+      // Header
       nodes.push(h('div', { key: 'head', style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 } },
         h('span', { style: { width: 20, height: 20, display: 'inline-flex', color: s.accent } }, h(Icon, { src: IC.emulator, size: 20 })),
         h('div', { style: { flex: 1 } },
@@ -598,7 +600,7 @@
         h(Btn, { icon: IC.refresh, ghost: true, disabled: busy === 'refresh', onClick: refresh, title: '刷新' }, '刷新'),
       ))
 
-      // devecocli 版本行(可一键更新,避免 CLI 与 IDE 工具链版本不同步踩坑)
+      // devecocli version row (one-click update; keeps CLI and IDE toolchains in sync)
       if (tc && tc.devecoCliJs) {
         nodes.push(h('div', { key: 'cliVer', style: { display: 'flex', alignItems: 'center', gap: 6, margin: '-4px 0 8px', fontSize: 11, color: s.faint } },
           h('span', null, `devecocli ${tc.devecoCliVersion || '版本未知'}`),
@@ -606,7 +608,7 @@
         ))
       }
 
-      // 工具链缺失提醒(可见横幅,别让用户到点了按钮才报错)
+      // Toolchain banners so a missing CLI surfaces before the user clicks anything
       if (tc) {
         if (!tc.devecoCliJs) nodes.push(h('div', { key: 'warnCli', style: warnBox },
           h('div', null, '未检测到 devecocli:启动/部署功能不可用。'),
@@ -615,7 +617,7 @@
         if (!tc.hdcExe) nodes.push(h('div', { key: 'warnHdc', style: warnBox }, '未检测到 hdc:请设置环境变量 DEVECO_SDK_HOME(指向 DevEco Studio SDK 目录)后重启 dsh web。'))
       }
 
-      // 模拟器实例
+      // Emulator instances
       nodes.push(h(Card, { key: 'emuCard', title: '模拟器实例' },
         h('div', { style: row },
           h('span', { style: label }, '模拟器'),
@@ -657,7 +659,7 @@
         showRaw && emuRaw ? h('pre', { style: { ...field, maxHeight: 110, overflow: 'auto', margin: '2px 0 0', fontSize: 10, whiteSpace: 'pre-wrap' } }, emuRaw) : null,
       ))
 
-      // 应用工程
+      // Application project
       nodes.push(h(Card, { key: 'projCard', title: '应用项目' },
         h('div', { style: row },
           h('span', { style: label }, '查找目录'),
@@ -681,7 +683,7 @@
         h('div', { style: { fontSize: 11, color: s.faint, margin: '-2px 0 8px' } }, '需包含 build-profile.json5 的项目根;点「扫描」列出子目录项目,或「浏览」直接选择'),
       ))
 
-      // 部署目标:单台设备只读展示;多台在线时可下拉选择。
+      // Deploy target: read-only for a single device, a dropdown when several are online.
       const devLabel = (serial) => {
         const n = instances.find((it) => it.serial === serial)?.name
         return n ? `${n} (${serial})` : serial
@@ -697,7 +699,8 @@
             })
             : h('div', { style: { ...field, display: 'flex', alignItems: 'center', color: targetDevice ? s.fg : s.faint, cursor: 'default' } },
               targetDevice ? devLabel(targetDevice) : '暂无在线设备')),
-        // 截图:紧贴设备行,与设备字段同高对齐;轻量描边,不抢部署主按钮。
+        // The screenshot action sits under the device row, matches the field height, and stays
+        // outlined so it never competes with the primary deploy button.
         h('div', { style: { marginTop: 8 } },
           h(Btn, {
             secondary: true, icon: IC.camera, disabled: busy !== '' || !targetDevice, onClick: takeShot,
@@ -711,7 +714,7 @@
             : h('div', { style: { fontSize: 11, color: s.faint, marginTop: 6 } }, '暂无在线设备;请先在「模拟器实例」启动模拟器'))),
       ))
 
-      // 部署主按钮(截图已移至「部署目标」卡片,见设备行下方)
+      // Primary deploy button (the screenshot action lives in the deploy-target card)
       nodes.push(h('div', { key: 'deployBtn', style: { marginTop: 2 } },
         h(Btn, {
           primary: true, disabled: busy !== '', onClick: deploy, icon: IC.deploy,
@@ -720,7 +723,7 @@
         h('div', { style: { fontSize: 11, color: s.faint, margin: '6px 2px 0' } }, 'devecocli run:构建 → 安装 → 启动(首次约 1–3 分钟)'),
       ))
 
-      // 调试输出
+      // Debug output
       nodes.push(h('div', { key: 'logWrap', style: { ...card, marginTop: 4, padding: 8, marginBottom: 0 } },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 } },
           h('span', { style: { fontSize: 11, color: s.muted, letterSpacing: '.06em', textTransform: 'uppercase' } }, '调试输出'),
@@ -737,7 +740,7 @@
 
       if (tcMsg) nodes.push(h('div', { key: 'tcerr', style: { color: s.danger, fontSize: 12, marginTop: 6 } }, tcMsg))
 
-      // 最近截图:内嵌面板底部;滚轮缩放、按住拖动平移、双击重置。
+      // Latest screenshot: embedded at the panel bottom; wheel zoom, drag pan, double-click reset.
       if (shot) nodes.push(h(Card, {
         key: 'shotCard', title: '最近截图', style: { marginTop: 12 },
         action: h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
@@ -777,7 +780,7 @@
         shot.dataUrl ? h('div', { style: { fontSize: 10, color: s.faint, marginTop: 6 } }, '滚轮缩放 · 按住拖动平移 · 双击重置') : null,
       ))
 
-      // 面板可上下拖动滚动(空白处按下拖动);内容超出时也可用滚轮/滚动条。
+      // The panel scrolls by dragging from empty space, plus the wheel/scrollbar.
       return h('div', {
         onMouseDown: onPanelDragStart,
         style: { padding: 8, color: s.fg, height: '100%', overflowY: 'auto', boxSizing: 'border-box' },
@@ -785,7 +788,7 @@
     }
 
     function apply(ctx: Ctx) {
-      // 隔离:客户端 apply 的任何异常只打日志、绝不抛出,避免影响 DSH client loader。
+      // Isolation: never throw from client apply; log only, so the DSH client loader is unaffected.
       let disposed = false
       let registered = false
       let timer = null
