@@ -164,6 +164,9 @@
       const [instanceSel, setInstanceSel] = useState(() => lsGet('instance'))
       const [shot, setShotState] = useState(lastShot)
       const [copied, setCopied] = useState(false)
+      // 截图预览视图:缩放与平移合并为一个原子状态(以鼠标位置为中心缩放需同时更新二者)。
+      const [shotView, setShotView] = useState({ zoom: 1, x: 0, y: 0 })
+      const shotBoxRef = useRef(null)
       // 写入 state 的同时更新模块级缓存(面板重挂载后可恢复)。
       const setShot = (v) => { lastShot = v; setShotState(v) }
       const [showRaw, setShowRaw] = useState(false)
@@ -241,6 +244,26 @@
         lsSet('instance', instanceSel)
         lsSet('module', moduleSel)
       }, [project, scanRoot, instanceSel, moduleSel])
+      // 截图预览:滚轮以鼠标位置为中心缩放(需非 passive 监听才能阻止面板随之滚动)。
+      useEffect(() => {
+        const el = shotBoxRef.current
+        if (!el || !shot) return
+        const onWheel = (e) => {
+          e.preventDefault()
+          const rect = el.getBoundingClientRect()
+          // 鼠标相对容器中心的坐标
+          const mx = e.clientX - rect.left - rect.width / 2
+          const my = e.clientY - rect.top - rect.height / 2
+          setShotView((v) => {
+            const zoom = Math.min(4, Math.max(0.25, Math.round(v.zoom * (e.deltaY < 0 ? 1.1 : 0.9) * 100) / 100))
+            const k = zoom / v.zoom
+            // 保持鼠标下的图像点不动:offset' = m*(1-k) + k*offset
+            return { zoom, x: mx * (1 - k) + k * v.x, y: my * (1 - k) + k * v.y }
+          })
+        }
+        el.addEventListener('wheel', onWheel, { passive: false })
+        return () => el.removeEventListener('wheel', onWheel)
+      }, [shot])
 
       // ── 应用工程选择 ─────────────────────────────────────────────────
       // 直接调用系统/宿主原生目录选择框。
@@ -468,6 +491,7 @@
           if (v && v.path) {
             pushLog('ok', `截图已保存 → ${v.path}`)
             setShot({ path: v.path, dataUrl: v.dataUrl || null })
+            setShotView({ zoom: 1, x: 0, y: 0 })
           } else pushLog('info', '截图完成,但宿主未返回保存路径')
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error)
@@ -498,6 +522,22 @@
       const shortPath = (p) => {
         const parts = String(p).split(/[\\/]/)
         return parts.length > 2 ? `…\\${parts.slice(-2).join('\\')}` : String(p)
+      }
+      // 截图图片:按住拖动平移(阻止冒泡,避免同时触发面板拖动滚动)。
+      const onShotImgDragStart = (e) => {
+        if (!shot) return
+        e.preventDefault()
+        e.stopPropagation()
+        const startX = e.clientX
+        const startY = e.clientY
+        const base = shotView
+        const move = (ev) => setShotView((v) => ({ zoom: v.zoom, x: base.x + (ev.clientX - startX), y: base.y + (ev.clientY - startY) }))
+        const up = () => {
+          window.removeEventListener('mousemove', move)
+          window.removeEventListener('mouseup', up)
+        }
+        window.addEventListener('mousemove', move)
+        window.addEventListener('mouseup', up)
       }
       // 面板内容可上下拖动:在空白处按下并拖动即滚动内容(按钮/输入不受影响)。
       const onPanelDragStart = (e) => {
@@ -697,19 +737,32 @@
 
       if (tcMsg) nodes.push(h('div', { key: 'tcerr', style: { color: s.danger, fontSize: 12, marginTop: 6 } }, tcMsg))
 
-      // 最近截图:内嵌在面板底部(与其它卡片同款),关闭按钮在右上角。
+      // 最近截图:内嵌面板底部;滚轮缩放、按住拖动平移、双击重置。
       if (shot) nodes.push(h(Card, {
         key: 'shotCard', title: '最近截图', style: { marginTop: 12 },
-        action: h(Btn, { ghost: true, style: { padding: '0 6px', fontSize: 14, lineHeight: 1 }, onClick: () => setShot(null), title: '关闭' }, '×'),
+        action: h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+          h('span', { style: { fontSize: 10, color: s.faint } }, `${Math.round(shotView.zoom * 100)}%`),
+          h(Btn, { ghost: true, style: { padding: '0 6px', fontSize: 14, lineHeight: 1 }, onClick: () => setShot(null), title: '关闭' }, '×')),
       },
         h('div', {
+          ref: shotBoxRef,
           style: {
             background: 'rgba(0,0,0,.35)', border: `1px solid ${s.border}`, borderRadius: 8,
-            padding: 6, display: 'flex', justifyContent: 'center', alignItems: 'center',
+            height: 300, overflow: 'hidden', position: 'relative',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
           },
         },
           shot.dataUrl
-            ? h('img', { src: shot.dataUrl, style: { maxWidth: '100%', maxHeight: 240, objectFit: 'contain', borderRadius: 6, display: 'block' } })
+            ? h('img', {
+              src: shot.dataUrl, draggable: false,
+              onMouseDown: onShotImgDragStart,
+              onDoubleClick: () => setShotView({ zoom: 1, x: 0, y: 0 }),
+              style: {
+                maxWidth: '100%', maxHeight: '100%', borderRadius: 6, userSelect: 'none', cursor: 'grab',
+                transform: `translate(${shotView.x}px, ${shotView.y}px) scale(${shotView.zoom})`,
+                transformOrigin: 'center center',
+              },
+            })
             : h('div', { style: { fontSize: 11, color: s.faint, padding: '18px 0' } }, '(预览不可用,文件已保存)')),
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 } },
           h('span', {
@@ -721,6 +774,7 @@
             style: { padding: '4px 10px', color: copied ? s.ok : s.fg, border: `1px solid ${copied ? s.ok : s.border}` },
             onClick: () => copyText(shot.path),
           }, copied ? '已复制 ✓' : '复制路径')),
+        shot.dataUrl ? h('div', { style: { fontSize: 10, color: s.faint, marginTop: 6 } }, '滚轮缩放 · 按住拖动平移 · 双击重置') : null,
       ))
 
       // 面板可上下拖动滚动(空白处按下拖动);内容超出时也可用滚轮/滚动条。
