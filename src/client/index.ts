@@ -53,6 +53,7 @@
       accentSoft: 'rgba(79,110,247,.16)',
       ok: 'var(--dsh-success, #2f9e44)',
       danger: 'var(--dsh-danger, #e5484d)',
+      solid: '#1d1f28',
     }
     const row = { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, flexWrap: 'wrap' }
     const label = { fontSize: 12, color: s.muted, width: 64, flex: '0 0 64px' }
@@ -121,7 +122,7 @@
             h('span', { style: { display: 'inline-flex', color: s.faint, transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .12s' } }, h(Icon, { src: IC.chevron, size: 14 }))),
           open ? h('div', { style: {
             position: 'absolute', zIndex: 10, left: 0, right: 0, top: 'calc(100% + 4px)',
-            background: 'var(--dsh-bg-solid, #1d1f28)', border: `1px solid ${s.border}`, borderRadius: 8, padding: 4,
+            background: s.solid, border: `1px solid ${s.border}`, borderRadius: 8, padding: 4,
             boxShadow: '0 8px 24px rgba(0,0,0,.45)', maxHeight: 220, overflowY: 'auto',
           } },
             options.length === 0
@@ -750,7 +751,7 @@
         h('div', {
           ref: shotBoxRef,
           style: {
-            background: 'rgba(0,0,0,.35)', border: `1px solid ${s.border}`, borderRadius: 8,
+            background: '#15171d', border: `1px solid ${s.border}`, borderRadius: 8,
             height: 300, overflow: 'hidden', position: 'relative',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
           },
@@ -781,9 +782,16 @@
       ))
 
       // The panel scrolls by dragging from empty space, plus the wheel/scrollbar.
+      // Frosted glass only on the panel content: the theme base color stays translucent
+      // and blurs whatever sits behind it, so text stays readable without a black slab.
       return h('div', {
         onMouseDown: onPanelDragStart,
-        style: { padding: 8, color: s.fg, height: '100%', overflowY: 'auto', boxSizing: 'border-box' },
+        style: {
+          padding: 8, color: s.fg, height: '100%', overflowY: 'auto', boxSizing: 'border-box',
+          background: 'var(--dsw-alias-bg-base, rgba(46, 52, 66, 0.55))',
+          backdropFilter: 'blur(18px) saturate(1.15)',
+          WebkitBackdropFilter: 'blur(18px) saturate(1.15)',
+        },
       }, nodes)
     }
 
