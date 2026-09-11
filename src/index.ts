@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
 import { readdir, readFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { dirname, join, resolve, sep } from 'node:path'
-import { homedir } from 'node:os'
+import { homedir, networkInterfaces } from 'node:os'
 
 /** Minimal cordis context: only the members used here, avoiding the full DSH type graph. */
 export interface Ctx {
@@ -385,11 +385,14 @@ let lastLintNotice = ''
 let lintNotice = ''
 let lintDeliveries = 0
 
-function createApi(config) {
+function createApi() {
   const api: Record<string, (payload?: any, res?: any) => Promise<any>> = {}
 
   api.toolchain = async () => {
-    const sdk = process.env.DEVECO_SDK_HOME || config?.sdkHome || ''
+    // SDK root comes from the environment only: this value is reported to the panel, and hdc is
+    // resolved from the same variable, so a row-config override could only report a path that
+    // discovery does not actually use.
+    const sdk = process.env.DEVECO_SDK_HOME || ''
     const cliPath = resolveDevecoCli()
     // Local devecocli version (shown in the panel; helps spot an outdated CLI).
     let cliVersion = null
@@ -552,12 +555,20 @@ function createApi(config) {
   // A --fix run cannot report what is left (codelinter prints only what it could fix), so it is
   // always followed by a check of the same scope: the panel result is "fixed N files; recheck …".
   api['check.lint'] = async (payload) => {
-    const cli = resolveDevecoCli()
-    if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
+    // Validate the target before probing the toolchain: these checks are pure filesystem lookups,
+    // they decide a request that a missing CLI would only mask, and a request about to be rejected
+    // must not spawn `npm root -g` first.
     const project = typeof payload?.projectPath === 'string' ? resolve(payload.projectPath) : ''
     if (!project || !existsSync(project)) throw Object.assign(new Error('应用工程路径不存在'), { code: 'bad-request' })
     const asked = payload?.mode
     const fixing = asked === 'fix' || asked === 'fix-all'
+    // Only a --fix run rewrites files, so only it needs a HarmonyOS project root; a plain check
+    // stays usable on any directory the user picked (a single module, for instance).
+    if (fixing && !existsSync(join(project, PROJECT_MARK))) {
+      throw Object.assign(new Error(`“${project}”不是鸿蒙工程根(缺少 ${PROJECT_MARK}),不能执行自动修复`), { code: 'bad-request' })
+    }
+    const cli = resolveDevecoCli()
+    if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
     const full = asked === 'all' || asked === 'fix-all'
     const mode = full ? (fixing ? 'fix-all' : 'all') : (fixing ? 'fix' : 'changed')
     const scopeMode = full ? 'all' : 'changed'
@@ -718,18 +729,121 @@ function createApi(config) {
 
 // ── Route wiring ────────────────────────────────────────────────────────
 
+/** Body cap for one request: the panel only ever sends a small JSON payload. */
+const MAX_BODY_BYTES = 1_000_000
+
+function headerValue(headers: any, name: string): string | undefined {
+  const value = headers?.[name]
+  return typeof value === 'string' ? value : undefined
+}
+
+/** Normalized URL of a Host/trustedHosts authority, or undefined when unparsable. */
+function parseAuthority(authority: string | undefined): URL | undefined {
+  if (authority === undefined || authority === '') return undefined
+  try {
+    // http: is a WHATWG "special scheme": parsing yields a non-empty hostname or throws.
+    return new URL(`http://${authority}`)
+  } catch {
+    return undefined
+  }
+}
+
+/** localhost, IPv6 loopback, or any 127/8 IPv4 address (DSH's loopback-hostname.ts). */
+function isLoopbackHostname(hostname: string): boolean {
+  if (hostname === 'localhost' || hostname === '[::1]') return true
+  const parts = hostname.split('.')
+  return parts.length === 4 && parts[0] === '127'
+    && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+}
+
+/**
+ * Whether one request may reach this plugin's API — the browser-trust fence DSH applies to its
+ * own /api (packages/client/connection/src/api-request-trust.ts). This route is registered as a
+ * prefix on webServer, so it inherits none of DSH's fencing; without it a DNS-rebound host or a
+ * malicious page could drive deveco.install, check.lint --fix or deploy on this machine.
+ *  - Host binds every request: a browser fills Host from the URL it believes it is talking to,
+ *    so a rebound page carries the attacker's domain even though the socket lands here.
+ *  - `sec-fetch-site: cross-site` is refused outright, whatever the Origin says.
+ *  - An attached Origin must be this exact authority; "null" (opaque origin) is refused.
+ * @param req - the node request.
+ * @param trustedHosts - non-loopback authorities this deployment also serves, in DSH's
+ *   client-connection shape: a port-less entry matches that host on any port.
+ */
+export function trustRequest(req: any, trustedHosts: readonly string[] = []): boolean {
+  const hostUrl = parseAuthority(headerValue(req?.headers, 'host'))
+  if (hostUrl === undefined) return false
+  if (!isLoopbackHostname(hostUrl.hostname)) {
+    const declared = trustedHosts.some((entry) => {
+      const entryUrl = parseAuthority(entry)
+      if (entryUrl === undefined) return false
+      return entryUrl.port === '' ? entryUrl.hostname === hostUrl.hostname : entryUrl.host === hostUrl.host
+    })
+    if (!declared) return false
+  }
+  if (headerValue(req?.headers, 'sec-fetch-site') === 'cross-site') return false
+  const origin = headerValue(req?.headers, 'origin')
+  if (origin === undefined) return true
+  try {
+    return new URL(origin).host === hostUrl.host
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Fence authorities for this deployment, taken from the same source DSH's own /api uses: the Web
+ * runtime publishes `{ lanAddresses, trustedHosts }` as the `webRuntime` service, already folding
+ * in `dsh web --trusted-host` and this machine's LAN literals (resolveLanTrust). Reading it keeps
+ * the two fences in step — a second, plugin-private trust list is how a deployment ends up with a
+ * panel that 403s while the rest of the GUI keeps working.
+ * Loopback is always accepted by trustRequest and needs no entry here. When the service is absent
+ * (a non-web host context), fall back to deriving the LAN literals a `0.0.0.0` bind is reached by:
+ * only IP literals, since DNS rebinding needs an attacker-controlled name and an IP-literal Host
+ * is safe on any port.
+ * @param webRuntime - the published `{ lanAddresses, trustedHosts }`, when present.
+ * @param bindHost - the webserver's active bind host.
+ */
+export function fenceAuthorities(webRuntime: any, bindHost: unknown): string[] {
+  const published = webRuntime?.trustedHosts
+  if (Array.isArray(published)) {
+    return published.filter((entry): entry is string => typeof entry === 'string' && entry.trim() !== '')
+  }
+  if (bindHost !== '0.0.0.0') return []
+  return Object.values(networkInterfaces()).flat()
+    .filter((iface) => iface !== undefined && iface.family === 'IPv4' && !iface.internal)
+    .map((iface) => String(iface?.address ?? ''))
+    .filter((address) => address !== '')
+}
+
 function readBody(req: any): Promise<string> {
   return new Promise((resolveBody, rejectBody) => {
-    const chunks = []
+    const chunks: Buffer[] = []
+    let size = 0
+    let settled = false
     req.on('data', (chunk) => {
-      chunks.push(chunk)
-      if (chunks.reduce((sum, c) => sum + c.length, 0) > 1_000_000) {
-        rejectBody(new Error('request body too large'))
-        req.destroy()
+      if (settled) return
+      // Running total, not a per-chunk sum: the old reduce was O(n²) on a large body.
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        settled = true
+        chunks.length = 0
+        // Reject so the handler can answer 413, and drain the rest so that answer is writable.
+        rejectBody(Object.assign(new Error(`请求体过大(上限 ${MAX_BODY_BYTES} 字节)`), { code: 'too-large' }))
+        req.resume()
+        return
       }
+      chunks.push(chunk)
     })
-    req.on('end', () => resolveBody(Buffer.concat(chunks).toString('utf8')))
-    req.on('error', rejectBody)
+    req.on('end', () => {
+      if (settled) return
+      settled = true
+      resolveBody(Buffer.concat(chunks).toString('utf8'))
+    })
+    req.on('error', (error) => {
+      if (settled) return
+      settled = true
+      rejectBody(error)
+    })
   })
 }
 
@@ -746,7 +860,9 @@ function writeOk(res, value) {
 function writeError(res, error) {
   const code = error && error.code ? error.code : 'internal'
   const message = error instanceof Error ? error.message : String(error)
-  const status = code === 'bad-request' || code === 'toolchain' || code === 'fs-error' || code === 'image-missing' ? 400 : 500
+  const status = code === 'too-large' ? 413
+    : code === 'bad-request' || code === 'toolchain' || code === 'fs-error' || code === 'image-missing' ? 400
+      : 500
   writeJson(res, status, { ok: false, error: { code, message } })
 }
 
@@ -862,6 +978,112 @@ async function firstRunningSerial(cli) {
   return inst ? inst.serial : ''
 }
 
+/** Drop the spinner line and blank lines from a devecocli `ui layout` dump. */
+function cleanLayout(text: string): string {
+  return String(text || '').split(/\r?\n/).filter((l) => l.trim() !== '' && !/Dumping layout/i.test(l)).join('\n')
+}
+
+/**
+ * Cap a layout tree. The note names `depth`, which is a real emu_ui parameter: an earlier
+ * message told the reader to "pass depth" while the tool had no such property.
+ */
+function capTree(tree: string): string {
+  return tree.length > 6000 ? `${tree.slice(0, 6000)}\n…(truncated; retry layout with a smaller depth)` : tree
+}
+
+/** One compact layout line: `TYPE#id [x1,y1,x2,y2] "text" [clickable] [longClickable] …`. */
+export interface LayoutLine {
+  /** Unescaped node text; empty for nodes that carry none. */
+  text: string
+  /** Node rectangle, or null when the line carries no bounds. */
+  bounds: [number, number, number, number] | null
+  /** Node rectangle area in px, used to prefer the innermost match. */
+  area: number
+  clickable: boolean
+  /** Leading-space count; the dump nests children two spaces deeper than their parent. */
+  indent: number
+  raw: string
+}
+
+export function parseLayoutLine(raw: string): LayoutLine {
+  const text = raw.match(/"((?:[^"\\]|\\.)*)"/)
+  let decoded = ''
+  if (text) {
+    try { decoded = JSON.parse(`"${text[1]}"`) } catch { decoded = text[1] }
+  }
+  const box = raw.match(/\[(-?\d+),(-?\d+),(-?\d+),(-?\d+)\]/)
+  const bounds: [number, number, number, number] | null = box
+    ? [Number(box[1]), Number(box[2]), Number(box[3]), Number(box[4])]
+    : null
+  return {
+    text: decoded,
+    bounds,
+    area: bounds ? Math.abs((bounds[2] - bounds[0]) * (bounds[3] - bounds[1])) : Number.MAX_SAFE_INTEGER,
+    clickable: /\bclickable\b/.test(raw),
+    indent: raw.length - raw.trimStart().length,
+    raw,
+  }
+}
+
+/**
+ * The node whose center should be tapped for a match. Verified on a real dump: a tab label
+ * flush with the screen edge has its own center in the system gesture area, where the tap is
+ * swallowed, while its clickable parent is one level up. So an inert match climbs to its
+ * nearest clickable ancestor — unless that ancestor dwarfs the label, which makes it a
+ * container (a whole clickable page) rather than the control.
+ */
+function tapTarget(lines: LayoutLine[], index: number): LayoutLine {
+  const hit = lines[index]
+  if (hit.clickable) return hit
+  let depth = hit.indent
+  for (let i = index - 1; i >= 0; i--) {
+    if (lines[i].indent >= depth) continue
+    if (lines[i].clickable) {
+      // A zero-area match has no visible point of its own, so it climbs whatever it finds
+      // inside; otherwise an ancestor far larger than the label is a container, not the control.
+      return hit.area === 0 || lines[i].area <= hit.area * 64 ? lines[i] : hit
+    }
+    depth = lines[i].indent
+  }
+  return hit
+}
+
+/**
+ * Center of a node, moved out of the screen's bottom edge when it would land there.
+ * Measured on a 1320x2856 emulator: a bottom tab bar spanning y 2688..2856 answers at
+ * 2716-2730 (icon) but not at 2772-2832 (label), where the tap is swallowed by the system
+ * gesture area — or read as a back gesture, which navigates away instead of failing loudly.
+ * The bottom ~96px (3.4%) is dead, so a center inside the outermost 5% is replaced by the
+ * center of the node's upper third, which stays inside the node.
+ */
+function tapPoint(target: LayoutLine, screenBottom: number): { x: number; y: number } {
+  const [x1, y1, x2, y2] = target.bounds
+  const x = Math.round((x1 + x2) / 2)
+  const y = Math.round((y1 + y2) / 2)
+  return screenBottom > 0 && y > screenBottom * 0.95 ? { x, y: Math.round(y1 + (y2 - y1) / 6) } : { x, y }
+}
+
+/**
+ * Pick the layout node to tap for a label, plus the node whose center is actually used.
+ * A plain `includes` scan over the dump used to take the first hit, so a tap meant for a short
+ * label landed on a container whose text merely contained it. Rank instead: exact text before
+ * mere containment, clickable nodes before inert ones, then the smallest area so an inner node
+ * wins over the outer container that holds it.
+ */
+export function pickLayoutLine(tree: string, label: string): { line: LayoutLine; target: LayoutLine; exact: boolean; point: { x: number; y: number } } | null {
+  const wanted = String(label ?? '')
+  if (!wanted) return null
+  const lines = String(tree || '').split(/\r?\n/).map(parseLayoutLine)
+  const hits = lines.map((_, i) => i).filter((i) => lines[i].bounds && lines[i].text.includes(wanted))
+  if (!hits.length) return null
+  const rank = (i: number) => (lines[i].text === wanted ? 0 : 1) * 2 + (lines[i].clickable ? 0 : 1)
+  hits.sort((a, b) => rank(a) - rank(b) || lines[a].area - lines[b].area)
+  const best = hits[0]
+  const target = tapTarget(lines, best)
+  const screenBottom = Math.max(...lines.map((l) => (l.bounds ? l.bounds[3] : 0)))
+  return { line: lines[best], target, exact: lines[best].text === wanted, point: tapPoint(target, screenBottom) }
+}
+
 /**
  * Two model tools:
  *  - emu    : instance list/start/stop (reuses image precheck + readiness polling)
@@ -910,13 +1132,14 @@ function createToolDefs(api) {
 
   const emuUi = {
     name: 'emu_ui',
-    description: 'Drive the emulator screen via devecocli ui: layout (compact tree lines: type [x1,y1,x2,y2] "text" clickable), click (by label -> auto-locates and taps its center; or x/y), text, swipe, screenshot (saves a PNG; view with read_image).',
+    description: 'Drive the emulator screen via devecocli ui: layout (compact tree lines: type [x1,y1,x2,y2] "text" clickable; depth limits the tree), click (by label -> exact text match preferred among clickable nodes, or x/y), text, swipe, screenshot (saves a PNG; view with read_image).',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['layout', 'click', 'text', 'swipe', 'screenshot'], description: 'UI action' },
         device: { type: 'string', description: 'Target serial (default: first running emulator)' },
-        label: { type: 'string', description: 'click: node text; runs layout and taps that center in one call' },
+        label: { type: 'string', description: 'click: node text; runs layout and taps its center in one call (exact match, else the smallest clickable node containing it)' },
+        depth: { type: 'integer', description: 'layout: tree depth limit (0=unlimited, 1=root only, 2=root+children)' },
         thenLayout: { type: 'boolean', description: 'click: return a fresh layout after the tap (verifies in one call)' },
         waitMs: { type: 'integer', description: 'thenLayout delay, ms (default 600, max 5000)' },
         x: { type: 'integer', description: 'click x, or swipe start x' },
@@ -924,7 +1147,7 @@ function createToolDefs(api) {
         x2: { type: 'integer', description: 'swipe end x' },
         y2: { type: 'integer', description: 'swipe end y' },
         text: { type: 'string', description: 'text to input' },
-        root: { type: 'string', description: 'screenshot root; PNG goes to <root>/screenshots (default: cwd)' },
+        root: { type: 'string', description: 'screenshot root; PNG goes to <root>/screenshots (default: the DSH host process cwd, not the session workspace — pass root to choose)' },
       },
       required: ['action'],
     },
@@ -938,16 +1161,17 @@ function createToolDefs(api) {
       const run = (argv, timeoutMs) => runCli([process.execPath, cli, ...argv], { timeoutMs })
 
       if (action === 'layout') {
-        const argv = ['ui', 'layout', '--device', device]
-        const r = await run(argv, 30000)
+        const depth = Number.isFinite(args?.depth) ? Math.max(0, Math.floor(args.depth)) : 0
+        const r = await run(['ui', 'layout', '--device', device, '--depth', String(depth)], 30000)
         if (r.code !== 0) return { ok: false, device, error: tailText(r.output, 6) }
-        const tree = r.output.split(/\r?\n/).filter((l) => l.trim() !== '' && !/Dumping layout/i.test(l)).join('\n')
-        return { ok: true, device, tree: tree.length > 6000 ? `${tree.slice(0, 6000)}\n…(truncated; pass depth to narrow)` : tree }
+        return { ok: true, device, tree: capTree(cleanLayout(r.output)) }
       }
       if (action === 'click') {
         let argv = ['ui', 'click', '--device', device]
         let point = null
         let matched = ''
+        let exact = true
+        let tapped = ''
         if (Number.isFinite(args?.x) && Number.isFinite(args?.y)) {
           point = { x: args.x, y: args.y }
           argv.push(String(args.x), String(args.y))
@@ -955,32 +1179,38 @@ function createToolDefs(api) {
           // Resolve a label to its center in one call: avoids a layout round-trip before click.
           const lr = await run(['ui', 'layout', '--device', device], 30000)
           if (lr.code !== 0) return { ok: false, device, error: tailText(lr.output, 6) }
-          const line = lr.output.split(/\r?\n/).find((l) => l.includes(args.label))
-          const m = line ? line.match(/\[(\d+),(\d+),(\d+),(\d+)\]/) : null
-          if (!m) return { ok: false, device, error: `no layout node matching "${args.label}"` }
-          point = { x: Math.round((Number(m[1]) + Number(m[3])) / 2), y: Math.round((Number(m[2]) + Number(m[4])) / 2) }
-          matched = line.trim()
+          const hit = pickLayoutLine(cleanLayout(lr.output), args.label)
+          if (!hit) return { ok: false, device, error: `no layout node matching "${args.label}"` }
+          point = hit.point
+          matched = hit.line.raw.trim()
+          exact = hit.exact
+          tapped = hit.target === hit.line ? '' : hit.target.raw.trim()
           argv = ['ui', 'click', String(point.x), String(point.y), '--device', device]
         } else return { ok: false, error: 'click needs label or x/y' }
         const r = await run(argv, 20000)
         if (r.code !== 0) return { ok: false, device, error: tailText(r.output, 4) }
         const result: any = { ok: true, device, x: point.x, y: point.y }
         if (matched) result.matched = matched
+        // A containment-only match tapped a node whose text merely held the label; say so,
+        // so the caller can re-issue with exact x/y when that is not the intended node.
+        if (matched && !exact) result.matchedBy = 'contains'
+        // The label sat in an inert node, so its clickable parent supplied the coordinates.
+        if (tapped) result.tapped = tapped
         // thenLayout verifies the tap in the same call: a fresh layout after a short settle delay.
         if (args?.thenLayout) {
           const wait = Number.isFinite(args?.waitMs) ? Math.max(0, Math.min(5000, args.waitMs)) : 600
           if (wait > 0) await new Promise((resolveWait) => setTimeout(resolveWait, wait))
           const after = await run(['ui', 'layout', '--device', device], 30000)
-          result.tree = after.code === 0
-            ? after.output.split(/\r?\n/).filter((l) => l.trim() !== '' && !/Dumping layout/i.test(l)).join('\n')
-            : tailText(after.output, 4)
+          result.tree = after.code === 0 ? capTree(cleanLayout(after.output)) : tailText(after.output, 4)
         }
         return result
       }
       if (action === 'text') {
         const value = typeof args?.text === 'string' ? args.text : ''
         if (!value) return { ok: false, error: 'text is required' }
-        const r = await run(['ui', 'text', value, '--device', device], 20000)
+        // `--` ends option parsing: without it a string starting with "-" is read as an option
+        // ("--help" prints help and exits 0, which the tool would have reported as success).
+        const r = await run(['ui', 'text', '--device', device, '--', value], 20000)
         return { ok: r.code === 0, device, error: r.code === 0 ? '' : tailText(r.output, 4) }
       }
       if (action === 'swipe') {
@@ -1118,7 +1348,7 @@ function createToolDefs(api) {
 export function apply(ctx: Ctx, config?: any) {
   // Isolation: never throw from host apply; log only, so the DSH composition keeps loading.
   try {
-    const api = createApi(config ?? {})
+    const api = createApi()
     let registered = false
     let timer: ReturnType<typeof setTimeout> | null = null
     let disposed = false
@@ -1139,6 +1369,19 @@ export function apply(ctx: Ctx, config?: any) {
             try {
               if (req.method !== 'POST') {
                 writeJson(res, 405, { ok: false, error: { code: 'method', message: 'only POST' } })
+                return
+              }
+              // Fence first, before any method lookup: a rebound or cross-site caller must not
+              // learn which methods exist, let alone reach install / lint --fix / deploy.
+              // Read per request so the authorities stay whatever DSH currently publishes.
+              if (!trustRequest(req, fenceAuthorities(ctx.get('webRuntime'), ws.host))) {
+                writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: '请求来源不可信(Host/Origin 校验未通过)' } })
+                return
+              }
+              // JSON-only: also refuses the no-preflight `text/plain` cross-site POST, which a
+              // browser would otherwise deliver to this route without any CORS preflight.
+              if (!/^application\/json\b/i.test(String(headerValue(req.headers, 'content-type') || ''))) {
+                writeJson(res, 415, { ok: false, error: { code: 'media-type', message: 'content-type 必须是 application/json' } })
                 return
               }
               const pathname = new URL(req.url ?? '/', 'http://dsh.internal').pathname

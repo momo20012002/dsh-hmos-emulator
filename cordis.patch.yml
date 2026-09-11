@@ -3,15 +3,9 @@
 # 挂载宿主行(loader 在 profile 启动时合并本文件)。
 # 客户端 bundle 由 profile 的 dsh.profile.bundles 列表加载(见 README 安装步骤)。
 #
-# 可选 row config(按需取消注释;未配置时宿主自动探测 devecocli/hdc):
-# - insert:
-#     - id: hmos-emulator
-#       name: dsh-hmos-emulator
-#       config:
-#         # devecocli 的 node CLI 入口(默认自动探测 npm 全局 @deveco/deveco-cli)
-#         devecoCliJs: <devecocli 的 node CLI 入口路径>
-#         # DevEco Studio SDK 根目录(默认读取环境变量 DEVECO_SDK_HOME)
-#         sdkHome: <DevEco Studio SDK 根路径>
+# 本插件没有 row config;两个外部依赖由环境变量指定,未设置时宿主自动探测:
+#   devecocli — DSH_HMOS_DEVECO_CLI 指向其 node CLI 入口,或 npm 全局安装 @deveco/deveco-cli
+#   hdc       — DEVECO_SDK_HOME 指向 DevEco Studio 的 SDK 目录
 - insert:
     - id: hmos-emulator
       name: dsh-hmos-emulator
