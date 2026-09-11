@@ -3,7 +3,8 @@
  *
  * Turns better-sidebar tab actions into real local work: toolchain discovery,
  * emulator start/stop, device listing, project browsing, build+deploy, screenshots,
- * and two model tools (emu / emu_ui) so an agent can drive the emulator directly.
+ * and one compact set of model tools (emu, emu_ui, hmos_deploy, hmos_log, hmos_docs) so an
+ * agent can drive the emulator, deploy, read logs and consult the DevEco docs directly.
  *
  * The client calls this module over same-origin HTTP JSON (prefix /dsh-hmos-emulator/api)
  * with the envelope { ok: true, value } / { ok: false, error: { code, message } }.
@@ -13,6 +14,8 @@
  */
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
+import { readdir, readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { dirname, join, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -34,7 +37,7 @@ const API_PREFIX = '/dsh-hmos-emulator/api'
 /** Allowed API methods (keeps this from becoming an arbitrary command executor). */
 const METHODS = new Set([
   'toolchain', 'emu.list', 'emu.start', 'emu.stop',
-  'devices', 'browse', 'scan', 'project.info', 'deploy', 'device.ready', 'deveco.install', 'deveco.update', 'screenshot',
+  'devices', 'browse', 'scan', 'project.info', 'check.lint', 'lint.notify', 'deploy', 'device.ready', 'deveco.install', 'deveco.update', 'screenshot',
 ])
 /** Methods whose handler owns the response (streaming); they skip the JSON envelope. */
 const STREAMING_METHODS = new Set(['deploy'])
@@ -376,6 +379,12 @@ async function waitDeviceReady(cli, name, timeoutMs = 120000, intervalMs = 3000)
 
 // ── API methods ─────────────────────────────────────────────────────────
 
+// Latest code-check result. It is cached here on every check, and only handed to the model
+// when the user presses "send to AI" (lint.notify) — never automatically.
+let lastLintNotice = ''
+let lintNotice = ''
+let lintDeliveries = 0
+
 function createApi(config) {
   const api: Record<string, (payload?: any, res?: any) => Promise<any>> = {}
 
@@ -538,6 +547,74 @@ function createApi(config) {
     return { modules: readModules(project) }
   }
 
+  // DevEco Code Linter for the selected project. Four mode pairs: changed / all decide the scope
+  // (uncommitted tracked files vs. the whole project), fix / fix-all add --fix to that scope.
+  // A --fix run cannot report what is left (codelinter prints only what it could fix), so it is
+  // always followed by a check of the same scope: the panel result is "fixed N files; recheck …".
+  api['check.lint'] = async (payload) => {
+    const cli = resolveDevecoCli()
+    if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
+    const project = typeof payload?.projectPath === 'string' ? resolve(payload.projectPath) : ''
+    if (!project || !existsSync(project)) throw Object.assign(new Error('应用工程路径不存在'), { code: 'bad-request' })
+    const asked = payload?.mode
+    const fixing = asked === 'fix' || asked === 'fix-all'
+    const full = asked === 'all' || asked === 'fix-all'
+    const mode = full ? (fixing ? 'fix-all' : 'all') : (fixing ? 'fix' : 'changed')
+    const scopeMode = full ? 'all' : 'changed'
+    const timeoutMs = full ? 600000 : 300000
+    const argv = [process.execPath, cli, 'check', 'lint', project]
+    if (!full) argv.push('--incremental')
+    if (fixing) argv.push('--fix')
+    // Hash the sources around the run: --fix must be judged by what it rewrote in the files.
+    const before = fixing ? await hashTree(project) : null
+    const fixRun = await runCli(argv, { timeoutMs })
+    // The reported state always comes from a plain check, never from a --fix run's own summary.
+    const check = fixing ? await runCli(argv.filter((a) => a !== '--fix'), { timeoutMs }) : fixRun
+    const text = check.output
+    const summary = parseLintSummary(text)
+    const hasProblems = summary !== null && (summary.errors > 0 || summary.warnings > 0 || summary.suggestions > 0)
+    // Only an empty result of a scoped run is ambiguous, so git is consulted just for that case.
+    const changedFiles = summary !== null && summary.files === 0 && !full ? await countChangedCode(project) : null
+    const outcome = lintOutcome(summary, scopeMode, changedFiles)
+    let stats = outcome.stats
+    if (fixing) {
+      let fixedFiles: number | null = null
+      if (before !== null) {
+        const after = await hashTree(project)
+        if (after !== null) {
+          fixedFiles = 0
+          for (const [path, hash] of after) if (before.get(path) !== hash) fixedFiles += 1
+          for (const path of before.keys()) if (!after.has(path)) fixedFiles += 1
+        }
+      }
+      stats = `${fixStats(fixedFiles)};${outcome.stats === '未发现告警' ? '复检未发现告警' : `复检 — ${outcome.stats}`}`
+    }
+    const modeLabel = LINT_LABELS[mode]
+    // Issue entries come before the summary line, so an excerpt keeps the head when dirty.
+    const excerpt = hasProblems ? headText(text, 30) : tailText(text, 2)
+    const forModel = outcome.empty ? '' : hasProblems ? headText(text, 12) : tailText(text, 1)
+    const clipped = forModel.length > 1500 ? `${forModel.slice(0, 1500)}\n…(已截断;需要全部问题时再跑一次检查)` : forModel
+    lastLintNotice = `[代码检查] ${modeLabel} ${project} — ${stats}${clipped ? `\n${clipped}` : ''}`
+    return {
+      ok: check.code === 0,
+      code: check.code,
+      timedOut: fixRun.timedOut || check.timedOut,
+      summary,
+      empty: outcome.empty,
+      stats,
+      text: excerpt,
+    }
+  }
+
+  // Hand the cached check result to the model only when the user asks for it. The runtime
+  // context provider (registered in apply) delivers it on the next prompt assembly.
+  api['lint.notify'] = async () => {
+    if (!lastLintNotice) throw Object.assign(new Error('尚未生成检查结果,请先执行代码检查'), { code: 'bad-request' })
+    lintNotice = lastLintNotice
+    lintDeliveries = 0
+    return { sent: true, bytes: lintNotice.length }
+  }
+
   api.deploy = async (payload, res) => {
     const cli = resolveDevecoCli()
     if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
@@ -679,10 +756,103 @@ function writeError(res, error) {
 const TOOL_OUT_SCHEMA = { type: 'object', additionalProperties: true }
 const toolRender = (args, value) => [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }]
 
+/** Keep the first n non-empty lines (issue lists put entries before the summary). */
+function headText(text, n) {
+  const lines = String(text || '').split(/\r?\n/).filter((l) => l.trim() !== '')
+  return lines.slice(0, n).join('\n')
+}
+
 /** Keep the last n non-empty lines (trims command output before it reaches context). */
 function tailText(text, n) {
   const lines = String(text || '').split(/\r?\n/).filter((l) => l.trim() !== '')
   return lines.slice(-n).join('\n')
+}
+
+export interface LintSummary {
+  issues: number
+  errors: number
+  warnings: number
+  suggestions: number
+  files: number
+}
+
+/**
+ * How many uncommitted code files `--incremental` would inspect under the project. Only tracked
+ * modifications count: a new untracked .ets file was verified to be ignored by codelinter even
+ * though it matches code-linter.json5 (so "新增" from the docs does not cover untracked files).
+ * Null when git cannot be used, so wording can never claim more than was verified.
+ *
+ * Note: codelinter's "Files checked" counts files that produced a finding, not files scanned, so
+ * it can never be used to tell "nothing to check" from "checked and clean".
+ */
+async function countChangedCode(project: string): Promise<number | null> {
+  const r = await runCli(['git', 'status', '--porcelain', '--', '.'], { cwd: project, timeoutMs: 15000 })
+  if (r.code !== 0) return null
+  return r.output.split(/\r?\n/).filter((l) => !l.startsWith('??') && /\.(ets|ts|js)$/.test(l)).length
+}
+
+/**
+ * Read a code-check result the way a user would. "changed"/"fix" pass --incremental, which only
+ * inspects uncommitted tracked files: with none of them nothing was verified, and reporting that
+ * as "0 errors" would be a false all-clear.
+ */
+export function lintOutcome(summary: LintSummary | null, mode: string, changedFiles: number | null): { empty: boolean; stats: string } {
+  if (summary === null) return { empty: false, stats: '未解析到结果' }
+  const scoped = mode === 'changed' || mode === 'fix'
+  if (scoped && summary.files === 0) {
+    if (changedFiles === 0) return { empty: true, stats: '无 Git 已跟踪改动,未检查任何文件' }
+    if (typeof changedFiles === 'number') return { empty: false, stats: `未发现告警(已检查 ${changedFiles} 个改动文件)` }
+    return { empty: false, stats: '未发现告警(仅检查未提交改动)' }
+  }
+  if (summary.errors + summary.warnings + summary.suggestions === 0) return { empty: false, stats: '未发现告警' }
+  return { empty: false, stats: `错误 ${summary.errors} / 警告 ${summary.warnings} / 建议 ${summary.suggestions} / 涉及文件 ${summary.files}` }
+}
+
+/** Panel-facing names of the four check modes. */
+const LINT_LABELS = { changed: '检查改动', all: '全量检查', fix: '自动修复', 'fix-all': '全量修复' }
+
+/** Files codelinter may rewrite, and directories it never looks at. */
+const LINT_EXT = /\.(ets|ts|js|json5|json)$/
+const LINT_SKIP = /(^|[\\/])(node_modules|oh_modules|build|\.git|\.hvigor|\.idea|\.preview)([\\/]|$)/
+
+/**
+ * Hash every code/config file under the project. A `--fix` run reports only the issues it could
+ * fix (verified: the same directory prints 2 issues plain and "0 issues" with --fix while nothing
+ * is touched), so its own summary is useless as a result. Hashing around the run is what tells us
+ * how much source actually changed.
+ */
+async function hashTree(root: string): Promise<Map<string, string> | null> {
+  const out = new Map<string, string>()
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name)
+      if (LINT_SKIP.test(full)) continue
+      if (entry.isDirectory()) await walk(full)
+      else if (LINT_EXT.test(entry.name)) out.set(full, createHash('sha1').update(await readFile(full)).digest('hex'))
+    }
+  }
+  try {
+    await walk(root)
+    return out
+  } catch {
+    return null
+  }
+}
+
+/** How much a fix run rewrote, which is the only result its own output can be trusted for. */
+export function fixStats(fixedFiles: number | null): string {
+  if (fixedFiles === null) return '已执行自动修复(无法统计改动文件)'
+  if (fixedFiles === 0) return '没有可自动修复的告警,未改动任何文件'
+  return `已自动修复 ${fixedFiles} 个文件`
+}
+
+/** Parse codelinter's trailing summary line. */
+const LINT_SUMMARY_RE = /Issues:\s*(\d+)\s*\|\s*Errors:\s*(\d+)\s*\|\s*Warnings:\s*(\d+)\s*\|\s*Suggestions:\s*(\d+)\s*\|\s*Files checked:\s*(\d+)/
+function parseLintSummary(text: string): LintSummary | null {
+  const m = String(text || '').match(LINT_SUMMARY_RE)
+  return m
+    ? { issues: Number(m[1]), errors: Number(m[2]), warnings: Number(m[3]), suggestions: Number(m[4]), files: Number(m[5]) }
+    : null
 }
 
 /** Serial of the first running emulator (default target for emu_ui). */
@@ -700,12 +870,12 @@ async function firstRunningSerial(cli) {
 function createToolDefs(api) {
   const emu = {
     name: 'emu',
-    description: 'Control HarmonyOS emulators through devecocli: list instances, start (pre-checks the system image, waits until the device is online), stop. Use emu_ui for screen inspection/interaction.',
+    description: 'List/start/stop HarmonyOS emulators via devecocli (start pre-checks the system image and waits until online).',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'start', 'stop'], description: 'list = instances; start = launch and wait until online; stop = shut down' },
-        name: { type: 'string', description: 'Emulator instance name (required for start/stop)' },
+        action: { type: 'string', enum: ['list', 'start', 'stop'], description: 'list | start (waits online) | stop' },
+        name: { type: 'string', description: 'Instance name (required for start/stop)' },
       },
       required: ['action'],
     },
@@ -740,22 +910,21 @@ function createToolDefs(api) {
 
   const emuUi = {
     name: 'emu_ui',
-    description: 'Inspect and drive the emulator screen via devecocli ui. layout = compact control tree lines (type [x1,y1,x2,y2] "text" clickable); click = tap by label (runs layout and taps that node center, one call), or by x/y; text/swipe = input; screenshot = save a PNG and return its path (view with read_image).',
+    description: 'Drive the emulator screen via devecocli ui: layout (compact tree lines: type [x1,y1,x2,y2] "text" clickable), click (by label -> auto-locates and taps its center; or x/y), text, swipe, screenshot (saves a PNG; view with read_image).',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['layout', 'click', 'text', 'swipe', 'screenshot'], description: 'UI action' },
-        device: { type: 'string', description: 'Target serial; defaults to the first running emulator' },
-        label: { type: 'string', description: 'click: text of a layout node; the tool runs layout, finds it, and taps its center (one call instead of layout + click)' },
-        thenLayout: { type: 'boolean', description: 'click: after tapping, take a fresh layout and return it as tree (verifies the result without a second call)' },
-        waitMs: { type: 'integer', description: 'click + thenLayout: delay before the fresh layout, ms (default 600, max 5000)' },
+        device: { type: 'string', description: 'Target serial (default: first running emulator)' },
+        label: { type: 'string', description: 'click: node text; runs layout and taps that center in one call' },
+        thenLayout: { type: 'boolean', description: 'click: return a fresh layout after the tap (verifies in one call)' },
+        waitMs: { type: 'integer', description: 'thenLayout delay, ms (default 600, max 5000)' },
         x: { type: 'integer', description: 'click x, or swipe start x' },
         y: { type: 'integer', description: 'click y, or swipe start y' },
         x2: { type: 'integer', description: 'swipe end x' },
         y2: { type: 'integer', description: 'swipe end y' },
         text: { type: 'string', description: 'text to input' },
-        depth: { type: 'integer', description: 'layout tree depth (0 = unlimited); use to narrow large trees' },
-        root: { type: 'string', description: 'screenshot root dir (PNG goes to <root>/screenshots); defaults to process cwd' },
+        root: { type: 'string', description: 'screenshot root; PNG goes to <root>/screenshots (default: cwd)' },
       },
       required: ['action'],
     },
@@ -770,7 +939,6 @@ function createToolDefs(api) {
 
       if (action === 'layout') {
         const argv = ['ui', 'layout', '--device', device]
-        if (Number.isFinite(args?.depth)) argv.push('--depth', String(args.depth))
         const r = await run(argv, 30000)
         if (r.code !== 0) return { ok: false, device, error: tailText(r.output, 6) }
         const tree = r.output.split(/\r?\n/).filter((l) => l.trim() !== '' && !/Dumping layout/i.test(l)).join('\n')
@@ -829,7 +997,122 @@ function createToolDefs(api) {
     },
   }
 
-  return [emu, emuUi]
+  const hmosDeploy = {
+    name: 'hmos_deploy',
+    description: 'Build and deploy a project to a running emulator (devecocli run: build -> install -> launch). Returns a short note plus the output tail, not the full hvigor log.',
+    parameters: {
+      type: 'object',
+      properties: {
+        projectPath: { type: 'string', description: 'Project root (must contain build-profile.json5)' },
+        device: { type: 'string', description: 'Target serial (default: first running emulator)' },
+        module: { type: 'string', description: 'Entry module (default: entry)' },
+      },
+      required: ['projectPath'],
+    },
+    output: { schema: TOOL_OUT_SCHEMA, render: toolRender },
+    async execute(args) {
+      const cli = resolveDevecoCli()
+      if (!cli) return { ok: false, error: 'devecocli not found; install @deveco/deveco-cli or set DSH_HMOS_DEVECO_CLI' }
+      const projectPath = typeof args?.projectPath === 'string' ? args.projectPath.trim() : ''
+      if (!projectPath) return { ok: false, error: 'projectPath is required' }
+      const device = (typeof args?.device === 'string' && args.device.trim() ? args.device.trim() : '') || await firstRunningSerial(cli)
+      if (!device) return { ok: false, error: 'no running emulator; start one with emu {action:"start", name:"<instance>"}' }
+      try {
+        // Reuse the HTTP API's non-streaming path: it already validates the project, checks the
+        // device is online and picks the entry module.
+        const r = await api.deploy({ projectPath, device, module: args?.module })
+        return { ok: r.code === 0, code: r.code ?? null, timedOut: r.timedOut === true, device, note: r.note, tail: tailText(r.output, 30) }
+      } catch (error) {
+        return { ok: false, device, error: error instanceof Error ? error.message : String(error) }
+      }
+    },
+  }
+
+  const hmosLog = {
+    name: 'hmos_log',
+    description: 'Read recent device logs via devecocli log: filter by bundle/level/keyword or crash-only, and return only the tail (default 50 lines). Covers crash + hilog without hdc.',
+    parameters: {
+      type: 'object',
+      properties: {
+        bundle: { type: 'string', description: 'Filter by bundle name' },
+        level: { type: 'string', enum: ['D', 'I', 'W', 'E', 'F'], description: 'Log level filter' },
+        keyword: { type: 'string', description: 'Keyword filter' },
+        crash: { type: 'boolean', description: 'Only crash logs' },
+        tail: { type: 'integer', description: 'Latest N lines (default 50, max 500)' },
+        device: { type: 'string', description: 'Target serial (default: first running emulator)' },
+      },
+      required: [],
+    },
+    output: { schema: TOOL_OUT_SCHEMA, render: toolRender },
+    async execute(args) {
+      const cli = resolveDevecoCli()
+      if (!cli) return { ok: false, error: 'devecocli not found; install @deveco/deveco-cli or set DSH_HMOS_DEVECO_CLI' }
+      const device = (typeof args?.device === 'string' && args.device.trim() ? args.device.trim() : '') || await firstRunningSerial(cli)
+      if (!device) return { ok: false, error: 'no running emulator; start one with emu {action:"start", name:"<instance>"}' }
+      const tail = Number.isFinite(args?.tail) ? Math.max(1, Math.min(500, args.tail)) : 50
+      const argv = ['log', '--device', device, '--tail', String(tail)]
+      if (args?.crash) argv.push('--crash')
+      if (typeof args?.level === 'string' && args.level) argv.push('--level', String(args.level))
+      if (typeof args?.bundle === 'string' && args.bundle.trim()) argv.push('--bundle-name', args.bundle.trim())
+      if (typeof args?.keyword === 'string' && args.keyword.trim()) argv.push('--keyword', args.keyword.trim())
+      const r = await runCli([process.execPath, cli, ...argv], { timeoutMs: 60000 })
+      if (r.code !== 0) return { ok: false, device, error: tailText(r.output, 8) }
+      const text = r.output.trim()
+      // Second guard on top of --tail: keep only the newest 8000 characters.
+      return { ok: true, device, tail, text: text.length > 8000 ? text.slice(-8000) : text }
+    },
+  }
+
+  const hmosDocs = {
+    name: 'hmos_docs',
+    description: 'Search and read the official HarmonyOS docs via devecocli docs (local official doc set, works offline). search returns compact entries (id/title/140-char snippet); read returns one document (truncated).',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['search', 'read'], description: 'search | read' },
+        keywords: { type: 'string', description: 'search: keywords, pass the phrase as-is' },
+        documentId: { type: 'string', description: 'read: id from a search result' },
+        limit: { type: 'integer', description: 'search: max results (default 5, max 20)' },
+      },
+      required: ['action'],
+    },
+    output: { schema: TOOL_OUT_SCHEMA, render: toolRender },
+    async execute(args) {
+      const cli = resolveDevecoCli()
+      if (!cli) return { ok: false, error: 'devecocli not found; install @deveco/deveco-cli or set DSH_HMOS_DEVECO_CLI' }
+      const action = String(args?.action || '')
+      if (action === 'search') {
+        const keywords = typeof args?.keywords === 'string' ? args.keywords.trim() : ''
+        if (!keywords) return { ok: false, error: 'keywords is required' }
+        const limit = Number.isFinite(args?.limit) ? Math.max(1, Math.min(20, args.limit)) : 5
+        const argv = [process.execPath, cli, 'docs', 'search', keywords, '--limit', String(limit)]
+        const r = await runCli(argv, { timeoutMs: 60000 })
+        if (r.code !== 0) return { ok: false, error: tailText(r.output, 6) }
+        // Entries look like "<documentId>\n  Title: ...\n  Content: ...", separated by blank lines.
+        const entries = r.output.split(/\n\s*\n/).map((chunk) => {
+          const lines = chunk.split(/\r?\n/).filter((line) => line.trim() !== '')
+          if (lines.length === 0) return null
+          const id = lines[0].trim()
+          if (id.startsWith('Title:') || id.startsWith('Content:')) return null
+          const title = (chunk.match(/Title:\s*(.+)/) || [])[1] || ''
+          const content = (chunk.match(/Content:\s*([\s\S]*)/) || [])[1] || ''
+          return { id, title: title.trim(), snippet: content.replace(/\s+/g, ' ').trim().slice(0, 140) }
+        }).filter(Boolean)
+        return { ok: true, count: entries.length, entries }
+      }
+      if (action === 'read') {
+        const documentId = typeof args?.documentId === 'string' ? args.documentId.trim() : ''
+        if (!documentId) return { ok: false, error: 'documentId is required' }
+        const r = await runCli([process.execPath, cli, 'docs', 'read', documentId], { timeoutMs: 60000 })
+        if (r.code !== 0) return { ok: false, error: tailText(r.output, 6) }
+        const text = r.output.trim()
+        return { ok: true, documentId, text: text.length > 14000 ? `${text.slice(0, 14000)}\n…(truncated)` : text }
+      }
+      return { ok: false, error: `unknown action ${action}` }
+    },
+  }
+
+  return [emu, emuUi, hmosDeploy, hmosLog, hmosDocs]
 }
 
 export function apply(ctx: Ctx, config?: any) {
@@ -923,11 +1206,40 @@ export function apply(ctx: Ctx, config?: any) {
       }
     }
     registerTools()
+    // Runtime-context provider: hands the latest code-check result to the model on its next
+    // prompt assembly, so the user never has to copy it out of the panel. Non-blocking wait
+    // like the others; the text function is evaluated per assembly.
+    let lintContextRegistered = false
+    let lintTimer: ReturnType<typeof setTimeout> | null = null
+    const registerLintContext = () => {
+      if (disposed || lintContextRegistered) return
+      try {
+        const sp = ctx.get('systemPrompt') as any
+        if (sp === undefined || typeof sp.context !== 'function') {
+          lintTimer = setTimeout(registerLintContext, 700)
+          return
+        }
+        lintContextRegistered = true
+        ctx.effect(() => sp.context({
+          name: 'hmos-emulator-code-check',
+          order: 990,
+          text: () => {
+            if (!lintNotice || lintDeliveries >= 1) return ''
+            lintDeliveries += 1
+            return lintNotice
+          },
+        }), 'dsh-hmos-emulator: code-check context')
+      } catch (error) {
+        console.error('[dsh-hmos-emulator] 检查结果上下文注册异常(已隔离,不影响 DSH):', error)
+      }
+    }
+    registerLintContext()
     // Stop waiting / dispose registered resources on unload.
     ctx.effect(() => () => {
       disposed = true
       if (timer) clearTimeout(timer)
       if (toolsTimer) clearTimeout(toolsTimer)
+      if (lintTimer) clearTimeout(lintTimer)
     })
   } catch (error) {
     console.error('[dsh-hmos-emulator] 宿主 apply 异常(已隔离,不影响 DSH 启动):', error)

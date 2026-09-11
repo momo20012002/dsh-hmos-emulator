@@ -42,6 +42,13 @@
     }
 
     // ── Design tokens (follow DSH theme variables; usable in light and dark) ──
+    /** Panel-facing names of the four check modes, shared by the buttons and the status line. */
+    const LINT_TITLES = { changed: '检查改动', all: '全量检查', fix: '自动修复', 'fix-all': '全量修复' }
+    /** Elapsed time of a running step: "42s" below a minute, "1m12s" above. */
+    const fmtDur = (ms: number) => {
+      const sec = Math.max(0, Math.round(ms / 1000))
+      return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m${String(sec % 60).padStart(2, '0')}s`
+    }
     const s = {
       fg: 'var(--dsh-fg, #e6e6e6)',
       muted: 'var(--dsh-muted, rgba(148,148,160,.9))',
@@ -165,6 +172,10 @@
       const [instanceSel, setInstanceSel] = useState(() => lsGet('instance'))
       const [shot, setShotState] = useState(lastShot)
       const [copied, setCopied] = useState(false)
+      const [lintReady, setLintReady] = useState(false)
+      // Fix buttons stay locked until the matching check has shown what is in scope.
+      const [fixReady, setFixReady] = useState({ changed: false, all: false })
+      const [lintSec, setLintSec] = useState(0)
       // Screenshot viewport: zoom and pan share one atomic state (cursor-anchored zoom updates both).
       const [shotView, setShotView] = useState({ zoom: 1, x: 0, y: 0 })
       const shotBoxRef = useRef(null)
@@ -191,6 +202,9 @@
       // Deploy target: an explicit pick (auto/manual/device dropdown) wins, else the instance serial.
       const targetDevice = device || (selInst && selInst.serial) || ''
       const [busy, setBusy] = useState('')
+      // Label of the check running right now ('' when none), used by the live progress line.
+      const lintMode = busy.startsWith('lint-') ? busy.slice(5) : ''
+      const lintTitle = LINT_TITLES[lintMode] || ''
       const [logs, setLogs] = useState([])
       const logBox = useRef(null)
 
@@ -238,6 +252,15 @@
         mounted.current = true
         refresh()
       }, [])
+      // A check prints nothing until it is done (verified: codelinter buffers its whole run), so
+      // the panel runs its own clock to show the work is still going on.
+      useEffect(() => {
+        if (!busy.startsWith('lint-')) return undefined
+        const t0 = Date.now()
+        setLintSec(0)
+        const id = setInterval(() => setLintSec(Math.floor((Date.now() - t0) / 1000)), 1000)
+        return () => clearInterval(id)
+      }, [busy])
       // Restore the persisted selection when the panel opens again.
       useEffect(() => {
         lsSet('project', project)
@@ -245,6 +268,8 @@
         lsSet('instance', instanceSel)
         lsSet('module', moduleSel)
       }, [project, scanRoot, instanceSel, moduleSel])
+      // A check authorizes fixing only that same project, so switching project locks both again.
+      useEffect(() => { setFixReady({ changed: false, all: false }) }, [project])
       // Screenshot preview: wheel zoom anchored at the cursor. A non-passive listener is
       // required, otherwise the panel would scroll while zooming.
       useEffect(() => {
@@ -321,6 +346,46 @@
         setProject(path)
         loadProjectInfo(path)
         pushLog('ok', `已选择项目:${path}`)
+      }
+      // Project code check (DevEco Code Linter). Scope: changed / all. Fix: fix / fix-all.
+      const runLint = async (mode) => {
+        const p = project.trim()
+        if (!p) { pushLog('err', '请先在“应用项目”选择项目'); return }
+        const title = LINT_TITLES[mode]
+        const t0 = Date.now()
+        setBusy(`lint-${mode}`)
+        pushLog('info', `[代码检查] ${title}开始:${p}`)
+        if (mode.startsWith('fix')) pushLog('info', '[代码检查] 修复结束后会自动复检一次,总耗时约为单次检查的两倍')
+        try {
+          const v = await rpc('check.lint', { projectPath: p, mode })
+          const st = v.summary || {}
+          // The host phrases the outcome ("nothing to check" vs "checked and clean") because only
+          // it can tell those apart; fall back to raw numbers on an older host.
+          const line = v.stats || `错误 ${st.errors ?? '-'}、警告 ${st.warnings ?? '-'}、建议 ${st.suggestions ?? '-'}、涉及文件 ${st.files ?? '-'}`
+          pushLog(v.empty ? 'info' : v.ok ? 'ok' : 'err', `[代码检查] ${title}完成 — ${line} · 用时 ${fmtDur(Date.now() - t0)}`)
+          if (v.text && v.empty !== true) pushLog('raw', v.text)
+          setLintReady(v.empty !== true)
+          // A check unlocks the fix button with the same scope; a run with nothing in scope does not.
+          if (mode === 'changed') setFixReady((r) => ({ ...r, changed: v.empty !== true }))
+          if (mode === 'all') setFixReady((r) => ({ ...r, all: true }))
+        } catch (error) {
+          pushLog('err', `[代码检查] ${title}失败:${error.message}(用时 ${fmtDur(Date.now() - t0)})`)
+        } finally {
+          setBusy('')
+        }
+      }
+      // Send the cached check result to the AI on demand (nothing is sent automatically).
+      const sendLint = async () => {
+        if (!lintReady) { pushLog('err', '尚未生成检查结果,请先执行代码检查'); return }
+        setBusy('lint-send')
+        try {
+          await rpc('lint.notify')
+          pushLog('ok', '检查结果已就绪:发送一条消息后 AI 即可读取')
+        } catch (error) {
+          pushLog('err', `检查结果提交失败:${error.message}`)
+        } finally {
+          setBusy('')
+        }
       }
 
       // ── Emulator / deploy actions ───────────────────────────────────────
@@ -681,6 +746,42 @@
           h('span', { style: label }, '入口模块'),
           h(Dropdown, { value: moduleSel, placeholder: '选择入口模块', options: modules.map((m) => ({ value: m, label: m })), onChange: setModuleSel }),
         ) : null,
+        // On-demand project checks (no model-tool schema cost). Details live in tooltips so
+        // the panel itself stays free of explanatory clutter.
+        h('div', { style: row, key: 'lintRow' },
+          h('span', { style: label }, '代码检查'),
+          h(Btn, {
+            secondary: true, disabled: busy !== '' || !project.trim(),
+            onClick: () => runLint('changed'), title: '只检查已跟踪文件的未提交改动(快;新建文件请用「全量检查」)',
+          }, busy === 'lint-changed' ? '检查中…' : '检查改动'),
+          h(Btn, {
+            secondary: true, disabled: busy !== '' || !project.trim(),
+            onClick: () => runLint('all'), title: '检查整个项目(较慢)',
+          }, busy === 'lint-all' ? '检查中…' : '全量检查'),
+          h(Btn, {
+            secondary: true, disabled: busy !== '' || !lintReady,
+            onClick: sendLint, title: '将最近一次检查结果提供给 AI(发送消息后生效)',
+          }, busy === 'lint-send' ? '发送中…' : '发送到对话')),
+        // Fixing writes to the source files, so each button unlocks only after the check with the
+        // same scope has run: you see what is in range before anything is rewritten.
+        h('div', { style: row, key: 'fixRow' },
+          h('span', { style: label }, '代码修复'),
+          h(Btn, {
+            secondary: true, disabled: busy !== '' || !fixReady.changed, onClick: () => runLint('fix'),
+            title: fixReady.changed ? '自动修复未提交改动中可修复的告警;无法自动修复的不会列出' : '先点「检查改动」查看范围后才能修复',
+          }, busy === 'lint-fix' ? '修复中…' : '自动修复'),
+          h(Btn, {
+            secondary: true, disabled: busy !== '' || !fixReady.all, onClick: () => runLint('fix-all'),
+            title: fixReady.all ? '自动修复整个项目中可修复的告警;无法自动修复的不会列出' : '先点「全量检查」查看范围后才能修复',
+          }, busy === 'lint-fix-all' ? '修复中…' : '全量修复')),
+        // Live status while a check runs: the linter only writes its report at the end, so the
+        // ticking clock is what tells the user it is still working.
+        lintTitle ? h('div', {
+          key: 'lintProgress',
+          style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: s.muted, margin: '-2px 0 8px' },
+        },
+          h('span', { style: { display: 'inline-flex' } }, h(Icon, { src: IC.clock, size: 12 })),
+          `${lintTitle}进行中… 已用时 ${lintSec}s(检查工具在结束时才输出报告)`) : null,
         h('div', { style: { fontSize: 11, color: s.faint, margin: '-2px 0 8px' } }, '需包含 build-profile.json5 的项目根;点「扫描」列出子目录项目,或「浏览」直接选择'),
       ))
 
