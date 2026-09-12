@@ -1,6 +1,6 @@
 {
   "name": "dsh-hmos-emulator",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "DSH better-sidebar 标签页插件:一键启动鸿蒙模拟器,将选定的 HarmonyOS 应用工程构建并部署到模拟器。",
   "type": "module",
   "main": "./lib/index.js",
