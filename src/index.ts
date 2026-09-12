@@ -37,7 +37,7 @@ const API_PREFIX = '/dsh-hmos-emulator/api'
 /** Allowed API methods (keeps this from becoming an arbitrary command executor). */
 const METHODS = new Set([
   'toolchain', 'emu.list', 'emu.start', 'emu.stop',
-  'devices', 'browse', 'scan', 'project.info', 'check.lint', 'lint.notify', 'deploy', 'device.ready', 'deveco.install', 'deveco.update', 'screenshot',
+  'devices', 'scan', 'project.info', 'check.lint', 'lint.notify', 'deploy', 'device.ready', 'deveco.install', 'deveco.update', 'screenshot',
 ])
 /** Methods whose handler owns the response (streaming); they skip the JSON envelope. */
 const STREAMING_METHODS = new Set(['deploy'])
@@ -229,28 +229,11 @@ function normalizeDir(input) {
   return existsSync(dir) && dir !== resolve(dir, sep) ? dir : homedir()
 }
 
-function listDirs(dir) {
-  let entries = []
-  try {
-    entries = readdirSync(dir, { withFileTypes: true })
-  } catch (error) {
-    throw Object.assign(new Error(`无法读取目录:${error instanceof Error ? error.message : String(error)}`), { code: 'fs-error' })
-  }
-  const result = []
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue
-    if (entry.name.startsWith('.') || IGNORED_DIRS.has(entry.name)) continue
-    if (result.length >= 300) break
-    result.push({
-      name: entry.name,
-      isProject: existsSync(join(dir, entry.name, PROJECT_MARK)),
-    })
-  }
-  result.sort((a, b) => Number(b.isProject) - Number(a.isProject) || a.name.localeCompare(b.name))
-  return result
-}
-
 function scanProjects(root, maxDepth = 3) {
+  // A project root is the project. Descending would list its modules instead, because a HarmonyOS
+  // module directory carries its own build-profile.json5 (verified live: scanning a project root
+  // returned only "<project>/entry"), and selecting that would aim a deploy at a module directory.
+  if (existsSync(join(root, PROJECT_MARK))) return [root]
   const found = []
   let queue = [{ dir: root, depth: 0 }]
   let visited = 0
@@ -284,13 +267,56 @@ function scanProjects(root, maxDepth = 3) {
 
 // ── Project info (multi-module deploy) ──────────────────────────────────
 
-/** Minimal JSON5→JSON: strip comments, quote bare keys, drop trailing commas, then JSON.parse. */
+/**
+ * Minimal JSON5→JSON: drop comments, quote bare keys, drop trailing commas — each of the last two
+ * only outside a string literal. Whole-text regexes cannot do that: `,\s*([}\]])` also reaches
+ * inside a value, so {"reason": "a, }"} would silently lose its comma, and the bare-key pattern
+ * would rewrite text inside a string the same way.
+ */
 function stripJson5(text: string): string {
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/^\s*\/\/.*$/gm, '')
-    .replace(/([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)/g, '$1"$2"$3')
-    .replace(/,\s*([}\]])/g, '$1')
+  let out = ''
+  let i = 0
+  let quote = ''          // current string delimiter; '' when outside a string
+  let keyPending = false  // a bare key may start at the next non-space character
+  while (i < text.length) {
+    const ch = text[i]
+    if (quote !== '') {
+      if (ch === '\\') { out += text.slice(i, i + 2); i += 2; continue }
+      if (ch === quote) quote = ''
+      out += ch
+      i += 1
+      continue
+    }
+    if (ch === '"') { quote = ch; out += ch; i += 1; keyPending = false; continue }
+    if (ch === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i += 1; continue }
+    if (ch === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2)
+      i = end === -1 ? text.length : end + 2
+      continue
+    }
+    if (ch === '{') { keyPending = true; out += ch; i += 1; continue }
+    if (ch === ',') {
+      // A comma that is followed only by a closing bracket is a trailing comma.
+      let j = i + 1
+      while (j < text.length && /\s/.test(text[j])) j += 1
+      if (text[j] === '}' || text[j] === ']') { i += 1; continue }
+      keyPending = true
+      out += ch
+      i += 1
+      continue
+    }
+    if (keyPending && /[A-Za-z_$]/.test(ch)) {
+      let j = i
+      while (j < text.length && /[\w$]/.test(text[j])) j += 1
+      let k = j
+      while (k < text.length && /\s/.test(text[k])) k += 1
+      if (text[k] === ':') { out += `"${text.slice(i, j)}"`; i = j; keyPending = false; continue }
+    }
+    if (!/\s/.test(ch)) keyPending = false
+    out += ch
+    i += 1
+  }
+  return out
 }
 
 /** Read entry module names from build-profile.json5 modules[].name; [] when unparsable. */
@@ -380,9 +406,12 @@ async function waitDeviceReady(cli, name, timeoutMs = 120000, intervalMs = 3000)
 // ── API methods ─────────────────────────────────────────────────────────
 
 // Latest code-check result. It is cached here on every check, and only handed to the model
-// when the user presses "send to AI" (lint.notify) — never automatically.
+// when the user presses "send to AI" (lint.notify) — never automatically. The queued notice also
+// remembers which session asked for it: this module is shared by every session, so without that
+// the first session to assemble a prompt would receive another session's result.
 let lastLintNotice = ''
 let lintNotice = ''
+let lintNoticeSession = ''
 let lintDeliveries = 0
 
 function createApi() {
@@ -529,15 +558,6 @@ function createApi() {
     return { devices, raw, hdcError: error, hdcExe: resolveHdc() ?? null }
   }
 
-  api.browse = async (payload) => {
-    const root = normalizeDir(payload?.path)
-    return {
-      root,
-      parent: dirname(root) === root ? null : dirname(root),
-      dirs: listDirs(root),
-    }
-  }
-
   api.scan = async (payload) => {
     const root = normalizeDir(payload?.root)
     const paths = scanProjects(root)
@@ -547,7 +567,9 @@ function createApi() {
   api['project.info'] = async (payload) => {
     const project = typeof payload?.projectPath === 'string' ? resolve(payload.projectPath) : ''
     if (!project || !existsSync(project)) throw Object.assign(new Error('应用工程路径不存在'), { code: 'bad-request' })
-    return { modules: readModules(project) }
+    // readModules() answers [] for a directory without the marker, so the modules alone cannot tell
+    // a project root from any other folder; report that fact explicitly.
+    return { isProject: existsSync(join(project, PROJECT_MARK)), modules: readModules(project) }
   }
 
   // DevEco Code Linter for the selected project. Four mode pairs: changed / all decide the scope
@@ -618,10 +640,12 @@ function createApi() {
   }
 
   // Hand the cached check result to the model only when the user asks for it. The runtime
-  // context provider (registered in apply) delivers it on the next prompt assembly.
-  api['lint.notify'] = async () => {
+  // context provider (registered in apply) delivers it on the next prompt assembly of the session
+  // that asked, and of that one only.
+  api['lint.notify'] = async (payload) => {
     if (!lastLintNotice) throw Object.assign(new Error('尚未生成检查结果,请先执行代码检查'), { code: 'bad-request' })
     lintNotice = lastLintNotice
+    lintNoticeSession = typeof payload?.sessionId === 'string' ? payload.sessionId : ''
     lintDeliveries = 0
     return { sent: true, bytes: lintNotice.length }
   }
@@ -652,6 +676,11 @@ function createApi() {
     }
     // Multi-module: choose --module (entry when present, else the first module).
     const modules = readModules(project)
+    // A panel that switched project can still be holding the previous project's module name, so a
+    // name this project does not have is refused instead of being handed to the build.
+    if (payload?.module !== undefined && payload?.module !== null && !modules.includes(String(payload.module))) {
+      throw Object.assign(new Error(`模块“${payload.module}”不属于该工程(可选:${modules.join('、') || '无'})`), { code: 'bad-request' })
+    }
     const chosen = payload?.module ? String(payload.module) : modules.includes('entry') ? 'entry' : modules[0]
     const cmd = [process.execPath, cli, 'run', '--device', device]
     if (chosen) cmd.push('--module', chosen)
@@ -895,7 +924,7 @@ export interface LintSummary {
 /**
  * How many uncommitted code files `--incremental` would inspect under the project. Only tracked
  * modifications count: a new untracked .ets file was verified to be ignored by codelinter even
- * though it matches code-linter.json5 (so "新增" from the docs does not cover untracked files).
+ * though it matches code-linter.json5 (so the docs' "new files" does not cover untracked ones).
  * Null when git cannot be used, so wording can never claim more than was verified.
  *
  * Note: codelinter's "Files checked" counts files that produced a finding, not files scanned, so
@@ -1466,8 +1495,17 @@ export function apply(ctx: Ctx, config?: any) {
         ctx.effect(() => sp.context({
           name: 'hmos-emulator-code-check',
           order: 990,
-          text: () => {
+          text: (assemble) => {
             if (!lintNotice || lintDeliveries >= 1) return ''
+            // `assemble.scope` is the asking session's Agent object, and ctx.agents.get(id) hands
+            // back that same object, so identity is the exact test. Only filter when the owner can
+            // actually be identified: an older client sends no session id, and a host without the
+            // agents service must keep delivering instead of stranding the notice forever.
+            const agents = ctx.get('agents') as any
+            if (lintNoticeSession && agents && typeof agents.get === 'function') {
+              const owner = agents.get(lintNoticeSession)
+              if (owner !== undefined && assemble?.scope !== owner) return ''
+            }
             lintDeliveries += 1
             return lintNotice
           },

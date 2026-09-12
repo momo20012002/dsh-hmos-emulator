@@ -159,13 +159,24 @@
       const LS_PREFIX = 'dsh-hmos-emulator:'
       const lsGet = (k) => { try { return localStorage.getItem(LS_PREFIX + k) || '' } catch { return '' } }
       const lsSet = (k, v) => { try { localStorage.setItem(LS_PREFIX + k, v) } catch { /* ignore */ } }
+      // localStorage is shared by every session of this origin, but a scan root and a project
+      // belong to one workspace: keyed per session, so opening another session does not restore
+      // the previous workspace's selection instead of its own.
+      const lsSessionKey = (k) => ((scope && scope.sessionId) ? `${k}:${scope.sessionId}` : k)
+      // An entry module name only means something inside the project it came from.
+      const lsModuleKey = (p) => (p ? `module:${p}` : 'module')
       const [tc, setTc] = useState(null)
       const [tcMsg, setTcMsg] = useState('')
-      const [project, setProject] = useState(() => lsGet('project'))
-      const [scanRoot, setScanRoot] = useState(() => lsGet('scanRoot'))
+      const [project, setProject] = useState(() => lsGet(lsSessionKey('project')))
+      // Default the scan root to the session working directory. scope.cwd is optional and arrives
+      // with the session list summary, so it is also applied later by the effect below.
+      const [scanRoot, setScanRoot] = useState(() => lsGet(lsSessionKey('scanRoot')) || (scope && scope.cwd) || '')
+      const scopeCwd = (scope && scope.cwd) || ''
+      // Once the user types or picks a directory, the workspace default must not overwrite it.
+      const scanRootEdited = useRef(false)
       const [projectOptions, setProjectOptions] = useState([])
       const [modules, setModules] = useState([])
-      const [moduleSel, setModuleSel] = useState(() => lsGet('module'))
+      const [moduleSel, setModuleSel] = useState(() => lsGet(lsModuleKey(project)))
       const [emuRaw, setEmuRaw] = useState('')
       const [emuTarget, setEmuTarget] = useState('')
       const [instances, setInstances] = useState([])
@@ -229,13 +240,16 @@
           setTc(toolchain)
           setTcMsg('')
           setEmuRaw(emu.raw || '(空)')
-          setInstances(emu.instances || [])
-          setInstanceSel((prev) => prev || ((emu.instances || [])[0]?.name || ''))
+          // Resolve the target from the list just fetched: the state variables still hold this
+          // render's values here, so looking the instance up in `instances` misses its serial and
+          // silently falls back to the first device whenever more than one is online.
+          const list = emu.instances || []
+          const selName = instanceSel || list[0]?.name || ''
+          setInstances(list)
+          setInstanceSel((prev) => prev || selName)
           setDevices(dev.devices || [])
-          setScanRoot((prev) => prev || (scope && scope.cwd) || '')
           if (dev.devices && dev.devices.length) {
-            const selSerial = instances.find((it) => it.name === instanceSel)?.serial
-            setDevice(pickDevice(dev.devices, selSerial))
+            setDevice(pickDevice(dev.devices, list.find((it) => it.name === selName)?.serial))
           }
           pushLog('info', '已刷新:工具链就绪' + (toolchain.devecoCliJs ? '' : '(devecocli 未找到)'))
         } catch (error) {
@@ -263,13 +277,30 @@
       }, [busy])
       // Restore the persisted selection when the panel opens again.
       useEffect(() => {
-        lsSet('project', project)
-        lsSet('scanRoot', scanRoot)
+        lsSet(lsSessionKey('project'), project)
+        lsSet(lsSessionKey('scanRoot'), scanRoot)
         lsSet('instance', instanceSel)
-        lsSet('module', moduleSel)
+        lsSet(lsModuleKey(project), moduleSel)
       }, [project, scanRoot, instanceSel, moduleSel])
-      // A check authorizes fixing only that same project, so switching project locks both again.
-      useEffect(() => { setFixReady({ changed: false, all: false }) }, [project])
+      // Fill the scan root from the session working directory as soon as it is known: it is an
+      // optional field of the tab's scope, so on a fresh panel it can still be undefined while the
+      // panel is already rendered (the previous one-shot default inside refresh() never ran again).
+      useEffect(() => {
+        if (!scopeCwd || scanRootEdited.current) return
+        setScanRoot((prev) => prev || scopeCwd)
+      }, [scopeCwd])
+      // A check authorizes fixing only that same project, so switching project locks both again —
+      // and the cached check result stops being deliverable, since it describes the old project.
+      useEffect(() => {
+        setFixReady({ changed: false, all: false })
+        setLintReady(false)
+      }, [project])
+      // Load the selected project's entry modules whenever the selection changes, including the
+      // restored one on mount: without this the module row kept the previous project's names and
+      // the deploy could carry a module this project does not have.
+      useEffect(() => {
+        if (project) loadProjectInfo(project)
+      }, [project])
       // Screenshot preview: wheel zoom anchored at the cursor. A non-passive listener is
       // required, otherwise the panel would scroll while zooming.
       useEffect(() => {
@@ -293,14 +324,29 @@
       }, [shot])
 
       // ── Project selection ───────────────────────────────────────────────
-      // Use the host-native directory picker.
+      // Use the host-native directory picker. The button sits on the scan-root row, so the picked
+      // directory goes there; the project row then follows the same rule as the scan button: the
+      // directory itself when it is a project root, otherwise the first project found inside it.
+      // (Setting the project alone used to leave the row showing its placeholder, because the
+      // dropdown can only render a value it has an option for.)
       const pickNative = async () => {
         setBusy('browse')
         try {
           const ui = ctx.get('uiWorkspace')
           if (ui && typeof ui.pickDirectory === 'function') {
             const p = await ui.pickDirectory()
-            if (p) { setProject(p); loadProjectInfo(p); pushLog('ok', `已选择项目:${p}`) }
+            if (!p) return
+            scanRootEdited.current = true
+            setScanRoot(p)
+            pushLog('ok', `已设置查找目录:${p}`)
+            const info = await loadProjectInfo(p)
+            if (info && info.isProject) {
+              setProject(p)
+              setProjectOptions((prev) => (prev.includes(p) ? prev : [p, ...prev]))
+              pushLog('ok', `该目录是鸿蒙工程,已选中项目:${p}`)
+            } else {
+              await scanInto(p)
+            }
           } else {
             pushLog('err', '系统目录选择不可用,请用「扫描」或直接粘贴路径')
           }
@@ -310,42 +356,47 @@
           setBusy('')
         }
       }
-      // Scan the root for projects and fill the project dropdown.
+      // Scan a root for projects and fill the project dropdown. Shared by the scan and browse
+      // buttons, so picking a directory that merely contains projects refreshes the project row.
+      const scanInto = async (root) => {
+        const value = await rpc('scan', { root })
+        setProjectOptions(value.projects || [])
+        if (value.projects && value.projects.length) {
+          // Selecting the project is enough: the project effect loads its entry modules.
+          setProject(value.projects[0])
+          pushLog('info', `扫描「${value.root}」发现 ${value.projects.length} 个项目,已默认选中第一个`)
+        } else {
+          setModules([]); setModuleSel('')
+          pushLog('info', `“${value.root}”下(≤3 层)未发现鸿蒙项目`)
+        }
+        return value.projects || []
+      }
       const runScan = async () => {
         const root = scanRoot.trim()
         if (!root) { pushLog('err', '请先填写扫描目录'); return }
         setBusy('scan')
         try {
-          const value = await rpc('scan', { root })
-          setProjectOptions(value.projects || [])
-          if (value.projects && value.projects.length) {
-            pushLog('info', `扫描「${value.root}」发现 ${value.projects.length} 个项目,已默认选中第一个`)
-            setProject(value.projects[0])
-            loadProjectInfo(value.projects[0])
-          } else {
-            setModules([]); setModuleSel('')
-            pushLog('info', `“${value.root}”下(≤3 层)未发现鸿蒙项目`)
-          }
+          await scanInto(root)
         } catch (error) {
           pushLog('err', `扫描失败:${error.message}`)
         } finally {
           setBusy('')
         }
       }
-      // Read entry modules of the selected project (used to pass --module when deploying).
+      // Read a directory's project info (entry modules feed --module when deploying).
+      // Returns null only when the host rejects the path — whether the directory really is a
+      // project root is `info.isProject`, because readModules() answers [] for any other folder.
       const loadProjectInfo = async (proj) => {
-        if (!proj) return
+        if (!proj) return null
         try {
           const info = await rpc('project.info', { projectPath: proj })
           const mods = info.modules || []
           setModules(mods)
-          setModuleSel((prev) => (prev && mods.includes(prev) ? prev : mods.includes('entry') ? 'entry' : mods[0] || ''))
-        } catch { /* a module read failure must not block the flow */ }
-      }
-      const pickProject = (path) => {
-        setProject(path)
-        loadProjectInfo(path)
-        pushLog('ok', `已选择项目:${path}`)
+          // Prefer the module remembered for THIS project, then entry, then the first one.
+          const remembered = lsGet(lsModuleKey(proj))
+          setModuleSel(() => (mods.includes(remembered) ? remembered : mods.includes('entry') ? 'entry' : mods[0] || ''))
+          return info
+        } catch { return null /* a module read failure must not block the flow */ }
       }
       // Project code check (DevEco Code Linter). Scope: changed / all. Fix: fix / fix-all.
       const runLint = async (mode) => {
@@ -379,7 +430,9 @@
         if (!lintReady) { pushLog('err', '尚未生成检查结果,请先执行代码检查'); return }
         setBusy('lint-send')
         try {
-          await rpc('lint.notify')
+          // The session id tells the host which conversation may consume the notice, so a result
+          // produced here can never surface in another session's prompt.
+          await rpc('lint.notify', { sessionId: (scope && scope.sessionId) || '' })
           pushLog('ok', '检查结果已就绪:发送一条消息后 AI 即可读取')
         } catch (error) {
           pushLog('err', `检查结果提交失败:${error.message}`)
@@ -731,7 +784,7 @@
           h('span', { style: label }, '查找目录'),
           h('input', {
             style: field, value: scanRoot, placeholder: '默认为当前工作目录',
-            onChange: (e) => setScanRoot(e.target.value), spellCheck: false,
+            onChange: (e) => { scanRootEdited.current = true; setScanRoot(e.target.value) }, spellCheck: false,
           }),
           h(Btn, { icon: IC.folder, secondary: true, disabled: busy !== '', onClick: pickNative }, '浏览')),
         h('div', { style: row },

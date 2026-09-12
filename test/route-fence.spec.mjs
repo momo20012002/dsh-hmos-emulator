@@ -34,8 +34,11 @@ function mount() {
   return route
 }
 
-/** One POST through the mounted route with the given headers. */
-function request({ method = 'POST', name = 'browse', headers = {}, body = '{}' } = {}) {
+/**
+ * One POST through the mounted route with the given headers. project.info on the spec's own
+ * directory is the cheapest accepted call: it reads the filesystem and spawns nothing.
+ */
+function request({ method = 'POST', name = 'project.info', headers = {}, body = JSON.stringify({ projectPath: NOT_A_PROJECT }) } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port, path: `/dsh-hmos-emulator/api/${name}`, method, headers }, (res) => {
       let data = ''
