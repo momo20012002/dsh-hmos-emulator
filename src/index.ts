@@ -443,7 +443,10 @@ function createApi() {
       sdkHome: sdk || null,
       hint:
         'devecocli 缺失时:安装 @deveco/deveco-cli 或设置环境变量 DSH_HMOS_DEVECO_CLI。' +
-        `hdc 缺失时:设置 DEVECO_SDK_HOME(${sdkExample})后重启 dsh web。`,
+        `hdc 缺失时:设置 DEVECO_SDK_HOME(${sdkExample})后重启 dsh web。` +
+        (process.platform === 'linux'
+          ? 'Linux 模拟器来自 Command Line Tools(需 26.0.0 Release 及以上):把 DEVECO_CLI_CLT_PATH 指向其安装目录。'
+          : ''),
     }
   }
 
@@ -509,10 +512,7 @@ function createApi() {
     if (!name) throw Object.assign(new Error('缺少模拟器实例名(先执行“列出模拟器”查看实例名)'), { code: 'bad-request' })
     // Pre-check the system image so a miss returns the exact download command.
     await ensureImageReady(cli, name)
-    const argv = [process.execPath, cli, 'emulator', 'start', name]
-    // A headless Linux host must pass -noWindow (official constraint) or start fails.
-    if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) argv.push('-noWindow')
-    const result = await runCli(argv, { timeoutMs: 240000 })
+    const result = await runCli([process.execPath, cli, 'emulator', 'start', name], { timeoutMs: 240000 })
     if (result.code !== 0) return { code: result.code, timedOut: result.timedOut, output: result.output, ready: false, serial: null }
     // Wait for the device to come online (replaces the manual readiness button).
     const { ready, serial } = await waitDeviceReady(cli, name)
@@ -1144,9 +1144,7 @@ function createToolDefs(api) {
       if (!name) return { ok: false, error: 'name is required for start/stop' }
       if (action === 'start') {
         try { await ensureImageReady(cli, name) } catch (error) { return { ok: false, stage: 'image', error: error instanceof Error ? error.message : String(error) } }
-        const argv = [process.execPath, cli, 'emulator', 'start', name]
-        if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) argv.push('-noWindow')
-        const r = await runCli(argv, { timeoutMs: 240000 })
+        const r = await runCli([process.execPath, cli, 'emulator', 'start', name], { timeoutMs: 240000 })
         if (r.code !== 0) return { ok: false, stage: 'start', code: r.code, error: tailText(r.output, 8) }
         const { ready, serial } = await waitDeviceReady(cli, name)
         return { ok: true, ready, serial }

@@ -22,7 +22,7 @@
 前置条件:
 
 - 已安装 dsh 并正常运行(`dsh web`);Node.js ≥ 22(LTS 或更新)、pnpm ≥ 10。
-- 已安装 DevEco Studio(提供模拟器、hdc 与 SDK)。
+- 已安装 [DevEco Studio](https://developer.huawei.com/consumer/cn/download/)(提供模拟器、hdc 与 SDK);Linux 上改用 [Command Line Tools](https://developer.huawei.com/consumer/cn/download/)(见「平台支持」)。
 - 已安装 [`devecocli`](https://www.npmjs.com/package/@deveco/deveco-cli) 命令行工具;如未安装,执行 `npm i -g @deveco/deveco-cli`,或装好插件后在面板点击「一键安装 devecocli」。
 
 ### 方式一:npm 安装(推荐)
@@ -62,7 +62,11 @@ dsh plugin --profile web remove dsh-hmos-emulator
 
 ## 平台支持
 
-- 模拟器(启动 / 停止)仅在 **Windows 与 macOS** 上可用——DevEco 官方模拟器不支持 Linux。
+- **Windows / macOS**:模拟器启动与停止由 [**DevEco Studio**](https://developer.huawei.com/consumer/cn/download/) 提供。
+- **Linux**:DevEco Studio 没有 Linux 版,模拟器来自 [**Command Line Tools**](https://developer.huawei.com/consumer/cn/download/)(需 26.0.0 Release 及以上)。需要:
+  - Ubuntu 18.04 及以上;
+  - 把 `DEVECO_CLI_CLT_PATH` 指向 Command Line Tools 安装目录(或把其 `emulator` 目录加入 `PATH`);
+  - 需要桌面环境:无图形界面(`DISPLAY` / `WAYLAND_DISPLAY` 均未设置)时,本插件不提供启动支持。
 - 选择工程、连接设备、构建并部署在所有系统上均可用。
 
 ## 常见问题
@@ -71,6 +75,7 @@ dsh plugin --profile web remove dsh-hmos-emulator
 |---|---|
 | 启动时提示授权 / 协议未接受 | 在终端执行 `devecocli emulator license accept` 后重试 |
 | 扫描不到模拟器实例 | 使用 DevEco Studio 的 Device Manager 确认实例存在,或在终端执行 `devecocli emulator list` 查看实际报错 |
+| Linux 上启动模拟器报错 | 需 Command Line Tools 26.0.0 Release 及以上(`DevEco Studio is not available on Linux` 即未设置 `DEVECO_CLI_CLT_PATH`) |
 | 部署失败但无具体报错 | 在工程中配置签名后重试;多入口模块已自动选择入口模块(可在面板切换) |
 | 提示找不到 hdc | 设置环境变量 `DEVECO_SDK_HOME` 指向 DevEco Studio 的 SDK 目录,然后重启 `dsh web` |
 

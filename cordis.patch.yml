@@ -6,6 +6,8 @@
 # 本插件没有 row config;两个外部依赖由环境变量指定,未设置时宿主自动探测:
 #   devecocli — DSH_HMOS_DEVECO_CLI 指向其 node CLI 入口,或 npm 全局安装 @deveco/deveco-cli
 #   hdc       — DEVECO_SDK_HOME 指向 DevEco Studio 的 SDK 目录
+# Linux 无 DevEco Studio,devecocli 需要 DEVECO_CLI_CLT_PATH 指向 Command Line Tools 安装目录
+# (需 26.0.0 Release 及以上才有 Linux 模拟器);无图形界面环境本插件不支持启动模拟器。
 - insert:
     - id: hmos-emulator
       name: dsh-hmos-emulator
