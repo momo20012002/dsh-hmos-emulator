@@ -1,17 +1,16 @@
 # 鸿蒙模拟器 · dsh-hmos-emulator
 
-> DeepSeek Harness 侧边栏插件:一键启动鸿蒙模拟器,并将 HarmonyOS 应用构建、部署到模拟器。
+> DeepSeek Harness 侧边栏插件:在面板中启动鸿蒙模拟器,并把选定的 HarmonyOS 应用构建、部署到模拟器。
 
 ![鸿蒙模拟器面板:模拟器实例 · 应用项目 · 部署目标 · 调试输出](assets/screenshots/screenshot-1.png)
 
 ## 能做什么
 
-- **启动 / 停止模拟器**：一键启动或停止鸿蒙模拟器,自动列出可用实例与在线设备。
-- **选择应用项目**：文件浏览或一键扫描,自动识别鸿蒙工程。
-- **一键构建并部署**：将选定的应用构建、安装并启动到目标设备,自动识别多入口模块。
-- **部署实时输出**：构建 / 安装 / 启动过程实时显示,无需干等。
-- **就绪检测**：模拟器冷启动后一键检测设备是否上线。
-- **全程可见**：每一步的输出与状态实时显示,成功 / 失败一目了然。
+- **启动 / 停止模拟器**:启动或停止鸿蒙模拟器,列出可用实例与在线设备。
+- **选择应用项目**:文件浏览或扫描,识别鸿蒙工程。
+- **构建并部署**:将选定工程构建、安装并启动到目标设备,自动识别多入口模块。
+- **部署实时输出**:构建 / 安装 / 启动过程实时输出。
+- **就绪检测**:模拟器冷启动后检测设备是否上线。
 
 ## 依赖说明
 
@@ -60,10 +59,27 @@ dsh plugin --profile web remove dsh-hmos-emulator
 3. 在「应用项目」中浏览或扫描,选择鸿蒙工程。
 4. 点击「构建并部署」,等待完成。
 
+## 模型工具
+
+除面板外,插件向 AI 提供六个工具,均经 `devecocli` 执行,可在对话中直接触发模拟器、部署、日志、代码检查等操作。
+
+| 工具 | 职责 |
+|---|---|
+| `emu` | 模拟器实例的查看 / 启动 / 停止 |
+| `emu_ui` | 屏幕结构读取与交互(点击 / 输入 / 滑动 / 截图) |
+| `hmos_deploy` | 构建 → 安装 → 启动 |
+| `hmos_lint` | 代码检查;结果含文件与行号 |
+| `hmos_log` | 设备日志,按级别与关键字筛选 |
+| `hmos_docs` | 官方鸿蒙文档检索 |
+
+- 界面状态默认以节点结构读取,不作截图:结构信息精度高于图像,且开销更低。截图仅用于白屏、崩溃、视觉问题等结构无法描述的场景。
+- 出现异常时,插件会自动把截图留存到工作区 `screenshots/` 目录。
+- 截图支持基线比对:以既有截图为基线判断画面是否变化,无变化时不写入新图。
+
 ## 平台支持
 
-- **Windows / macOS**:模拟器启动与停止由 [**DevEco Studio**](https://developer.huawei.com/consumer/cn/download/) 提供。
-- **Linux**:DevEco Studio 没有 Linux 版,模拟器来自 [**Command Line Tools**](https://developer.huawei.com/consumer/cn/download/)(需 26.0.0 Release 及以上)。需要:
+- **Windows / macOS**:模拟器启动与停止由 [DevEco Studio](https://developer.huawei.com/consumer/cn/download/) 提供。
+- **Linux**:DevEco Studio 没有 Linux 版,模拟器来自 [Command Line Tools](https://developer.huawei.com/consumer/cn/download/)(需 26.0.0 Release 及以上)。需要:
   - Ubuntu 18.04 及以上;
   - 把 `DEVECO_CLI_CLT_PATH` 指向 Command Line Tools 安装目录(或把其 `emulator` 目录加入 `PATH`);
   - 需要桌面环境:无图形界面(`DISPLAY` / `WAYLAND_DISPLAY` 均未设置)时,本插件不提供启动支持。
