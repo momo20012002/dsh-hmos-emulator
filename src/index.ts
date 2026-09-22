@@ -13,11 +13,11 @@
  * the host runtime instance and can mount in any host context.
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { readdir, readFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { inflateSync } from 'node:zlib'
-import { dirname, join, resolve, sep } from 'node:path'
+import { deflateSync, inflateSync } from 'node:zlib'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { homedir, networkInterfaces } from 'node:os'
 
 /** Minimal cordis context: only the members used here, avoiding the full DSH type graph. */
@@ -74,22 +74,42 @@ function cliUnderNpmRoot(npmRoot) {
   return existsSync(cli) ? cli : undefined
 }
 
-function resolveDevecoCli() {
-  // 1) explicit env var wins
+/**
+ * The JS entry a devecocli path stands for. `npm i -g` writes `devecocli.cmd` / `.ps1` / an
+ * extension-less sh shim side by side in the global bin dir, and each is only a launcher whose last
+ * line runs `<its dir>/node_modules/@deveco/deveco-cli/dist/cli.js`. Node cannot spawn such a
+ * wrapper — a `.cmd` needs a shell, and going through cmd.exe would re-quote the Chinese labels and
+ * regexes this plugin passes — so a wrapper is traced to its target and never executed.
+ */
+export function cliFromWrapper(candidate: string): string | undefined {
+  if (/\.(c|m)?(js|ts)$/i.test(candidate)) return existsSync(candidate) ? candidate : undefined
+  const dir = dirname(candidate)
+  return cliUnderNpmRoot(dir) ?? cliUnderNpmRoot(dirname(dir))
+}
+
+/** What the toolchain report should say about `DSH_HMOS_DEVECO_CLI`; '' when there is nothing to say. */
+export function devecoCliHint(): string {
   const explicit = process.env.DSH_HMOS_DEVECO_CLI || ''
-  if (explicit && existsSync(explicit)) return explicit
+  if (!explicit) return ''
+  if (!existsSync(explicit)) return ` 🔴 DSH_HMOS_DEVECO_CLI 指向的路径不存在,已忽略并回退自动探测:${explicit}`
+  const traced = cliFromWrapper(explicit)
+  if (traced === explicit) return ''
+  if (traced) return ` DSH_HMOS_DEVECO_CLI 指向的是 npm 包装脚本(垫片),已按它的目标改用 JS 入口:${traced}`
+  return ` 🔴 DSH_HMOS_DEVECO_CLI 指向的不是 devecocli 的 JS 入口(npm 包装脚本的目录下也没有 node_modules/@deveco/deveco-cli/dist/cli.js),已忽略并回退自动探测:${explicit}`
+}
+
+function resolveDevecoCli() {
+  // 1) explicit env var wins (the JS entry itself, or the npm wrapper script that points at it)
+  const explicit = process.env.DSH_HMOS_DEVECO_CLI || ''
+  if (explicit && existsSync(explicit)) {
+    const traced = cliFromWrapper(explicit)
+    if (traced) return traced
+  }
   // 2) reverse-derive the npm global root from the devecocli shim on PATH
   const shim = whichFirst('devecocli')
   if (shim) {
-    for (const line of [shim]) {
-      const dir = dirname(line)
-      const cli = cliUnderNpmRoot(dir)
-      if (cli) return cli
-    }
-    // the shim may sit in the npm root itself; its parent still holds the global root
-    const parent = dirname(shim)
-    const cli = cliUnderNpmRoot(parent)
-    if (cli) return cli
+    const traced = cliFromWrapper(shim)
+    if (traced) return traced
   }
   // 3) npm root -g
   try {
@@ -232,7 +252,7 @@ function normalizeDir(input) {
 
 function scanProjects(root, maxDepth = 3) {
   // A project root is the project. Descending would list its modules instead, because a HarmonyOS
-  // module directory carries its own build-profile.json5 (verified live: scanning a project root
+  // module directory carries its own build-profile.json5 (in practice: scanning a project root
   // returned only "<project>/entry"), and selecting that would aim a deploy at a module directory.
   if (existsSync(join(root, PROJECT_MARK))) return [root]
   const found = []
@@ -331,6 +351,20 @@ function readModules(project: string): string[] {
   } catch {
     return []
   }
+}
+
+/**
+ * The project root a model tool should act on. An absolute path is taken as given; a relative one
+ * is resolved against the **session workspace** — the same base screenshots use — instead of the
+ * host process's cwd, which is wherever `dsh web` happened to start. A relative `projectPath` used
+ * to resolve against that cwd, so a path that looked right in the conversation pointed at a
+ * directory that did not exist, and the failure only surfaced later as a confusing message about
+ * `modules` .
+ */
+function projectRootOf(input, exec): string {
+  const raw = typeof input === 'string' ? input.trim() : ''
+  if (!raw) return ''
+  return resolve(sessionWorkspace(exec), raw)
 }
 
 // ── Emulator start helpers (image precheck / readiness polling) ─────────
@@ -443,6 +477,7 @@ function createApi() {
       hdcExe: resolveHdc() ?? null,
       sdkHome: sdk || null,
       hint:
+        devecoCliHint() +
         'devecocli 缺失时:安装 @deveco/deveco-cli 或设置环境变量 DSH_HMOS_DEVECO_CLI。' +
         `hdc 缺失时:设置 DEVECO_SDK_HOME(${sdkExample})后重启 dsh web。` +
         (process.platform === 'linux'
@@ -696,7 +731,7 @@ function createApi() {
     if (res && typeof res.write === 'function') {
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache, no-transform' })
       res.write(`[dsh-hmos-emulator] 部署 ${device}${chosen ? `(模块 ${chosen})` : ''}\n`)
-      const { code, timedOut } = await runCliStream(cmd, {
+      const { code } = await runCliStream(cmd, {
         cwd: project,
         timeoutMs: 20 * 60 * 1000,
         onChunk: (chunk) => { try { res.write(chunk) } catch { /* client disconnected */ } },
@@ -732,7 +767,7 @@ function createApi() {
   }
 
   // Screenshot through devecocli ui screenshot (official command, not hdc). Passing a full
-  // PNG path makes the CLI write that exact file (verified), so no auto-name parsing.
+  // PNG path makes the CLI write that exact file , so no auto-name parsing.
   api.screenshot = async (payload) => {
     const cli = resolveDevecoCli()
     if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
@@ -745,18 +780,29 @@ function createApi() {
       throw Object.assign(new Error(`无法创建截图目录 ${dir}:${error instanceof Error ? error.message : String(error)}`), { code: 'fs-error' })
     }
     const safe = device.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 24)
-    // Automatic shots are named `auto-<reason>-…` so they can be told apart from hand-taken ones and
-    // pruned later; nothing else about them differs.
+    // The name records who owns the file, and that is the whole safety argument — a hand-taken
+    // shot must never be deleted by the tool:
+    //   auto-<reason>-…  a shot this plugin took because something just failed → pruned to SHOT_KEEP.
+    //   tool-…           a shot a model tool took (`emu_ui screenshot` / `observe`) → pruned to SHOT_KEEP.
+    //   hmos-shot-…      the panel's shot, i.e. the user's own → never matched by any prune.
+    // A caller cannot claim `tool` over HTTP: the route strips the field, so the only way to reach
+    // the two pruned prefixes is plugin code that knows it created the file.
     const auto = payload?.auto === true
+    const tool = !auto && payload?.origin === 'tool'
     const label = String(payload?.label ?? 'shot').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24) || 'shot'
-    const file = join(dir, auto ? `${AUTO_SHOT_PREFIX}${label}-${Date.now()}-${safe}.png` : `hmos-shot-${Date.now()}-${safe}.png`)
+    const file = join(dir, auto
+      ? `${AUTO_SHOT_PREFIX}${label}-${Date.now()}-${safe}.png`
+      : tool
+        ? `${TOOL_SHOT_PREFIX}${Date.now()}-${safe}.png`
+        : `hmos-shot-${Date.now()}-${safe}.png`)
     const result = await runCli([process.execPath, cli, 'ui', 'screenshot', '--device', device, '--path', file], { timeoutMs: 60000 })
     if (result.code !== 0 || !existsSync(file)) {
       const why = result.timedOut ? '超时' : result.code === 0 ? '未生成文件' : `退出码 ${result.code}`
       throw new Error(`截图失败(${why}):\n${result.output}`)
     }
-    // Verified need: the directory already held 42 shots / 39 MB with nobody cleaning it up.
+    // Why: the directory had grown to tens of megabytes with nobody cleaning it up.
     if (auto) pruneAutoShots(dir)
+    else if (tool) pruneToolShots(dir)
     return { path: file, device, dataUrl: payload?.preview ? readDataUrl(file) : null }
   }
 
@@ -796,7 +842,7 @@ function isLoopbackHostname(hostname: string): boolean {
  * Whether one request may reach this plugin's API — the browser-trust fence DSH applies to its
  * own /api (packages/client/connection/src/api-request-trust.ts). This route is registered as a
  * prefix on webServer, so it inherits none of DSH's fencing; without it a DNS-rebound host or a
- * malicious page could drive deveco.install, check.lint --fix or deploy on this machine.
+ * malicious page could drive deveco.install, check.lint --fix or deploy on the host.
  *  - Host binds every request: a browser fills Host from the URL it believes it is talking to,
  *    so a rebound page carries the attacker's domain even though the socket lands here.
  *  - `sec-fetch-site: cross-site` is refused outright, whatever the Origin says.
@@ -906,7 +952,58 @@ function writeError(res, error) {
 
 /** Tool output is compact JSON (no indentation) to save tokens. */
 const TOOL_OUT_SCHEMA = { type: 'object', additionalProperties: true }
-const toolRender = (args, value) => [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }]
+
+/**
+ * One durable image block from a value's attachment reference, or undefined when that value
+ * carries no image. The ref shape is checked rather than trusted: a half-built reference must not
+ * produce a block the harness cannot resolve.
+ */
+function imageBlockOf(image) {
+  if (!image || typeof image !== 'object' || Array.isArray(image)) return undefined
+  if (typeof image.attachmentId !== 'string' || typeof image.mediaType !== 'string') return undefined
+  return { type: 'image', attachment: { ...image } }
+}
+
+/**
+ * Render a tool value as one text block, plus an image block when the call asked for the picture
+ * itself (a screenshot that is only a path costs a second `read_image` round-trip per capture).
+ * The block shape is the durable one the harness projects: `{type:'image', attachment: <ref>}` —
+ * the `{data, mimeType}` form is the wire shape the harness builds from it, not a tool result.
+ *
+ * `steps` keeps its last step's result under `last`, so an image requested inside a batch has to be
+ * found there too.
+ */
+const toolRender = (_args, value) => {
+  const blocks: any[] = [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }]
+  const record = value && typeof value === 'object' && !Array.isArray(value) ? value : undefined
+  const block = imageBlockOf(record?.image) ?? imageBlockOf(record?.last?.image)
+  if (block) blocks.push(block)
+  return blocks
+}
+
+/**
+ * Store a captured PNG through the harness attachment service so it can ride the same call as an
+ * image block. Every failure (no attachment service, an image the deployment refuses) degrades to
+ * the text-only answer: a picture is an optimization here, never the result of the call.
+ */
+export async function attachmentRefForImage(ctx, filePath) {
+  try {
+    const attachments = ctx && typeof ctx.get === 'function' ? ctx.get('attachments') : undefined
+    if (!attachments || typeof attachments.saveImage !== 'function') return undefined
+    const ref = await attachments.saveImage({ data: readFileSync(filePath), mediaType: 'image/png', name: basename(filePath) })
+    if (!ref || typeof ref.attachmentId !== 'string') return undefined
+    return {
+      attachmentId: String(ref.attachmentId),
+      mediaType: String(ref.mediaType || 'image/png'),
+      bytes: Number(ref.bytes) || 0,
+      width: Number(ref.width) || 0,
+      height: Number(ref.height) || 0,
+      ...(typeof ref.name === 'string' ? { name: ref.name } : {}),
+    }
+  } catch {
+    return undefined
+  }
+}
 
 /** Keep the first n non-empty lines (issue lists put entries before the summary). */
 function headText(text, n) {
@@ -930,7 +1027,7 @@ export interface LintSummary {
 
 /**
  * Uncommitted code files `--incremental` is expected to inspect, project-relative. Only tracked
- * modifications count: a new untracked .ets file was verified to be ignored by codelinter even
+ * modifications count: a new untracked .ets file is ignored by codelinter even
  * though it matches code-linter.json5 (so the docs' "new files" does not cover untracked ones).
  * Null when git cannot answer (not a repo, no git), which is the signal to run the full check
  * instead of silently under-checking.
@@ -942,25 +1039,46 @@ export interface LintSummary {
  * it can never be used to tell "nothing to check" from "checked and clean" — this list is.
  */
 export async function changedCodeFiles(project: string): Promise<string[] | null> {
+  return (await codeStatusFiles(project))?.changed ?? null
+}
+
+/**
+ * The new-but-unadded code files of a working tree. `--incremental` never inspects them — codelinter
+ * works from the tracked change set — so a refactor that *adds* files reads as a clean run
+ *. Reporting them is what turns "pretending to be clean" into "saying what was not looked
+ * at"; the lint behaviour itself is unchanged.
+ */
+export async function untrackedCodeFiles(project: string): Promise<string[] | null> {
+  return (await codeStatusFiles(project))?.untracked ?? null
+}
+
+/**
+ * Both halves of `git status --porcelain` that linting cares about. One call for both, so the tool
+ * never pays two status runs.
+ */
+async function codeStatusFiles(project: string): Promise<{ changed: string[]; untracked: string[] } | null> {
   const status = await runCli(['git', '-c', 'core.quotepath=false', 'status', '--porcelain', '--', '.'], { cwd: project, timeoutMs: 15000 })
   if (status.code !== 0) return null
   const top = await runCli(['git', 'rev-parse', '--show-toplevel'], { cwd: project, timeoutMs: 15000 })
   const root = top.code === 0 ? top.output.split(/\r?\n/)[0].trim().replace(/\\/g, '/').replace(/\/+$/, '') : ''
-  return status.output
-    .split(/\r?\n/)
-    .map((line) => {
-      // Not a fixed-offset slice: `runCli` trims the whole output, so the FIRST line arrives
-      // without its leading space (verified — slicing 3 chars then ate the first letter of the
-      // path, turning `Demo/entry/A.ets` into `emo/entry/A.ets`).
-      const parsed = /^\s*([A-Z?!]{1,2})\s+(.+)$/.exec(line)
-      if (!parsed || parsed[1].includes('?')) return ''
-      const rest = parsed[2].trim()
-      // A rename reads `R  old -> new`; the new path is the one that exists now.
-      const raw = rest.includes(' -> ') ? rest.slice(rest.lastIndexOf(' -> ') + 4) : rest
-      const path = raw.replace(/^"(.*)"$/, '$1')
-      return root ? relativeTo(project, join(root, path)) : path
-    })
-    .filter((path) => /\.(ets|ts|js)$/.test(path))
+  const changed: string[] = []
+  const untracked: string[] = []
+  for (const line of status.output.split(/\r?\n/)) {
+    // Not a fixed-offset slice: `runCli` trims the whole output, so the FIRST line arrives
+    // without its leading space (slicing 3 chars then ate the first letter of the
+    // path, turning `Demo/entry/A.ets` into `emo/entry/A.ets`).
+    const parsed = /^\s*([A-Z?!]{1,2})\s+(.+)$/.exec(line)
+    if (!parsed) continue
+    const rest = parsed[2].trim()
+    // A rename reads `R  old -> new`; the new path is the one that exists now.
+    const raw = rest.includes(' -> ') ? rest.slice(rest.lastIndexOf(' -> ') + 4) : rest
+    const path = raw.replace(/^"(.*)"$/, '$1')
+    const full = root ? relativeTo(project, join(root, path)) : path
+    if (!/\.(ets|ts|js)$/.test(full)) continue
+    if (parsed[1].includes('?')) untracked.push(full)
+    else changed.push(full)
+  }
+  return { changed, untracked }
 }
 
 /**
@@ -982,7 +1100,7 @@ async function countChangedCode(project: string): Promise<number | null> {
 
 /**
  * Read a code-check result the way a user would. "changed"/"fix" pass --incremental, which only
- * inspects uncommitted tracked files: with none of them nothing was verified, and reporting that
+ * inspects uncommitted tracked files: with none of them the check covered nothing, and reporting that
  * as "0 errors" would be a false all-clear.
  */
 export function lintOutcome(summary: LintSummary | null, mode: string, changedFiles: number | null): { empty: boolean; stats: string } {
@@ -1006,7 +1124,7 @@ const LINT_SKIP = /(^|[\\/])(node_modules|oh_modules|build|\.git|\.hvigor|\.idea
 
 /**
  * Hash every code/config file under the project. A `--fix` run reports only the issues it could
- * fix (verified: the same directory prints 2 issues plain and "0 issues" with --fix while nothing
+ * fix (the same directory prints 2 issues plain and "0 issues" with --fix while nothing
  * is touched), so its own summary is useless as a result. Hashing around the run is what tells us
  * how much source actually changed.
  */
@@ -1057,9 +1175,9 @@ function cleanLayout(text: string): string {
 }
 
 /**
- * Cap a rendered tree by LINE count. It used to be capped by character count, which slices a line
- * in half and leaves a fragment that reads like a node; the note names `depth` and `filter`, both
- * of which are real emu_ui parameters.
+ * Cap a rendered tree by LINE count, never by characters: a character cap slices a line in half and
+ * leaves a fragment that reads like a node. The note names `depth` and `filter`, both real emu_ui
+ * parameters.
  */
 export function capLines(lines: string[], max = 80): string[] {
   if (lines.length <= max) return lines
@@ -1068,7 +1186,7 @@ export function capLines(lines: string[], max = 80): string[] {
 
 /**
  * One compact layout line: `Type [x1,y1,x2,y2] "text" [clickable] [scrollable] …`.
- * Verified on a real dump: devecocli prints no node id in any mode (`--mode full` and
+ * In practice: devecocli prints no node id in any mode (`--mode full` and
  * `--format json` included), so `emu_ui` assigns ids by position in the dump it just returned.
  */
 export interface LayoutLine {
@@ -1112,7 +1230,7 @@ export function parseLayoutLine(raw: string): LayoutLine {
 }
 
 /**
- * The node whose center should be tapped for a match. Verified on a real dump: a tab label
+ * The node whose center should be tapped for a match. In practice: a tab label
  * flush with the screen edge has its own center in the system gesture area, where the tap is
  * swallowed, while its clickable parent is one level up. So an inert match climbs to its
  * nearest clickable ancestor — unless that ancestor dwarfs the label, which makes it a
@@ -1163,9 +1281,9 @@ export interface LabelMatch {
 
 /**
  * Every distinct control a label can mean, best first.
- * A plain `includes` scan over the dump used to take the first hit, so a tap meant for a short
- * label landed on a container whose text merely contained it. Rank instead: exact text before
- * mere containment, clickable nodes before inert ones, then the smallest area so an inner node
+ * Rank rather than take the first `includes` hit: a tap meant for a short label must not land on a
+ * container whose text merely contains it. Exact text before mere containment, clickable nodes
+ * before inert ones, then the smallest area so an inner node
  * wins over the outer container that holds it. Hits sharing one tap target (a label and the
  * container it climbed to) collapse into a single candidate, so the count is a control count.
  */
@@ -1202,7 +1320,7 @@ function candidateList(lines: LayoutLine[], matches: LabelMatch[], cap = 5) {
   })
 }
 
-// ── Layout ids and filtering (R8) ───────────────────────────────────────
+// ── Layout ids and filtering ───────────────────────────────────────
 
 /** Optional narrowing of a dump. `type` matches case-insensitively; `textRegex` is a JS regex. */
 interface LayoutQuery { type?: string; textRegex?: string; clickableOnly?: boolean }
@@ -1247,7 +1365,7 @@ function renderLines(rows: { index: number; line: LayoutLine }[]): string[] {
   return rows.map(({ index, line }) => `${' '.repeat(line.indent)}#${index} ${line.raw.trim()}`)
 }
 
-/** A rendered dump for the model, capped (R19). */
+/** A rendered dump for the model, capped. */
 function renderLayout(rows: { index: number; line: LayoutLine }[]): string {
   return capLines(renderLines(rows)).join('\n')
 }
@@ -1283,7 +1401,7 @@ export function diffLines(before: string[], after: string[]): string {
 
 /**
  * Human-readable name of a node: its own text, or — for a container matched through a child's
- * label (the clickable tab that owns the text) — the first text inside it. Verified need:
+ * label (the clickable tab that owns the text) — the first text inside it. Why:
  * `filter{clickableOnly}` reports the clickable Column, which carries no text of its own.
  */
 export function nodeLabel(lines: LayoutLine[], index: number): string {
@@ -1326,9 +1444,9 @@ export function ancestorLabels(lines: LayoutLine[], index: number, limit = 3): s
 /**
  * Text that identifies the page currently showing, used to answer "which page am I on" after a
  * tap. Prefers the shallowest text inside a `NavDestination` subtree (the page's own header), then
- * accepts the dump's first text only when it sits at the very top — verified shape of the failure:
- * a page whose title area holds no words produced `"0"`, the first stat number two levels deep in
- * the list, which names nothing. Returns '' rather than a guess, since callers confirm navigation
+ * accepts the dump's first text only when it sits at the very top and is not a bare number —
+ * shape of that failure: a page whose title area holds no words produced `"0"`, a stat
+ * number, which names nothing. Returns '' rather than a guess, since callers confirm navigation
  * with it.
  */
 export function pageTitle(lines: LayoutLine[]): string {
@@ -1343,7 +1461,14 @@ export function pageTitle(lines: LayoutLine[]): string {
     }
     if (found) return found
   }
-  const first = lines.find((l) => l.text)
+  // Otherwise accept a top-level text only from the header band. On a typical screen the only
+  // top-level texts are the statistics — a big counter and its small label, well below the header
+  // — so both "first text" and "first non-numeric text" named the wrong page. A page name
+  // that is wrong is worse than none, so anything lower than the band is refused and the caller
+  // gets `page: null`.
+  const bottom = lines.reduce((max, l) => (l.bounds ? Math.max(max, l.bounds[3]) : max), 0)
+  const band = bottom * 0.2
+  const first = lines.find((l) => l.text && l.bounds && l.bounds[1] < band && !/^\d+$/.test(l.text.trim()))
   return first && first.indent <= 2 ? first.text : ''
 }
 
@@ -1392,13 +1517,13 @@ function matchLayout(lines: LayoutLine[], { text, textRegex, clickableOnly }: { 
   return hits
 }
 
-// ── Structured parsers (R1 lint table, R3 build errors, R7 log lines) ────
+// ── Structured parsers ────
 
 /** One codelinter finding, from the report table. */
 export interface LintFinding { file: string; line: number; column: number; severity: string; rule: string; message: string }
 
 /**
- * Parse codelinter's report table. Verified on a real full run: rows are space-padded
+ * Parse codelinter's report table. Shape of a full run: rows are space-padded
  * (`No  File  Line  Column  Severity  Rule  Message`) and the File column is relative to the
  * process cwd — so the check must be run with `cwd: project` for project-relative paths.
  * The Message column is last, so any spacing inside it survives.
@@ -1417,7 +1542,7 @@ export function parseLintTable(text: string): { findings: LintFinding[]; summary
 export interface BuildError { file: string; line: number; column: number; code: string; message: string }
 
 /**
- * Parse the ArkTS error blocks hvigor prints on a failed build. Verified on a real failure:
+ * Parse the ArkTS error blocks hvigor prints on a failed build. Shape of a failure:
  *   1 ERROR: 10505001 ArkTS Compiler Error
  *   Error Message: Expression expected. At File: C:/…/PanelBody.ets:185:34
  *   COMPILE RESULT:FAIL {ERROR:2 WARN:27}
@@ -1451,7 +1576,7 @@ function relativeTo(root: string, file: string): string {
 }
 
 /**
- * Furthest deploy stage the output reached, from verified markers of a real `devecocli run`:
+ * Furthest deploy stage the output reached, from the stage markers `devecocli run` prints:
  *   `[hvigor build] Running...`      → `Build completed successfully.`
  *   `Installing artifacts to device` → `App installed successfully`
  *   `Launching <bundle>/<ability>...` → `start ability successfully.`
@@ -1464,7 +1589,7 @@ export function deployPhase(text: string): 'build' | 'install' | 'launch' {
   return 'build'
 }
 
-/** Newest hap under the module's standard hvigor output directory (verified layout). */
+/** Newest hap under the module's standard hvigor output directory (standard layout). */
 function hapPathOf(project: string, module: string): string | null {
   const dir = join(project, module, 'build', 'default', 'outputs', 'default')
   try {
@@ -1485,7 +1610,7 @@ function hapPathOf(project: string, module: string): string | null {
 export interface LogLine { time: string; level: string; tag: string; message: string }
 
 /**
- * Parse hilog lines. Verified format from the device:
+ * Parse hilog lines. Line format:
  *   `09-13 21:49:14.737 10388 10388 W C02c02/PARAM: SystemReadParam failed!…`
  * `tag` is the part after the domain slash (`PARAM`), which is the name callers know.
  * Lines that do not match (devecocli's progress line, wrapped continuations) are dropped.
@@ -1537,16 +1662,32 @@ export function sessionWorkspace(exec) {
 
 /** Prefix of every screenshot this plugin writes on its own initiative. */
 export const AUTO_SHOT_PREFIX = 'auto-'
+/**
+ * Prefix of the captures the **model tools** write on their own initiative (`emu_ui screenshot`).
+ * They are named apart from `hmos-shot-*` for one reason: only a file the plugin knows it created
+ * may ever be pruned. The user's own shots go through the panel and keep the `hmos-shot-*` name, so
+ * "never auto-delete a hand-taken shot" is enforced by the name, not by a heuristic.
+ */
+export const TOOL_SHOT_PREFIX = 'tool-'
 
 /**
- * Keep only the newest `keep` automatic screenshots. Automatic shots exist for the failure that
- * just happened, so they are disposable — but only `auto-*` is ever deleted: the directory is
- * shared with hand-taken shots, and a tool that prunes user files is worse than a full disk.
+ * How many captures of one owned prefix are kept — both pruned prefixes share this number.
+ *
+ * A capture is a full-screen PNG (1320x2856, ~2.4 MB on this emulator), so the count *is* the disk
+ * bound: 40 ≈ 96 MB per prefix, ~192 MB for the two together. A fixed count is what keeps the
+ * directory from growing without bound.
+ *
+ * One capture costs ~1.6 s, so a burst of 20 screenshots (~35 s) would evict a deliberate shot taken
+ * a minute earlier; 40 keeps a usable window. Raising it costs only disk, because a delivered image
+ * is already durable in the attachment store — the PNG here is the original, not the record.
  */
-export function pruneAutoShots(dir: string, keep = 20): number {
+export const SHOT_KEEP = 40
+
+/** Keep only the newest `keep` files carrying one prefix; returns how many were removed. */
+function pruneByPrefix(dir: string, prefix: string, keep: number): number {
   try {
     const shots = readdirSync(dir)
-      .filter((f) => f.startsWith(AUTO_SHOT_PREFIX) && f.endsWith('.png'))
+      .filter((f) => f.startsWith(prefix) && f.endsWith('.png'))
       .map((f) => ({ f, ms: statSync(join(dir, f)).mtimeMs }))
       .sort((a, b) => b.ms - a.ms)
     let removed = 0
@@ -1560,11 +1701,32 @@ export function pruneAutoShots(dir: string, keep = 20): number {
 }
 
 /**
+ * Keep only the newest `keep` automatic screenshots. Automatic shots exist for the failure that
+ * just happened, so they are disposable — but only `auto-*` is ever deleted: the directory is
+ * shared with hand-taken shots, and a tool that prunes user files is worse than a full disk.
+ */
+export function pruneAutoShots(dir: string, keep = SHOT_KEEP): number {
+  return pruneByPrefix(dir, AUTO_SHOT_PREFIX, keep)
+}
+
+/**
+ * Keep only the newest `keep` captures the model tools took. Safe for the same reason
+ * `pruneAutoShots` is: the prefix proves the plugin wrote the file (`hmos-shot-*`, the panel's and
+ * the user's, is never matched here).
+ */
+export function pruneToolShots(dir: string, keep = SHOT_KEEP): number {
+  return pruneByPrefix(dir, TOOL_SHOT_PREFIX, keep)
+}
+
+/**
  * Take a screenshot because something just failed — the next question after "the tap did nothing"
- * is always "what did it look like". Only the path is returned: the image itself would cost more
- * context than the whole session's layout dumps and is *less* precise than the tree (a 1320x2856
- * PNG is ~1.8 MB, and reading coordinates off a scaled image is guesswork). Failures here are
- * swallowed on purpose: a screenshot that cannot be taken must not turn one failure into two.
+ * is always "what did it look like". Only the path is returned by default: the image would cost
+ * context, and for locating a node the tree is more precise than a scaled 1320x2856 PNG.
+ *
+ * `read` attaches the picture as well. The attachment store normalizes and downscales before the
+ * request (`attachment-local`), the same path `screenshot {read:true}` uses. Failures here are
+ * swallowed on purpose: a
+ * screenshot that cannot be taken must not turn one failure into two.
  */
 async function autoShot(api, device: string, root: string, label: string): Promise<string> {
   try {
@@ -1573,6 +1735,14 @@ async function autoShot(api, device: string, root: string, label: string): Promi
   } catch {
     return ''
   }
+}
+
+/** The failure-shot fields to spread into a result: the path, plus the image when one was asked for. */
+async function shotFields(api, device: string, root: string, label: string, ctx, read: boolean) {
+  const path = await autoShot(api, device, root, label)
+  if (!path) return {}
+  const image = read ? await attachmentRefForImage(ctx, path) : undefined
+  return image ? { shot: path, image } : { shot: path }
 }
 
 /**
@@ -1603,7 +1773,7 @@ function paeth(a: number, b: number, c: number): number {
 }
 
 /**
- * Decode a PNG far enough to compare pixels. `devecocli ui screenshot` writes one verified shape —
+ * Decode a PNG far enough to compare pixels. `devecocli ui screenshot` writes one shape —
  * 1320x2856, 8 bit, colorType 6 (RGBA), interlace 0, filter 0 — and Node's zlib does the inflate, so
  * this stays dependency-free. Anything outside that shape is refused by name rather than guessed at.
  */
@@ -1655,9 +1825,90 @@ export function decodePng(file: Buffer): DecodedPng {
   return { width: header.width, height: header.height, channels, pixels }
 }
 
+/** CRC32 table for PNG chunks, built once. */
+const CRC_TABLE = (() => {
+  const table = new Int32Array(256)
+  for (let n = 0; n < 256; n += 1) {
+    let c = n
+    for (let k = 0; k < 8; k += 1) c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+    table[n] = c
+  }
+  return table
+})()
+
+function crc32(buf: Buffer): number {
+  let c = 0xffffffff
+  for (let i = 0; i < buf.length; i += 1) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8)
+  return (c ^ 0xffffffff) >>> 0
+}
+
+/** One PNG chunk: length, type, body, CRC over type+body. */
+function pngChunk(type: string, body: Buffer): Buffer {
+  const head = Buffer.alloc(8)
+  head.writeUInt32BE(body.length, 0)
+  head.write(type, 4, 'ascii')
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(crc32(Buffer.concat([head.subarray(4), body])), 0)
+  return Buffer.concat([head, body, crc])
+}
+
+/**
+ * Encode 8-bit RGB/RGBA pixels as a PNG, filter 0 on every row. The mirror of `decodePng`, and the
+ * The one thing a region capture needs: devecocli has no crop option, so a region capture means cutting the
+ * bitmap locally — which needs a way to write it back out. Deflate comes from `node:zlib`, so this
+ * stays dependency-free like the decoder.
+ */
+export function encodePng(image: DecodedPng): Buffer {
+  const { width, height, channels, pixels } = image
+  if (channels !== 3 && channels !== 4) throw new Error(`无法编码 ${channels} 通道(只处理 RGB/RGBA)`)
+  if (width <= 0 || height <= 0) throw new Error(`无法编码 ${width}x${height} 的图`)
+  const stride = width * channels
+  const raw = Buffer.alloc(height * (stride + 1))
+  for (let y = 0; y < height; y += 1) {
+    raw[y * (stride + 1)] = 0
+    pixels.copy(raw, y * (stride + 1) + 1, y * stride, y * stride + stride)
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  ihdr[8] = 8
+  ihdr[9] = channels === 4 ? 6 : 2
+  ihdr[10] = 0
+  ihdr[11] = 0
+  ihdr[12] = 0
+  return Buffer.concat([
+    PNG_SIGNATURE,
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ])
+}
+
+/**
+ * Cut a rectangle out of a decoded PNG, clamped to the image bounds. Returns the rectangle actually
+ * used (`clamped: true` when it differs from the request), so a partly off-screen request is
+ * reported rather than silently producing a different picture.
+ */
+export function cropPng(image: DecodedPng, rect: { x: number; y: number; w: number; h: number }): { image: DecodedPng; rect: { x: number; y: number; w: number; h: number }; clamped: boolean } {
+  const asked = { x: Math.floor(rect.x), y: Math.floor(rect.y), w: Math.floor(rect.w), h: Math.floor(rect.h) }
+  const x = Math.max(0, Math.min(image.width - 1, asked.x))
+  const y = Math.max(0, Math.min(image.height - 1, asked.y))
+  const w = Math.max(1, Math.min(image.width - x, asked.w))
+  const h = Math.max(1, Math.min(image.height - y, asked.h))
+  const clamped = x !== asked.x || y !== asked.y || w !== asked.w || h !== asked.h
+  const stride = image.width * image.channels
+  const rowBytes = w * image.channels
+  const out = Buffer.alloc(h * rowBytes)
+  for (let row = 0; row < h; row += 1) {
+    const from = (y + row) * stride + x * image.channels
+    image.pixels.copy(out, row * rowBytes, from, from + rowBytes)
+  }
+  return { image: { width: w, height: h, channels: image.channels, pixels: out }, rect: { x, y, w, h }, clamped }
+}
+
 /**
  * Pixel difference between two captures, as the fraction of pixels whose channels differ at all.
- * Two captures of an unchanged screen are byte-identical (verified), so callers get `same` from a
+ * Two captures of an unchanged screen are byte-identical , so callers get `same` from a
  * byte compare and never reach this function on the cheap path; it exists for the other case, where
  * "did that colour change actually land on screen, and how much" has to be a number rather than a
  * 268 KB image read into context.
@@ -1681,20 +1932,22 @@ export function diffPng(before: DecodedPng, after: DecodedPng, tolerance = 0): {
  *  - emu    : instance list/start/stop (reuses image precheck + readiness polling)
  *  - emu_ui : inspect/drive the screen through devecocli ui (compact layout tree, label click)
  */
-function createToolDefs(api) {
-  /** Last dump per device, so `click {id}` resolves the node the caller just read (R8). */
+function createToolDefs(api, ctx = null) {
+  /** Last dump per device, so `click {id}` resolves the node the caller just read. */
   const lastLayout = new Map<string, LayoutLine[]>()
   /**
    * The two baselines behind `changedOnly` and `waitForChange`. They live HERE, beside `lastLayout`,
    * and not inside `execute`: a map declared in the tool body is rebuilt on every call, so a
-   * baseline from the previous call is never seen. That is exactly how `changedOnly` used to work
-   * only when both renders happened inside one `steps` batch, and how `waitForChange` started after
-   * the change it was asked to observe had already happened.
+   * baseline from the previous call is never seen.
    */
   const lastRender = new Map<string, string[]>()
   const lastDump = new Map<string, string[]>()
-  /** Last screenshot taken per device, so a compare call can name it as `"last"`. */
-  const lastShot = new Map<string, string>()
+  /**
+   * Last screenshot taken per device, so a compare call can name it as `"last"`. The clip rect is
+   * remembered with it: a cropped capture cannot serve as a whole-screen baseline, and treating it
+   * as one answered "everything changed" (`diffRatio: 1`) instead of saying the sizes differ.
+   */
+  const lastShot = new Map<string, { path: string; clip?: { x: number; y: number; w: number; h: number } }>()
   const emu = {
     name: 'emu',
     description: 'List/start/stop emulators via devecocli (start waits until online).',
@@ -1735,38 +1988,71 @@ function createToolDefs(api) {
 
   const emuUi = {
     name: 'emu_ui',
-    description: 'Drive the emulator screen via devecocli ui. layout: tree lines (#id Type [x1,y1,x2,y2] "text" flags) + page title; click/longPress/doubleTap by label, id or x/y (results carry ancestors text breadcrumb, and matchCount/candidates when a label is ambiguous); waitFor/waitForChange/waitForIdle instead of sleeping; steps runs several actions in one call; drag/fling/dircfling/swipe/text/screenshot.',
+    description: 'Drive the emulator screen via devecocli ui. layout: tree lines (#id Type [x1,y1,x2,y2] "text" flags) + page title; click/longPress/doubleTap by label, id or x/y (results carry an ancestors breadcrumb, and matchCount/candidates when a label is ambiguous); waitFor/waitForChange/waitForIdle instead of sleeping; steps batches actions; drag/fling/dircfling/swipe/text/screenshot.',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['layout', 'click', 'text', 'swipe', 'screenshot', 'waitFor', 'waitForChange', 'waitForIdle', 'longPress', 'doubleTap', 'drag', 'fling', 'dircfling', 'steps'], description: 'UI action' },
-        steps: { type: 'array', items: { type: 'object' }, description: 'steps: [{action,...}] run in order with the same parameters; the first failure stops the batch' },
-        onFail: { type: 'string', enum: ['stop', 'continue'], description: 'steps: stop (default) | continue' },
-        changedOnly: { type: 'boolean', description: 'layout/thenLayout: only the lines that differ from the previous render' },
+        action: { type: 'string', enum: ['layout', 'observe', 'click', 'text', 'swipe', 'screenshot', 'waitFor', 'waitForChange', 'waitForIdle', 'longPress', 'doubleTap', 'drag', 'fling', 'dircfling', 'steps'], description: 'UI action' },
+        steps: { type: 'array', items: { type: 'object' }, description: 'steps: [{action,...}] in order (see onFail)' },
+        onFail: { type: 'string', enum: ['stop', 'continue'], description: 'steps: stop (default, returns stoppedAt) | continue (runs all, returns failedAt)' },
+        changedOnly: { type: 'boolean', description: 'layout/thenLayout: only changed lines vs the previous render' },
         device: { type: 'string', description: 'serial (default: first running)' },
-        id: { type: 'integer', description: 'press: node id (from the last layout)' },
-        label: { type: 'string', description: 'press: node text -> tap its center (exact first, else smallest clickable ancestor)' },
-        labelIndex: { type: 'integer', description: 'press: which candidate when the label repeats (0-based; see matchCount)' },
+        id: { type: 'integer', description: 'press: node id from the last layout' },
+        label: { type: 'string', description: 'press: node text; exact first, else smallest clickable ancestor' },
+        labelIndex: { type: 'integer', description: 'press: candidate index when label repeats (see matchCount)' },
         depth: { type: 'integer', description: 'layout/waitFor: depth (0=unlimited, 1=root)' },
         filter: { type: 'object', description: 'layout/thenLayout: node filter', properties: { type: { type: 'string' }, textRegex: { type: 'string' }, clickableOnly: { type: 'boolean' } } },
-        full: { type: 'boolean', description: 'layout: include unlabeled/inert containers (--mode full)' },
+        full: { type: 'boolean', description: 'layout: include unlabeled/inert nodes (--mode full)' },
         asJson: { type: 'boolean', description: 'layout: flat JSON nodes (label: inherited text)' },
         textRegex: { type: 'string', description: 'waitFor: JS regex on node text' },
         clickableOnly: { type: 'boolean', description: 'waitFor: clickable only' },
-        timeoutMs: { type: 'integer', description: 'wait: total ms (5000; one dump ≈1.5-3s is the floor)' },
+        absent: { type: 'boolean', description: 'waitFor: succeed when the match is gone instead of present' },
+        timeoutMs: { type: 'integer', description: 'wait: total ms (5000); one dump (1.5-3s) cannot be interrupted, so elapsed may exceed it by one dump' },
         pollMs: { type: 'integer', description: 'wait: poll ms (200)' },
         stablePolls: { type: 'integer', description: 'waitForIdle: stable dumps (2)' },
-        thenLayout: { type: 'boolean', description: 'click: attach a layout after the tap (honours filter/changedOnly)' },
-        waitMs: { type: 'integer', description: 'thenLayout ms (600, max 5000)' },
-        x: { type: 'integer', description: 'press/swipe/drag/fling: start x' },
-        y: { type: 'integer', description: 'press/swipe/drag/fling: start y' },
-        x2: { type: 'integer', description: 'swipe/drag/fling: end x' },
-        y2: { type: 'integer', description: 'swipe/drag/fling: end y' },
+        thenLayout: { type: 'boolean', description: 'click: layout after the tap (honours filter/changedOnly)' },
+        thenWaitFor: {
+          type: 'object',
+          properties: {
+            text: { type: 'string' },
+            textRegex: { type: 'string' },
+            absent: { type: 'boolean' },
+            timeoutMs: { type: 'integer' },
+            pollMs: { type: 'integer' },
+          },
+          additionalProperties: true,
+          description: 'click: wait for this condition after the tap, then dump (same shape as waitFor; replaces the fixed waitMs guess)',
+        },
+        waitMs: { type: 'integer', description: 'thenLayout ms (600, max 5000); thenWaitFor timeout floor' },
+        x: { type: 'integer', description: 'press/swipe/drag: start x' },
+        y: { type: 'integer', description: 'press/swipe/drag: start y' },
+        x2: { type: 'integer', description: 'swipe/drag: end x' },
+        y2: { type: 'integer', description: 'swipe/drag: end y' },
         velocity: { type: 'integer', description: 'drag: px/s' },
         direction: { type: 'string', description: 'dircfling: left|right|up|down' },
-        text: { type: 'string', description: 'text: string to type; waitFor: text to match' },
-        root: { type: 'string', description: 'screenshot: dir for the PNG (default: the session workspace)' },
-        baseline: { type: 'string', description: 'screenshot: PNG path (or "last") to compare against' },
+        text: { type: 'string', description: 'text: string to type, or the waitFor match' },
+        root: { type: 'string', description: 'screenshot: dir for the PNG (default: workspace)' },
+        baseline: { type: 'string', description: 'screenshot: PNG path or "last" to compare' },
+        read: { type: 'boolean', description: 'attach the image; a failed click/wait also attaches its shot' },
+        keep: { type: 'boolean', description: 'screenshot: keep the PNG on disk (default true); false deletes it once the image is attached; ignored with baseline' },
+        clip: {
+          type: 'object',
+          properties: { x: { type: 'integer' }, y: { type: 'integer' }, w: { type: 'integer' }, h: { type: 'integer' } },
+          required: ['x', 'y', 'w', 'h'],
+          additionalProperties: false,
+          description: 'screenshot/observe: crop to this device-pixel rect (layout coordinates) so the preview stays 1:1; not with baseline',
+        },
+        log: {
+          type: 'object',
+          properties: {
+            level: { type: 'string' },
+            keyword: { type: 'string' },
+            tail: { type: 'integer' },
+            crash: { type: 'boolean' },
+          },
+          additionalProperties: true,
+          description: 'observe: also return device logs in the same call (hmos_log parameters)',
+        },
       },
       required: ['action'],
     },
@@ -1778,18 +2064,23 @@ function createToolDefs(api) {
       if (!device) return { ok: false, error: 'no running emulator; start one with emu {action:"start", name:"<instance>"}' }
       const run = (argv, timeoutMs) => runCli([process.execPath, cli, ...argv], { timeoutMs })
       const depth = Number.isFinite(args?.depth) ? Math.max(0, Math.floor(args.depth)) : 0
+      /**
+       * The depth one call should dump at. A `steps` entry carries its own arguments ("same
+       * parameters as a normal call" is what `steps` promises), so a per-step `depth` has to reach
+       * `--depth`.
+       */
+      const depthOf = (step: any) => (Number.isFinite(step?.depth) ? Math.max(0, Math.floor(step.depth)) : depth)
       /** Where screenshots go: the session workspace, so the path it hands back can be read again. */
       const shotRoot = sessionWorkspace(exec)
 
       /**
        * Dump the tree and remember it. A dump taken right after a navigation can come back with
-       * only the progress line; that used to be reported as a valid empty tree, so retry briefly
-       * before believing it. `full` switches devecocli to `--mode full`, the only mode that keeps
-       * unlabeled and inert containers (verified: 29 lines against 13 for the same screen) — the
+       * only the progress line, so retry briefly before believing it. `full` switches devecocli to `--mode full`, the only mode that keeps
+       * unlabeled and inert containers (much longer than the default mode for the same screen) — the
        * default prunes the very node that can be swallowing a tap.
        */
-      const dumpLayout = async (full = false): Promise<{ ok: boolean; lines: LayoutLine[]; error?: string }> => {
-        const argv = ['ui', 'layout', '--device', device, '--depth', String(depth)]
+      const dumpLayout = async (full = false, atDepth = depth): Promise<{ ok: boolean; lines: LayoutLine[]; error?: string }> => {
+        const argv = ['ui', 'layout', '--device', device, '--depth', String(atDepth)]
         if (full) argv.push('--mode', 'full')
         for (let attempt = 0; attempt < 3; attempt += 1) {
           const r = await run(argv, 30000)
@@ -1808,8 +2099,8 @@ function createToolDefs(api) {
       /** Render rows, remembering what the caller saw so the next `changedOnly` has a baseline. */
       const renderFor = (rows: { index: number; line: LayoutLine }[], changedOnly: boolean): string => {
         const keys = rawKeys(rows)
-        // A filter that matched nothing is NOT "nothing changed": both used to answer an empty tree /
-        // `changed:0`, and one of those silent answers cost a whole wasted round (§3.8).
+        // A filter that matched nothing is NOT "nothing changed": answer `matched:0`, never an empty
+        // tree or `changed:0`.
         if (keys.length === 0) return 'matched:0'
         const previous = lastRender.get(device)
         lastRender.set(device, keys)
@@ -1832,6 +2123,7 @@ function createToolDefs(api) {
           const done: any[] = []
           let last: any = null
           let stoppedAt = -1
+          const failedAt: number[] = []
           for (let i = 0; i < list.length; i += 1) {
             const step = list[i] && typeof list[i] === 'object' ? list[i] : {}
             const stepAction = String(step.action || '')
@@ -1847,22 +2139,41 @@ function createToolDefs(api) {
             }
             done.push({ action: stepAction || '?', ok: last?.ok === true, ms: Date.now() - at, summary: stepSummary(stepAction, last) })
             if (last?.ok !== true) {
-              stoppedAt = i
-              if (!keepGoing) break
+              failedAt.push(i)
+              if (!keepGoing) { stoppedAt = i; break }
             }
           }
           // `ok` reflects the batch, not the last step: a failure in the middle is still a failure.
-          const failed = done.some((s) => s.ok !== true)
-          return { ok: !failed, device, steps: done, last, ...(stoppedAt >= 0 ? { stoppedAt } : {}) }
+          const failed = failedAt.length > 0
+          return {
+            ok: !failed,
+            device,
+            steps: done,
+            last,
+            // `stoppedAt` means the batch really stopped there — only `stop` can do that. A `continue`
+            // batch ran every step, so it reports the failing indices instead of a stop position that
+            // never happened.
+            ...(stoppedAt >= 0 ? { stoppedAt } : {}),
+            ...(keepGoing && failed ? { failedAt } : {}),
+          }
         }
         if (action === 'layout') {
-          const dump = await dumpLayout(a?.full === true)
+          const at = depthOf(a)
+          const dump = await dumpLayout(a?.full === true, at)
           if (!dump.ok) return { ok: false, device, error: dump.error }
           const rows = selectLayoutLines(dump.lines, a?.filter)
           const page = pageTitle(dump.lines)
+          // `depth` and `full` are measured differently — `--mode full` keeps the
+          // `window`/`root` containers, so the same number denotes a shallower slice of the real
+          // page. A caller that asked for a shallow full dump gets containers only and could read
+          // that as "the page is empty"; say what happened instead of guessing a corrected depth.
+          const textless = at > 0 && !dump.lines.some((line) => line.text)
+          const note = textless
+            ? `这次 dump 只有容器、没有任何文字:depth=${at} 只到第 ${at} 层${a?.full === true ? '(full 模式还会多出 window/root 两层)' : ''};要看内容请用 depth:0 或不传 depth。`
+            : undefined
           return a?.asJson
-            ? { ok: true, device, total: dump.lines.length, ...(page ? { page } : {}), nodes: layoutJson(rows, dump.lines) }
-            : { ok: true, device, total: dump.lines.length, ...(page ? { page } : {}), tree: renderFor(rows, a?.changedOnly === true) }
+            ? { ok: true, device, total: dump.lines.length, page: page || null, ...(note ? { note } : {}), nodes: layoutJson(rows, dump.lines) }
+            : { ok: true, device, total: dump.lines.length, page: page || null, ...(note ? { note } : {}), tree: renderFor(rows, a?.changedOnly === true) }
         }
         if (action === 'click' || action === 'longPress' || action === 'doubleTap') {
           // All three are "point at a node and press it": only the devecocli verb differs.
@@ -1895,8 +2206,8 @@ function createToolDefs(api) {
             if (!matches.length) {
               // A label that resolves to nothing is usually an overlay or a half-drawn page, which
               // is exactly the case where a picture answers what the tree cannot.
-              const shot = await autoShot(api, device, shotRoot, 'click')
-              return { ok: false, device, error: `no layout node matching "${a.label}"`, ...(pageTitle(dump.lines) ? { page: pageTitle(dump.lines) } : {}), ...(shot ? { shot } : {}) }
+              const shot = await shotFields(api, device, shotRoot, 'click', ctx, a?.read === true)
+              return { ok: false, device, error: `no layout node matching "${a.label}"`, page: pageTitle(dump.lines) || null, ...shot }
             }
             const want = Number.isFinite(a?.labelIndex) ? Math.max(0, Math.floor(a.labelIndex)) : 0
             matchCount = matches.length
@@ -1918,7 +2229,9 @@ function createToolDefs(api) {
           if (r.code !== 0) return { ok: false, device, error: tailText(r.output, 4) }
           const result: any = { ok: true, device, x: point.x, y: point.y }
           if (usedId !== null) result.id = usedId
-          if (page) result.page = page
+          // `page` is always present, `null` when the tree carries no title — "no title" and
+          // "the field is missing" looked the same to a caller, and only one of them is a signal.
+          result.page = page || null
           // The breadcrumb replaces the old raw `matched`/`tapped` lines: `Row [928,2702,…] clickable`
           // only repeated the coordinates we already return, while the text of the ancestors is what
           // tells the caller which of several identical buttons it just pressed.
@@ -1927,11 +2240,29 @@ function createToolDefs(api) {
           // A containment-only match tapped a node whose text merely held the label; say so,
           // so the caller can re-issue with exact x/y when that is not the intended node.
           if (inexact) result.matchedBy = 'contains'
-          // thenLayout verifies the tap in the same call: a fresh layout after a short settle delay.
-          if (action === 'click' && a?.thenLayout) {
-            const wait = Number.isFinite(a?.waitMs) ? Math.max(0, Math.min(5000, a.waitMs)) : 600
-            if (wait > 0) await new Promise((resolveWait) => setTimeout(resolveWait, wait))
-            const after = await dumpLayout()
+          // thenLayout verifies the tap in the same call. `thenWaitFor` waits for a condition instead
+          // of the fixed settle delay: a guess of 600 ms is either wasted or too short, and the
+          // caller would otherwise spend its next round on the `waitFor` it already knows about.
+          if (action === 'click' && (a?.thenLayout || a?.thenWaitFor)) {
+            const condition = a?.thenWaitFor && typeof a.thenWaitFor === 'object' ? a.thenWaitFor : null
+            if (condition) {
+              const waited = await perform({
+                ...condition,
+                action: 'waitFor',
+                timeoutMs: Number.isFinite(condition.timeoutMs) ? condition.timeoutMs : (Number.isFinite(a?.waitMs) ? a.waitMs : 5000),
+                ...(Number.isFinite(condition.pollMs) ? { pollMs: condition.pollMs } : {}),
+              })
+              result.thenWaitFor = {
+                ok: waited?.ok === true,
+                elapsedMs: waited?.elapsedMs,
+                ...(condition.absent === true ? { absent: true } : { matched: Array.isArray(waited?.matched) ? waited.matched.length : 0 }),
+                ...(waited?.ok === true ? {} : { error: waited?.error ?? '等待条件未在超时内成立' }),
+              }
+            } else {
+              const wait = Number.isFinite(a?.waitMs) ? Math.max(0, Math.min(5000, a.waitMs)) : 600
+              if (wait > 0) await new Promise((resolveWait) => setTimeout(resolveWait, wait))
+            }
+            const after = await dumpLayout(false, depthOf(a))
             result.tree = after.ok
               ? renderFor(selectLayoutLines(after.lines, a?.filter), a?.changedOnly === true)
               : after.error
@@ -1954,17 +2285,85 @@ function createToolDefs(api) {
         if (action === 'screenshot') {
           const asked = typeof a?.root === 'string' && a.root.trim() ? a.root.trim() : shotRoot
           const wanted = typeof a?.baseline === 'string' ? a.baseline.trim() : ''
-          const value = await api.screenshot({ device, root: asked })
+          const read = a?.read === true
+          // devecocli cannot crop, so a region capture is cut here. Doing it before the
+          // attachment is what makes the preview ~1:1 — the whole point of the option.
+          const clipWanted = a?.clip && typeof a.clip === 'object' ? a.clip : null
+          if (clipWanted && wanted) {
+            return { ok: false, device, error: 'clip 与 baseline 互斥:基线比对的是一整屏,裁剪会让"变没变"的坐标语义变模糊。' }
+          }
+          if (clipWanted && ![clipWanted.x, clipWanted.y, clipWanted.w, clipWanted.h].every((n) => Number.isFinite(n))) {
+            return { ok: false, device, error: 'clip 需要 {x, y, w, h}(设备像素,与 layout 的 [x1,y1,x2,y2] 同一坐标系)。' }
+          }
+          // `screenshots/` grew without bound because every `read:true` capture stayed
+          // on disk after it had been delivered. `keep:false` deletes it again — the picture is in the
+          // conversation, and a baseline comparison is the one case that still needs the file.
+          const discard = a?.keep === false && !wanted && read
+          // `origin` marks this file as one the tool wrote, so it may be pruned later; the panel
+          // never sends it and its files therefore keep the never-pruned `hmos-shot-*` name.
+          const value = await api.screenshot({ device, root: asked, origin: 'tool' })
           const rel = relativeTo(asked, value.path)
+          let clipped = null
+          if (clipWanted) {
+            try {
+              const region = cropPng(decodePng(readFileSync(value.path)), { x: clipWanted.x, y: clipWanted.y, w: clipWanted.w, h: clipWanted.h })
+              writeFileSync(value.path, encodePng(region.image))
+              clipped = {
+                ...region.rect,
+                ...(region.clamped ? { clamped: true, requested: { x: clipWanted.x, y: clipWanted.y, w: clipWanted.w, h: clipWanted.h } } : {}),
+              }
+            } catch (error) {
+              return { ok: false, device, path: value.path, error: `裁剪失败:${error instanceof Error ? error.message : String(error)}` }
+            }
+          }
           if (!wanted) {
             // No baseline asked for: this shot is what a later call compares against.
-            lastShot.set(device, value.path)
+            if (!discard) {
+              lastShot.set(device, {
+                path: value.path,
+                ...(clipped ? { clip: { x: clipped.x, y: clipped.y, w: clipped.w, h: clipped.h } } : {}),
+              })
+            }
             // Absolute path for `read_image`, workspace-relative one for talking about it.
-            return { ok: true, path: value.path, ...(rel !== value.path ? { rel } : {}), device: value.device }
+            const image = read ? await attachmentRefForImage(ctx, value.path) : undefined
+            let gone = false
+            // deleting without having delivered the picture leaves the caller with nothing.
+            if (discard && image) {
+              try { unlinkSync(value.path); gone = true } catch { /* a leftover file is harmless */ }
+            }
+            return {
+              ok: true, ...(gone ? {} : { path: value.path }), ...(gone || rel === value.path ? {} : { rel }), device: value.device,
+              ...(clipped ? { clip: clipped } : {}),
+              ...(gone ? { discarded: true } : {}),
+              ...(image ? { image } : {}),
+              ...(read && !image ? { imageUnavailable: '附件服务不可用或该图超出部署限制,只回了路径' } : {}),
+              ...(a?.keep === false && read && !gone ? { keepFailed: '图已留在盘上(附件没能生成,删了就没图可看)。' } : {}),
+            }
           }
-          const baselinePath = wanted === 'last' ? lastShot.get(device) ?? '' : wanted
-          if (!baselinePath) return { ok: false, device, error: '还没有基线:先不带 baseline 调一次 screenshot,或直接传 PNG 路径。' }
-          if (!existsSync(baselinePath)) return { ok: false, device, error: `基线文件不存在:${baselinePath}` }
+          const previous = wanted === 'last' ? lastShot.get(device) : undefined
+          const baselinePath = wanted === 'last' ? previous?.path ?? '' : wanted
+          /**
+           * A refused comparison still has a real capture on disk, and it is the picture the caller
+           * most wants next ("your baseline is a crop — so show me the screen"). Naming it costs
+           * nothing and turns 2.4 MB of orphaned file into a usable path, exactly as the success
+           * path does; without it the file was left behind unmentioned (found in the 2026-09-19
+           * verification: an unreferenced capture). It is a `tool-*` file, so a
+           * refused comparison can no longer be the thing that slowly fills the directory.
+           */
+          const capture = { diffPath: value.path, ...(rel !== value.path ? { rel } : {}) }
+          if (!baselinePath) return { ok: false, device, error: '还没有基线:先不带 baseline 调一次 screenshot,或直接传 PNG 路径。', ...capture }
+          // A crop is not a whole-screen baseline: comparing the two gave `diffRatio: 1` (the size
+          // guard read "different dimensions" as "everything changed"), which looks like a real
+          // answer. Say what happened instead.
+          if (previous?.clip) {
+            const { x, y, w, h } = previous.clip
+            return {
+              ok: false, device,
+              error: `上一次截图是裁剪图(${x},${y},${w},${h}),不能当整屏基线;请先用不带 clip 的 screenshot 建立整屏基线,或直接传整屏 PNG 路径。`,
+              ...capture,
+            }
+          }
+          if (!existsSync(baselinePath)) return { ok: false, device, error: `基线文件不存在:${baselinePath}`, ...capture }
           const before = readFileSync(baselinePath)
           const after = readFileSync(value.path)
           // Unchanged screens are byte-identical, so the common case costs no decode at all.
@@ -1983,7 +2382,16 @@ function createToolDefs(api) {
             try { unlinkSync(value.path) } catch { /* ignore */ }
             return { ok: true, device, same: true, diffRatio: 0 }
           }
-          return { ok: true, device, same: false, diffRatio: verdict.diffRatio, changedPixels: verdict.changedPixels, diffPath: value.path, ...(rel !== value.path ? { rel } : {}) }
+          // It moved, so the new capture is worth looking at — the same `read` flag covers it.
+          const movedImage = read ? await attachmentRefForImage(ctx, value.path) : undefined
+          return {
+            ok: true, device, same: false, diffRatio: verdict.diffRatio, changedPixels: verdict.changedPixels,
+            // `diffRatio` without its denominator is hard to sanity-check; hand the total over too.
+            totalPixels: verdict.totalPixels,
+            diffPath: value.path, ...(rel !== value.path ? { rel } : {}),
+            ...(movedImage ? { image: movedImage } : {}),
+            ...(read && !movedImage ? { imageUnavailable: '附件服务不可用或该图超出部署限制,只回了路径' } : {}),
+          }
         }
         if (action === 'drag' || action === 'fling') {
           if (![a?.x, a?.y, a?.x2, a?.y2].every((n) => Number.isFinite(n))) return { ok: false, error: `${action} needs x, y, x2, y2` }
@@ -2003,6 +2411,9 @@ function createToolDefs(api) {
           // Replaces the sleep-then-poll loop: the poll interval is the tool's business now.
           const timeout = Number.isFinite(a?.timeoutMs) ? Math.max(0, Math.min(60000, a.timeoutMs)) : 5000
           const poll = Number.isFinite(a?.pollMs) ? Math.max(50, Math.min(2000, a.pollMs)) : 200
+          // `absent` waits for the match to be GONE — the only way to observe a drawer, dialog,
+          // keyboard or toast closing, which `waitForChange`/`waitForIdle` can only approximate.
+          const absent = a?.absent === true
           const started = Date.now()
           let last: LayoutLine[] = []
           for (;;) {
@@ -2014,15 +2425,30 @@ function createToolDefs(api) {
               textRegex: a?.textRegex,
               clickableOnly: a?.clickableOnly,
             })
-            if (hits.length > 0) return { ok: true, device, matched: hits, elapsedMs: Date.now() - started }
+            if (absent ? hits.length === 0 : hits.length > 0) {
+              // The dump that matched is already in memory, so the tree costs nothing and saves the
+              // round-trip this action exists to avoid: "wait for X, then tap it" was two calls
+              // because only the timeout branch answered with a tree (the ids in it are the ones
+              // `click {id}` resolves against, since `dumpLayout` just refreshed `lastLayout`).
+              const found = pageTitle(last)
+              return {
+                ok: true, device, elapsedMs: Date.now() - started,
+                ...(absent ? { absent: true, matched: [] } : { matched: hits }),
+                page: found || null,
+                tree: renderLayout(last.map((line, index) => ({ index, line }))),
+              }
+            }
             if (Date.now() - started + poll > timeout) break
             await new Promise((resolveWait) => setTimeout(resolveWait, poll))
           }
           // A timeout hands back the tree it last saw (and a picture of it), so a miss is diagnosable
-          // without another call.
+          // without another call. For `absent` the miss is the opposite one: the match is still there.
           const page = pageTitle(last)
-          const shot = await autoShot(api, device, shotRoot, action)
-          return { ok: false, device, matched: [], elapsedMs: Date.now() - started, ...(page ? { page } : {}), ...(shot ? { shot } : {}), tree: renderLayout(last.map((line, index) => ({ index, line }))) }
+          const shot = await shotFields(api, device, shotRoot, action, ctx, a?.read === true)
+          const late = absent
+            ? matchLayout(last, { text: typeof a?.text === 'string' ? a.text : '', textRegex: a?.textRegex, clickableOnly: a?.clickableOnly })
+            : []
+          return { ok: false, device, matched: late, elapsedMs: Date.now() - started, ...(absent ? { absent: true } : {}), page: page || null, ...shot, tree: renderLayout(last.map((line, index) => ({ index, line }))) }
         }
         if (action === 'waitForChange') {
           // The counterpart of waitForIdle: that one returns as soon as the layout is stable, which
@@ -2054,8 +2480,8 @@ function createToolDefs(api) {
             await new Promise((resolveWait) => setTimeout(resolveWait, poll))
           }
           const page = pageTitle(last)
-          const shot = await autoShot(api, device, shotRoot, action)
-          return { ok: false, device, polls, elapsedMs: Date.now() - started, ...(page ? { page } : {}), ...(shot ? { shot } : {}), tree: renderLayout(last.map((line, index) => ({ index, line }))) }
+          const shot = await shotFields(api, device, shotRoot, action, ctx, a?.read === true)
+          return { ok: false, device, polls, elapsedMs: Date.now() - started, page: page || null, ...shot, tree: renderLayout(last.map((line, index) => ({ index, line }))) }
         }
         if (action === 'waitForIdle') {
           const timeout = Number.isFinite(a?.timeoutMs) ? Math.max(0, Math.min(60000, a.timeoutMs)) : 5000
@@ -2074,13 +2500,43 @@ function createToolDefs(api) {
             const now = dump.lines.map((l) => l.raw).join('\n')
             stable = now !== '' && now === previous ? stable + 1 : 1
             previous = now
-            if (stable >= need) return { ok: true, device, polls, elapsedMs: Date.now() - started }
+            if (stable >= need) {
+              // Same reason as `waitFor`: the stable dump is already here, and the tree it renders
+              // is what the caller is about to act on — answering without it cost a `layout` round.
+              const settled = pageTitle(last)
+              return {
+                ok: true, device, polls, elapsedMs: Date.now() - started,
+                page: settled || null,
+                tree: renderLayout(last.map((line, index) => ({ index, line }))),
+              }
+            }
             if (Date.now() - started + poll > timeout) break
             await new Promise((resolveWait) => setTimeout(resolveWait, poll))
           }
           const idlePage = pageTitle(last)
-          const idleShot = await autoShot(api, device, shotRoot, action)
-          return { ok: false, device, polls, elapsedMs: Date.now() - started, ...(idlePage ? { page: idlePage } : {}), ...(idleShot ? { shot: idleShot } : {}), tree: renderLayout(last.map((line, index) => ({ index, line }))) }
+          const idleShot = await shotFields(api, device, shotRoot, action, ctx, a?.read === true)
+          return { ok: false, device, polls, elapsedMs: Date.now() - started, page: idlePage || null, ...idleShot, tree: renderLayout(last.map((line, index) => ({ index, line }))) }
+        }
+        if (action === 'observe') {
+          // "What is on screen right now" in one call: the tree the caller needs in order to decide,
+          // plus — with `read` — the picture that answers what the tree cannot (blank page, layout
+          // bug). Composing layout with screenshot keeps exactly one implementation of each, and the
+          // tree still arrives when the capture fails.
+          const seen = await perform({ ...a, action: 'layout' })
+          if (seen?.ok !== true) return seen
+          const extra: any = {}
+          // debugging an odd screen was `act → observe → hmos_log`; the log that always comes
+          // next can ride along, through the same implementation `hmos_log` uses.
+          if (a?.log && typeof a.log === 'object') {
+            const logs = await hmosLog.execute({ ...a.log, ...(device ? { device } : {}) }, exec)
+            extra.log = logs?.ok === true
+              ? { count: logs.count, lines: logs.lines }
+              : { error: logs?.error ?? '日志读取失败' }
+          }
+          if (a?.read !== true) return { ...seen, ...extra }
+          const shot = await perform({ ...a, action: 'screenshot' })
+          if (shot?.ok === true) return { ...seen, ...extra, ...shot, ok: true }
+          return { ...seen, ...extra, shotError: shot?.error ?? '截图失败' }
         }
         return { ok: false, error: `unknown action ${action}` }
       }
@@ -2100,6 +2556,7 @@ function createToolDefs(api) {
         module: { type: 'string', description: 'module (default: entry)' },
         buildOnly: { type: 'boolean', description: 'build only: no device, no install/launch' },
         skipBuild: { type: 'boolean', description: 'run --skip-build: install + launch existing artifacts' },
+        read: { type: 'boolean', description: 'attach the failure screenshot when the deploy fails, not just its path' },
       },
       required: ['projectPath'],
     },
@@ -2107,8 +2564,14 @@ function createToolDefs(api) {
     async execute(args, exec) {
       const cli = resolveDevecoCli()
       if (!cli) return { ok: false, error: 'devecocli not found; install @deveco/deveco-cli or set DSH_HMOS_DEVECO_CLI' }
-      const projectPath = typeof args?.projectPath === 'string' ? args.projectPath.trim() : ''
+      const projectPath = projectRootOf(args?.projectPath, exec)
       if (!projectPath) return { ok: false, error: 'projectPath is required' }
+      // Name the directory that was actually searched. Without this, a relative path that resolved
+      // somewhere else surfaced later as `模块"entry"不属于该工程(可选:无)` — an error about modules
+      // for what was really a missing `build-profile.json5`.
+      if (!existsSync(join(projectPath, PROJECT_MARK))) {
+        return { ok: false, error: `未找到 ${PROJECT_MARK}:已按 ${projectPath} 查找(传目录时请给工程根,相对路径按会话工作区解析)。` }
+      }
       const buildOnly = args?.buildOnly === true
       const skipBuild = args?.skipBuild === true
       const device = buildOnly
@@ -2117,10 +2580,18 @@ function createToolDefs(api) {
       if (!buildOnly && !device) return { ok: false, error: 'no running emulator; start one with emu {action:"start", name:"<instance>"}' }
       const modules = readModules(projectPath)
       const asked = typeof args?.module === 'string' ? args.module.trim() : ''
-      if (asked && !modules.includes(asked)) {
-        return { ok: false, error: `模块“${asked}”不属于该工程(可选:${modules.join('、') || '无'})` }
+      // The marker file is checked to exist above, so an empty list means the names could not be
+      // READ (an extreme JSON5 literal `stripJson5` does not cover). Rejecting an explicit
+      // module with "模块 X 不属于该工程(可选:无)" was a misleading answer to a readable request:
+      // pass it through to hvigor instead, and say the list was unreadable.
+      const modulesUnreadable = modules.length === 0
+      if (asked && !modulesUnreadable && !modules.includes(asked)) {
+        return { ok: false, error: `模块“${asked}”不属于该工程(可选:${modules.join('、')})` }
       }
       const chosen = asked || (modules.includes('entry') ? 'entry' : modules[0])
+      const unreadNote = modulesUnreadable
+        ? `未能从 build-profile.json5 读出模块名(stripJson5 只覆盖常见 JSON5 写法),本次${asked ? `按你指定的 module=“${asked}”` : '不传 --module'};要精确定位请显式传 module。`
+        : ''
       const started = Date.now()
       let output = ''
       let code: number | null = null
@@ -2128,7 +2599,7 @@ function createToolDefs(api) {
       let note = ''
       try {
         if (buildOnly || skipBuild) {
-          // The official stage switches, verified in `build --help` / `run --help`. There is no
+          // The official stage switches, as listed in `build --help` / `run --help`. There is no
           // "install without launching", so that combination is deliberately not offered.
           const argv = buildOnly
             ? [process.execPath, cli, 'build', ...(chosen ? ['--modules', chosen] : [])]
@@ -2167,12 +2638,14 @@ function createToolDefs(api) {
       const hap = chosen ? hapPathOf(projectPath, chosen) : null
       if (hap) result.hapPath = hap
       if (!ok && note) result.note = note
+      // A readable-looking project whose module list could not be parsed is worth saying out loud,
+      // on success too: the caller cannot otherwise tell why `--module` was or was not passed.
+      if (unreadNote) result.note = result.note ? `${result.note} ${unreadNote}` : unreadNote
       result.tail = tailText(output, ok ? 6 : 30)
       // A failed install/launch leaves the device showing whatever the app did — the one thing the
       // build log cannot tell. A build-only failure has nothing to look at.
       if (!ok && !buildOnly && device) {
-        const shot = await autoShot(api, device, sessionWorkspace(exec), `deploy-${deployPhase(output)}`)
-        if (shot) result.shot = shot
+        Object.assign(result, await shotFields(api, device, sessionWorkspace(exec), `deploy-${deployPhase(output)}`, ctx, args?.read === true))
       }
       return result
     },
@@ -2191,7 +2664,8 @@ function createToolDefs(api) {
         since: { type: 'string', description: 'only logs from this far back (30s, 5m)' },
         tail: { type: 'integer', description: 'latest N lines (50, max 500)' },
         raw: { type: 'boolean', description: 'also return the raw text tail' },
-        device: { type: 'string', description: 'serial (default: first running emulator)' },
+        read: { type: 'boolean', description: 'crash: attach the screenshot taken with the crash log, not just its path' },
+        device: { type: 'string', description: 'serial (default: first running)' },
       },
       required: [],
     },
@@ -2219,8 +2693,7 @@ function createToolDefs(api) {
       else if (args?.raw) result.rawTail = text.length > 8000 ? text.slice(-8000) : text
       // A crash log names the failure; the screenshot shows what the app was doing when it happened.
       if (args?.crash && lines.length > 0) {
-        const shot = await autoShot(api, device, sessionWorkspace(exec), 'crash')
-        if (shot) result.shot = shot
+        Object.assign(result, await shotFields(api, device, sessionWorkspace(exec), 'crash', ctx, args?.read === true))
       }
       return result
     },
@@ -2228,12 +2701,13 @@ function createToolDefs(api) {
 
   const hmosDocs = {
     name: 'hmos_docs',
-    description: 'Search/read the official HarmonyOS docs via devecocli docs (offline local set). search: compact id/title/snippet entries; read: one document, pageable.',
+    description: 'Search/read the official HarmonyOS docs via devecocli docs (offline local set). search: compact id/title/snippet; read: one document, pageable.',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['search', 'read'], description: 'search | read' },
+        action: { type: 'string', enum: ['search', 'read'] },
         keywords: { type: 'string', description: 'search: phrase, as-is' },
+        open: { type: 'integer', description: 'search: also read the first N hits in full (1-3), saving the follow-up read' },
         documentId: { type: 'string', description: 'read: id from a search result' },
         limit: { type: 'integer', description: 'search: max results (5, max 20); read: max chars (8000, max 20000)' },
         offset: { type: 'integer', description: 'read: start at this char (0); continue from nextOffset' },
@@ -2262,7 +2736,22 @@ function createToolDefs(api) {
           const content = (chunk.match(/Content:\s*([\s\S]*)/) || [])[1] || ''
           return { id, title: title.trim(), snippet: content.replace(/\s+/g, ' ').trim().slice(0, 140) }
         }).filter(Boolean)
-        return { ok: true, count: entries.length, entries }
+        // a doc lookup is almost always search-then-read, so `open` fetches the body of the
+        // first N hits in the same call — the ids and titles in the list are what makes that safe.
+        const open = Number.isFinite(args?.open) ? Math.max(0, Math.min(3, Math.floor(args.open))) : 0
+        if (open === 0 || entries.length === 0) return { ok: true, count: entries.length, entries }
+        const opened: any[] = []
+        for (const entry of entries.slice(0, open)) {
+          const read = await runCli([process.execPath, cli, 'docs', 'read', entry.id], { timeoutMs: 60000 })
+          if (read.code !== 0) { opened.push({ id: entry.id, error: tailText(read.output, 3) }); continue }
+          const slice = sliceText(read.output.trim(), 0, 8000)
+          opened.push({
+            id: entry.id, title: entry.title, total: slice.total,
+            ...(slice.nextOffset === null ? {} : { nextOffset: slice.nextOffset }),
+            text: slice.text,
+          })
+        }
+        return { ok: true, count: entries.length, entries, opened }
       }
       if (action === 'read') {
         const documentId = typeof args?.documentId === 'string' ? args.documentId.trim() : ''
@@ -2277,8 +2766,7 @@ function createToolDefs(api) {
           documentId,
           total: slice.total,
           offset: slice.offset,
-          // Say where to continue instead of dropping the tail silently: a doc read used to be
-          // truncated at 14 000 chars with no way to reach the rest.
+          // Say where to continue instead of dropping the tail silently.
           ...(slice.nextOffset === null ? {} : { nextOffset: slice.nextOffset }),
           text: slice.text,
         }
@@ -2289,7 +2777,7 @@ function createToolDefs(api) {
 
   const hmosLint = {
     name: 'hmos_lint',
-    description: 'Run the DevEco code check via devecocli check lint; every finding comes back structured and the summary counts come from the report. scope changed = uncommitted tracked files under the project, reported as checkedFiles (a non-git project escalates to a full check); all = whole project.',
+    description: 'Run the DevEco code check via devecocli check lint; findings come back structured. changed = uncommitted tracked files under the project, reported as checkedFiles (a non-git project escalates to a full check); new files come back as untrackedFiles (incremental cannot see them); all = whole project.',
     parameters: {
       type: 'object',
       properties: {
@@ -2299,16 +2787,25 @@ function createToolDefs(api) {
       required: ['projectPath'],
     },
     output: { schema: TOOL_OUT_SCHEMA, render: toolRender },
-    async execute(args) {
+    async execute(args, exec) {
       const cli = resolveDevecoCli()
       if (!cli) return { ok: false, error: 'devecocli not found; install @deveco/deveco-cli or set DSH_HMOS_DEVECO_CLI' }
-      const project = typeof args?.projectPath === 'string' ? resolve(args.projectPath) : ''
-      if (!project || !existsSync(project)) return { ok: false, error: '应用工程路径不存在' }
+      const project = projectRootOf(args?.projectPath, exec)
+      if (!project) return { ok: false, error: 'projectPath is required' }
+      if (!existsSync(project)) return { ok: false, error: `应用工程路径不存在:${project}` }
+      if (!existsSync(join(project, PROJECT_MARK))) {
+        return { ok: false, error: `未找到 ${PROJECT_MARK}:已按 ${project} 查找(传目录时请给工程根,相对路径按会话工作区解析)。` }
+      }
       let full = args?.scope === 'all'
       let escalated = false
       let checkedFiles: string[] | null = null
+      let untrackedFiles: string[] = []
       if (!full) {
-        const changed = await changedCodeFiles(project)
+        // One git call for both halves: the tracked set decides the scope, the untracked set is what
+        // `--incremental` cannot see and therefore has to be reported.
+        const status = await codeStatusFiles(project)
+        const changed = status === null ? null : status.changed
+        untrackedFiles = status === null ? [] : status.untracked
         // `--incremental` without a usable change set can inspect almost nothing and then report a
         // clean summary; a slow full run is the only honest answer (see lintScope).
         const scope = lintScope('changed', changed)
@@ -2318,7 +2815,7 @@ function createToolDefs(api) {
       }
       const argv = [process.execPath, cli, 'check', 'lint', project]
       if (!full) argv.push('--incremental')
-      // cwd = project: verified that codelinter prints File paths relative to the process cwd,
+      // cwd = project: codelinter prints File paths relative to the process cwd,
       // so this is what makes the returned paths project-relative instead of host-cwd-relative.
       const r = await runCli(argv, { cwd: project, timeoutMs: full ? 600000 : 300000 })
       const { findings, summary } = parseLintTable(r.output)
@@ -2335,10 +2832,18 @@ function createToolDefs(api) {
         projectPath: project,
         scope: full ? 'all' : 'changed',
         // What `changed` actually covered, so a caller can tell "checked and clean" from "never
-        // looked at it" — the thing that used to force a 58s full run to feel safe.
+        // looked at it".
         scopeBasis: full ? 'all' : 'git',
         ...(escalated ? { escalated: true, escalatedWhy: '非 git 工程或 git 不可用,已自动改为全量检查' } : {}),
         ...(checkedFiles ? { checkedFiles } : {}),
+        // New files are outside `--incremental` by construction; saying so is the difference between
+        // "clean" and "never looked at the file you just added".
+        ...(untrackedFiles.length > 0
+          ? {
+              untrackedFiles,
+              note: `${untrackedFiles.length} 个新建(未跟踪)文件不在 --incremental 覆盖范围内;要检查它们请用 scope:'all',或先 git add。`,
+            }
+          : {}),
         empty: outcome.empty,
         summary: summary
           ? { issues: summary.issues, errors: summary.errors, warnings: summary.warnings, suggestions: summary.suggestions, filesChecked: summary.files }
@@ -2360,7 +2865,7 @@ function createToolDefs(api) {
   return [emu, emuUi, hmosDeploy, hmosLog, hmosDocs, hmosLint]
 }
 
-export function apply(ctx: Ctx, config?: any) {
+export function apply(ctx: Ctx, _config?: any) {
   // Isolation: never throw from host apply; log only, so the DSH composition keeps loading.
   try {
     const api = createApi()
@@ -2416,6 +2921,10 @@ export function apply(ctx: Ctx, config?: any) {
                   return
                 }
               }
+              // `origin` is not a wire field. It tags a screenshot as one the plugin itself took, and
+              // only such a file is ever pruned — so a caller over HTTP must not be able to mint that
+              // tag. The panel's shots keep `hmos-shot-*` and stay untouched forever (2026-09-19 rule).
+              if (payload !== null && typeof payload === 'object') delete payload['origin']
               // Streaming methods own the response; errors depend on whether headers were sent.
               if (STREAMING_METHODS.has(method)) {
                 try {
@@ -2442,7 +2951,7 @@ export function apply(ctx: Ctx, config?: any) {
     }
     registerOnce()
     // Register model tools the same non-blocking way (no inject, to avoid aborting composition).
-    const defs = createToolDefs(api)
+    const defs = createToolDefs(api, ctx)
     let toolsRegistered = false
     let toolsTimer: ReturnType<typeof setTimeout> | null = null
     const registerTools = () => {

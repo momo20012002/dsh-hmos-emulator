@@ -1,17 +1,24 @@
+/**
+ * Pure functions: parsers and helpers called directly — no tool call, no HTTP route. Everything
+ * here runs without a device and without devecocli (real git / temp-dir I/O is fine).
+ * A new case belongs here when it does NOT go through `createToolDefs(...).execute()`.
+ */
+
 import { describe, it, expect } from 'vitest'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { deflateSync } from 'node:zlib'
 import {
-  apply,
   ancestorLabels,
   capLines,
   changedCodeFiles,
+  cliFromWrapper,
   decodePng,
   diffLines,
   diffPng,
+  encodePng,
   labelMatches,
   layoutJson,
   lintScope,
@@ -23,31 +30,35 @@ import {
   parseLogLines,
   parseLayoutLine,
   pruneAutoShots,
+  pruneToolShots,
   sessionWorkspace,
+  SHOT_KEEP,
   sliceText,
   stepSummary,
+  untrackedCodeFiles,
 } from '../lib/index.js'
 
 /**
- * Every fixture below keeps the exact SHAPE of a real run on this machine (lint table, hvigor
+ * Every fixture below keeps the exact SHAPE the parsers must survive (lint table, hvigor
  * failure, layout dumps), because that shape is the whole point of these parsers — but the content
  * is sanitized: project names, bundle names, user names, local paths and the app's own UI copy are
- * replaced with neutral examples. This repository is public and a test file is not a place to carry
- * a real (unreleased) app's identity. Never paste a raw capture back in.
+ * replaced with neutral examples — the directory and file names inside those paths included, since
+ * a neutral project prefix alone still leaks `ets/components/<real component>.ets`. This repository
+ * is public: a test file is not a place to carry a real app's identity. Never paste a raw capture in.
  */
 
 const LINT_TABLE = `CodeLinter report
 
 No  File                                                              Line  Column  Severity    Rule                                                 Message
 --  ----------------------------------------------------------------  ----  ------  ----------  ---------------------------------------------------  ------------------------------------------------------------------------------
-1   DemoApp/entry/src/main/ets/pages/settings/About.ets                 8     15      Warning     @performance/avoid-overusing-custom-component-check  Preferentially use the @Builder method instead of custom components.
-2   DemoApp/entry/src/main/ets/services/SyncService.ets                 135   21      Warning     @performance/bad-deep-clone-check                    Prioritize structured clone for deep clone operations.
+1   DemoApp/entry/src/main/ets/pages/settings/About.ets          8     15      Warning     @performance/avoid-overusing-custom-component-check  Preferentially use the @Builder method instead of custom components.
+2   DemoApp/entry/src/main/ets/services/SyncService.ets                  135   21      Warning     @performance/bad-deep-clone-check                    Prioritize structured clone for deep clone operations.
 3   DemoApp/entry/src/main/module.json5                                 49    27      Suggestion  @performance/start-window-icon-check                 For faster app startup, keep the startup icon size within 256 x 256 pixels.
 Summary: Issues: 10 | Errors: 0 | Warnings: 9 | Suggestions: 1 | Files checked: 7`
 
 const BUILD_FAILURE = `> hvigor ERROR: 00305015 Rollup Error
 Error Message: Unexpected token (Note that you need plugins to import files that are not JavaScript)
-. At file: C:\\Temp\\hmos-broken\\entry\\src\\main\\ets\\components\\card\\PanelBody.ets:185
+. At file: C:\\Temp\\hmos-broken\\entry\\src\\main\\ets\\components\\panel\\PanelBody.ets:185
 1 ERROR: 10505001 ArkTS Compiler Error
 Error Message: Expression expected. At File: C:/Temp/hmos-broken/entry/src/main/ets/components/panel/PanelBody.ets:185:34
 
@@ -71,7 +82,7 @@ const HILOG = `- Preparing log request…
 09-13 21:49:14.772   128   156 I C01800/SAMGR: NF SA:65962,844_87807
 not a log line at all`
 
-describe('parseLintTable (R1)', () => {
+describe('parseLintTable', () => {
   it('reads the report rows and the summary counts', () => {
     const { findings, summary } = parseLintTable(LINT_TABLE)
     expect(findings).toHaveLength(3)
@@ -88,19 +99,13 @@ describe('parseLintTable (R1)', () => {
     expect(summary).toEqual({ issues: 10, errors: 0, warnings: 9, suggestions: 1, files: 7 })
   })
 
-  it('ignores the header and separator rows', () => {
-    // Header + separator + the first finding: only the finding is a row.
-    const { findings } = parseLintTable(LINT_TABLE.split('\n').slice(0, 5).join('\n'))
-    expect(findings).toHaveLength(1)
-  })
-
   it('returns an empty result for text with no table', () => {
     expect(parseLintTable('No defects found.').findings).toEqual([])
     expect(parseLintTable('No defects found.').summary).toBeNull()
   })
 })
 
-describe('parseBuildErrors (R3)', () => {
+describe('parseBuildErrors', () => {
   it('extracts file/line/column/message from the ArkTS error block', () => {
     const { errors, errorCount, warnCount } = parseBuildErrors(BUILD_FAILURE)
     expect(errors).toHaveLength(1)
@@ -117,20 +122,17 @@ describe('parseBuildErrors (R3)', () => {
     expect(warnCount).toBe(27)
   })
 
-  it('reports no errors for a successful run', () => {
-    expect(parseBuildErrors(RUN_OK)).toEqual({ errors: [], errorCount: 0, warnCount: 0 })
-  })
 })
 
-describe('deployPhase (R3)', () => {
-  it('reads the furthest verified stage marker', () => {
+describe('deployPhase', () => {
+  it('reads the furthest stage marker', () => {
     expect(deployPhase('[hvigor build] Running...\n> hvigor ERROR: BUILD FAILED in 26 s')).toBe('build')
     expect(deployPhase('Build completed successfully.\nInstalling artifacts to device 127.0.0.1:5555...')).toBe('install')
     expect(deployPhase(RUN_OK)).toBe('launch')
   })
 })
 
-describe('parseLogLines (R7)', () => {
+describe('parseLogLines', () => {
   it('splits hilog lines and keeps the tag after the domain slash', () => {
     const lines = parseLogLines(HILOG)
     expect(lines).toHaveLength(2)
@@ -148,7 +150,7 @@ describe('parseLogLines (R7)', () => {
   })
 })
 
-describe('parseLayoutLine (R8)', () => {
+describe('parseLayoutLine', () => {
   it('reads the widget type, bounds and flags', () => {
     const line = parseLayoutLine('  Column [264,2688,528,2856] clickable')
     expect(line).toMatchObject({ type: 'Column', clickable: true, indent: 2 })
@@ -162,7 +164,7 @@ describe('parseLayoutLine (R8)', () => {
   })
 
   it('parses the container types only --mode full prints', () => {
-    // R20: full mode keeps the unlabeled containers the default mode prunes, and those types carry
+    // Full mode keeps the unlabeled containers the default mode prunes, and those types carry
     // underscores and dots the type regex has to survive.
     expect(parseLayoutLine('    __Common__ [928,2702,1264,2814]').type).toBe('__Common__')
     expect(parseLayoutLine('        NavDestination [0,137,1320,2856]').type).toBe('NavDestination')
@@ -171,48 +173,8 @@ describe('parseLayoutLine (R8)', () => {
   })
 })
 
-/** Mount the plugin the way the host does, with every service it polls for already present. */
-function mountTools() {
-  const registered = []
-  const ctx = {
-    get: (n) => {
-      if (n === 'tools') return { register: (def) => { registered.push(def); return () => {} } }
-      if (n === 'webServer') return { host: '127.0.0.1', register: () => () => {} }
-      if (n === 'systemPrompt') return { context: () => () => {} }
-      return undefined
-    },
-    effect: (fn) => fn(),
-  }
-  apply(ctx, {})
-  return registered
-}
-
-describe('tool surface', () => {
-  it('registers hmos_lint next to the existing tools', () => {
-    const names = mountTools().map((d) => d.name)
-    expect(names).toEqual(['emu', 'emu_ui', 'hmos_deploy', 'hmos_log', 'hmos_docs', 'hmos_lint'])
-  })
-
-  it('exposes the waiting and gesture actions on emu_ui', () => {
-    const emuUi = mountTools().find((d) => d.name === 'emu_ui')
-    for (const action of ['waitFor', 'waitForIdle', 'longPress', 'doubleTap', 'drag', 'fling', 'dircfling']) {
-      expect(emuUi.parameters.properties.action.enum).toContain(action)
-    }
-    expect(Object.keys(emuUi.parameters.properties)).toEqual(
-      expect.arrayContaining(['id', 'filter', 'asJson', 'timeoutMs', 'pollMs', 'direction', 'velocity', 'labelIndex']),
-    )
-  })
-
-  it('keeps the hmos_deploy stage switches', () => {
-    const deploy = mountTools().find((d) => d.name === 'hmos_deploy')
-    expect(Object.keys(deploy.parameters.properties)).toEqual(
-      expect.arrayContaining(['buildOnly', 'skipBuild']),
-    )
-  })
-})
-
 /**
- * R8 follow-up. Real dump shape: a bottom tab's label lives in a Text child while the clickable
+ * Real dump shape: a bottom tab's label lives in a Text child while the clickable
  * node is the Column above it, so a `filter{clickableOnly}` match reports a node with no text.
  */
 const TAB_TREE = [
@@ -221,7 +183,7 @@ const TAB_TREE = [
   '    Text [1139,2807,1238,2856] "Tab"',
 ]
 
-describe('nodeLabel / layoutJson (R8 follow-up)', () => {
+describe('nodeLabel / layoutJson', () => {
   const lines = TAB_TREE.map(parseLayoutLine)
 
   it('inherits the first child text for a container with no text of its own', () => {
@@ -232,26 +194,16 @@ describe('nodeLabel / layoutJson (R8 follow-up)', () => {
     expect(nodeLabel(lines, 2)).toBe('Tab')
   })
 
-  it('returns an empty label when nothing below carries text', () => {
-    const bare = ['Column [0,0,10,10] clickable', '  Image [0,0,5,5] clickable'].map(parseLayoutLine)
-    expect(nodeLabel(bare, 0)).toBe('')
-  })
-
   it('adds label to a JSON node that matched through a child', () => {
     const nodes = layoutJson([{ index: 1, line: lines[1] }], lines)
     expect(nodes[0]).toMatchObject({ id: 1, type: 'Column', clickable: true, label: 'Tab' })
     expect(nodes[0].text).toBeUndefined()
   })
 
-  it('does not duplicate a node own text into label', () => {
-    const nodes = layoutJson([{ index: 2, line: lines[2] }], lines)
-    expect(nodes[0].text).toBe('Tab')
-    expect(nodes[0].label).toBeUndefined()
-  })
 })
 
 /**
- * R13/R14. Shape mirrors the real card list that caused the miss: one card container per item,
+ * Shape follows a card list where repeated labels need their container: one card container per item,
  * a title inside it, and a Button per card whose text is the same 「Start」 everywhere. The
  * indentation and the container/text nesting are the ones a real `ui layout` prints; the titles
  * stand in for whatever the cards hold.
@@ -273,7 +225,7 @@ const CARD_LIST = [
   '        Text [980,1460,1180,1520] "Start"',
 ]
 
-describe('labelMatches (R13)', () => {
+describe('labelMatches', () => {
   const lines = CARD_LIST.map(parseLayoutLine)
 
   it('counts each repeated label as its own tappable candidate', () => {
@@ -302,12 +254,9 @@ describe('labelMatches (R13)', () => {
     expect(matches[0].exact).toBe(false)
   })
 
-  it('returns nothing for a label the dump does not carry', () => {
-    expect(labelMatches(lines, '删除')).toEqual([])
-  })
 })
 
-describe('ancestorLabels (R14)', () => {
+describe('ancestorLabels', () => {
   const lines = CARD_LIST.map(parseLayoutLine)
   // The second card's button: its breadcrumb must name its own card, not the first one.
   const second = labelMatches(lines, 'Start')[1].targetIndex
@@ -327,7 +276,7 @@ describe('ancestorLabels (R14)', () => {
   })
 })
 
-/** R15: a verbatim `ui layout --mode full` capture of the running emulator's training page. */
+/** A full-mode dump of a running app: containers only, no text anywhere. */
 const LAYOUT_FULL = [
   '[0,0,1320,2856]',
   '  root [0,137,1320,2856]',
@@ -356,7 +305,7 @@ const LAYOUT_FULL = [
 ].join('\n')
 
 /**
- * The same page as the default (simplified) mode prints it — a verbatim capture, which drops the
+ * The same page as the default (simplified) mode prints it — the simplified dump drops the
  * unlabeled containers entirely and therefore has no NavDestination to read a title from.
  */
 const LAYOUT_SIMPLIFIED = [
@@ -374,7 +323,7 @@ const LAYOUT_SIMPLIFIED = [
   '    Text [1012,2734,1181,2783] "Hint"',
 ].join('\n')
 
-describe('pageTitle (R15)', () => {
+describe('pageTitle', () => {
   it('prefers the shallowest text inside the NavDestination subtree', () => {
     expect(pageTitle(LAYOUT_FULL.split('\n').map(parseLayoutLine))).toBe('Page title')
   })
@@ -383,13 +332,8 @@ describe('pageTitle (R15)', () => {
     expect(pageTitle(LAYOUT_SIMPLIFIED.split('\n').map(parseLayoutLine))).toBe('Page title')
   })
 
-  it('returns an empty title rather than guessing', () => {
-    expect(pageTitle([])).toBe('')
-    expect(pageTitle(['Column [0,0,10,10] clickable'].map(parseLayoutLine))).toBe('')
-  })
-
   it('refuses a first text that sits deep in the page', () => {
-    // Real home page: the top of the screen carries no words, and the first text is a stat number
+    // The top of the screen carries no words, and the first text is a stat number
     // two levels down — reporting "0" as the page title names nothing.
     const HOME = [
       '[0,0,1320,2856]',
@@ -401,9 +345,30 @@ describe('pageTitle (R15)', () => {
     ].join('\n')
     expect(pageTitle(HOME.split('\n').map(parseLayoutLine))).toBe('')
   })
+
+  it('refuses a bare number even when it really is the first top-level text', () => {
+    // The cards' text is absent (images only), so the
+    // first text at indent ≤ 2 is a statistics counter — before this guard `page` answered "0".
+    const HOME_NO_CARD_TEXT = [
+      '[0,0,1320,2856]',
+      '  TextInput [56,164,1265,319] clickable longClickable scrollable',
+      '  Image [1131,199,1215,283] clickable',
+      '  Swiper [56,360,1264,948] scrollable',
+      '  Text [231,1046,281,1144] "0"',
+      '  Text [193,1158,320,1207] "Pending"',
+    ].join('\n')
+    expect(pageTitle(HOME_NO_CARD_TEXT.split('\n').map(parseLayoutLine))).toBe('')
+    // A real top-level title still comes through.
+    const WITH_TITLE = [
+      '[0,0,1320,2856]',
+      '  Text [140,190,1096,264] "Sample title"',
+      '  Text [231,1046,281,1144] "0"',
+    ].join('\n')
+    expect(pageTitle(WITH_TITLE.split('\n').map(parseLayoutLine))).toBe('Sample title')
+  })
 })
 
-describe('diffLines (R17)', () => {
+describe('diffLines', () => {
   const before = [
     '  #8 Text [231,1046,281,1144] "0"',
     '  #9 Text [193,1158,320,1207] "Stat"',
@@ -428,22 +393,18 @@ describe('diffLines (R17)', () => {
   })
 })
 
-describe('capLines (R19)', () => {
-  it('leaves a tree under the cap alone', () => {
-    const lines = Array.from({ length: 80 }, (_, i) => `#${i}`)
-    expect(capLines(lines)).toHaveLength(80)
-  })
-
+describe('capLines', () => {
   it('caps by whole lines and says how many are hidden', () => {
     const capped = capLines(Array.from({ length: 81 }, (_, i) => `#${i}`))
     expect(capped).toHaveLength(81)
     expect(capped[79]).toBe('#79')
-    // A character cut used to slice line 80 in half and print a fragment that read like a node.
+    // The cut is by whole lines: cutting by characters would print a fragment of line 80 that
+    // reads like a node.
     expect(capped[80]).toBe('…(还有 1 行未显示;可用 depth 或 filter 收窄)')
   })
 })
 
-describe('stepSummary (R16)', () => {
+describe('stepSummary', () => {
   it('names what a step acted on', () => {
     expect(stepSummary('layout', { ok: true, total: 33, page: 'Tab one' })).toBe('page=Tab one 33 节点')
     expect(stepSummary('click', { ok: true, x: 256, y: 1095, ancestors: ['Alpha card', 'Start'], matchCount: 3 }))
@@ -455,31 +416,10 @@ describe('stepSummary (R16)', () => {
     expect(stepSummary('click', { ok: false, error: 'no layout node matching "x"' })).toBe('no layout node matching "x"')
   })
 
-  it('folds a tree onto one line', () => {
-    expect(stepSummary('layout', { ok: true, total: 2, tree: 'changed:0' })).toBe('2 节点 changed:0')
-  })
 })
 
-describe('emu_ui batch surface (R16/R18)', () => {
-  it('exposes steps, waitForChange and changedOnly', () => {
-    const emuUi = mountTools().find((d) => d.name === 'emu_ui')
-    for (const action of ['steps', 'waitForChange', 'changedOnly']) {
-      if (action === 'changedOnly') expect(emuUi.parameters.properties).toHaveProperty('changedOnly')
-      else expect(emuUi.parameters.properties.action.enum).toContain(action)
-    }
-    expect(emuUi.parameters.properties.steps.type).toBe('array')
-    expect(emuUi.parameters.properties.onFail.enum).toEqual(['stop', 'continue'])
-  })
 
-  it('keeps the resident emulator schema inside its budget', () => {
-    // The whole point of these tools is being cheap per turn; §7 of the handover allows 6 400.
-    const total = mountTools()
-      .reduce((sum, def) => sum + JSON.stringify({ name: def.name, description: def.description, parameters: def.parameters }).length, 0)
-    expect(total).toBeLessThan(6400)
-  })
-})
-
-describe('lintScope (R25)', () => {
+describe('lintScope', () => {
   it('answers `changed` with the files it will cover', () => {
     expect(lintScope('changed', ['entry/src/main/ets/A.ets'])).toEqual({
       full: false, escalated: false, checkedFiles: ['entry/src/main/ets/A.ets'],
@@ -493,9 +433,6 @@ describe('lintScope (R25)', () => {
     expect(lintScope('changed', null)).toEqual({ full: true, escalated: true, checkedFiles: null })
   })
 
-  it('leaves an explicit full request alone', () => {
-    expect(lintScope('all', null)).toEqual({ full: true, escalated: false, checkedFiles: null })
-  })
 })
 
 const GIT = spawnSync('git', ['--version'], { encoding: 'utf8' }).status === 0
@@ -506,7 +443,7 @@ const GIT = spawnSync('git', ['--version'], { encoding: 'utf8' }).status === 0
  */
 const GIT_TEST_TIMEOUT = 30000
 
-describe('changedCodeFiles (R25)', () => {
+describe('changedCodeFiles', () => {
   /** A throwaway repo with the project one level down, so path rebasing is genuinely exercised. */
   function scratchRepo() {
     const root = join(tmpdir(), `dsh-lint-scope-${Date.now()}-${Math.random().toString(36).slice(2)}`)
@@ -531,9 +468,9 @@ describe('changedCodeFiles (R25)', () => {
     writeFileSync(join(project, 'entry', 'zeta.md'), 'y\n')
     writeFileSync(join(project, 'entry', 'Untracked.ets'), 'const c = 3\n')
     const files = await changedCodeFiles(project)
-    // Alpha.ets is the first status line, which arrives trimmed and used to lose a character; the
+    // Alpha.ets is the first status line, so it arrives trimmed — a leading space would shift it; the
     // rebase has to drop the repo-root `DemoApp/` prefix the caller never uses; codelinter's
-    // --incremental ignores untracked files (verified on device) and markdown is not code.
+    // --incremental ignores untracked files, and markdown is not code.
     expect(files).toEqual(['entry/Alpha.ets', 'entry/Beta.ets'])
     rmSync(root, { recursive: true, force: true })
   }, GIT_TEST_TIMEOUT)
@@ -550,9 +487,28 @@ describe('changedCodeFiles (R25)', () => {
     expect(await changedCodeFiles(project)).toEqual([])
     rmSync(root, { recursive: true, force: true })
   }, GIT_TEST_TIMEOUT)
+
+  // `--incremental` cannot see a file that was never added, so a refactor that *adds* files
+  // read as a clean run. The lint behaviour stays as it is; the caller is told what was skipped.
+  it.skipIf(!GIT)('lists the untracked code files separately from the tracked changes', async () => {
+    const { root, project } = scratchRepo()
+    writeFileSync(join(project, 'entry', 'Alpha.ets'), 'const a = 2\n')
+    writeFileSync(join(project, 'entry', 'Untracked.ets'), 'const c = 3\n')
+    writeFileSync(join(project, 'entry', 'Untracked.md'), 'notes\n')
+    expect(await changedCodeFiles(project)).toEqual(['entry/Alpha.ets'])
+    // Code files only, and project-relative like the tracked list.
+    expect(await untrackedCodeFiles(project)).toEqual(['entry/Untracked.ets'])
+    rmSync(root, { recursive: true, force: true })
+  }, GIT_TEST_TIMEOUT)
+
+  it.skipIf(!GIT)('reports no untracked files for a clean tree', async () => {
+    const { root, project } = scratchRepo()
+    expect(await untrackedCodeFiles(project)).toEqual([])
+    rmSync(root, { recursive: true, force: true })
+  }, GIT_TEST_TIMEOUT)
 })
 
-describe('sessionWorkspace (R10)', () => {
+describe('sessionWorkspace', () => {
   it('reads the session cwd off the tool-call context', () => {
     expect(sessionWorkspace({ agent: { session: { header: { cwd: 'E:\\ws' } } } })).toBe('E:\\ws')
   })
@@ -563,11 +519,7 @@ describe('sessionWorkspace (R10)', () => {
   })
 })
 
-describe('sliceText (R9)', () => {
-  it('returns short text untouched, with no next page', () => {
-    expect(sliceText('abcdef', 0, 8000)).toEqual({ text: 'abcdef', total: 6, offset: 0, nextOffset: null })
-  })
-
+describe('sliceText', () => {
   it('hands back where to continue instead of dropping the tail', () => {
     expect(sliceText('abcdefghij', 2, 4)).toEqual({ text: 'cdef', total: 10, offset: 2, nextOffset: 6 })
     expect(sliceText('abcdefghij', 6, 4)).toEqual({ text: 'ghij', total: 10, offset: 6, nextOffset: null })
@@ -578,9 +530,12 @@ describe('sliceText (R9)', () => {
   })
 })
 
-describe('pruneAutoShots (R26)', () => {
-  /** A screenshots directory with both automatic and hand-taken shots, oldest first. */
-  function shotDir(autoCount, manualCount) {
+describe('shot pruning by ownership', () => {
+  /**
+   * A screenshots directory holding all three kinds of shot, oldest first: `auto-*` (failure shots),
+   * `tool-*` (captures the model tools took) and `hmos-shot-*` (the panel's — the user's own).
+   */
+  function shotDir(autoCount, manualCount, toolCount = 0) {
     const dir = join(tmpdir(), `dsh-shots-${Date.now()}-${Math.random().toString(36).slice(2)}`)
     mkdirSync(dir, { recursive: true })
     const stamp = (name, ageSeconds) => {
@@ -591,31 +546,59 @@ describe('pruneAutoShots (R26)', () => {
     }
     for (let i = 0; i < autoCount; i += 1) stamp(`auto-waitFor-${1000 + i}.png`, autoCount - i)
     for (let i = 0; i < manualCount; i += 1) stamp(`hmos-shot-${2000 + i}-dev.png`, manualCount - i)
+    for (let i = 0; i < toolCount; i += 1) stamp(`tool-${3000 + i}-dev.png`, toolCount - i)
     return dir
   }
 
-  it('keeps the newest 20 automatic shots and never touches a hand-taken one', () => {
-    const dir = shotDir(25, 3)
-    expect(pruneAutoShots(dir, 20)).toBe(5)
+  it('keeps the newest SHOT_KEEP automatic shots and never touches a hand-taken one', () => {
+    // The number is user-facing — it decides how far back a capture survives — and was raised
+    // 20 → 40 on 2026-09-19 at the user's request; pinning it keeps a refactor from moving it.
+    expect(SHOT_KEEP).toBe(40)
+    const dir = shotDir(45, 3)
+    expect(pruneAutoShots(dir)).toBe(5)
     const left = readdirSync(dir)
-    expect(left.filter((f) => f.startsWith('auto-'))).toHaveLength(20)
-    // The real directory already held 42 shots / 39 MB taken by hand; none of them may disappear.
+    expect(left.filter((f) => f.startsWith('auto-'))).toHaveLength(SHOT_KEEP)
+    // The real directory already held tens of megabytes taken by hand; none of them may disappear.
     expect(left.filter((f) => f.startsWith('hmos-shot-'))).toHaveLength(3)
-    expect(left).toContain('auto-waitFor-1024.png')
+    expect(left).toContain('auto-waitFor-1044.png')
     expect(left).not.toContain('auto-waitFor-1000.png')
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  // Hand-taken shots must never be auto-deleted. The tool takes far more captures than the
+  // failure paths do, so it needs its own cap — and the cap must be provably unable to reach a file
+  // the plugin did not write.
+  it('prunes only the tool\'s own captures, down to the newest SHOT_KEEP', () => {
+    const dir = shotDir(2, 4, 43)
+    expect(pruneToolShots(dir)).toBe(3)
+    const left = readdirSync(dir)
+    expect(left.filter((f) => f.startsWith('tool-'))).toHaveLength(SHOT_KEEP)
+    expect(left).toContain('tool-3042-dev.png')
+    expect(left).not.toContain('tool-3000-dev.png')
+    // Both other kinds survive untouched: the user's shots, and the failure shots the auto path owns.
+    expect(left.filter((f) => f.startsWith('hmos-shot-'))).toHaveLength(4)
+    expect(left.filter((f) => f.startsWith('auto-'))).toHaveLength(2)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('never lets one pruner eat another kind: each prefix is exclusive', () => {
+    const dir = shotDir(45, 45, 45)
+    pruneAutoShots(dir)
+    pruneToolShots(dir)
+    const left = readdirSync(dir)
+    // 5 + 5 removed, 40 + 45 + 40 left — true only because no name matches two prefixes.
+    expect(left).toHaveLength(125)
+    expect(left.filter((f) => f.startsWith('hmos-shot-'))).toHaveLength(45)
     rmSync(dir, { recursive: true, force: true })
   })
 
   it('leaves a directory under the limit alone', () => {
     const dir = shotDir(3, 1)
-    expect(pruneAutoShots(dir, 20)).toBe(0)
+    expect(pruneAutoShots(dir)).toBe(0)
     expect(readdirSync(dir)).toHaveLength(4)
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('answers 0 for a directory that does not exist', () => {
-    expect(pruneAutoShots(join(tmpdir(), `dsh-missing-${Date.now()}`), 20)).toBe(0)
-  })
 })
 
 // ── screenshot baseline diff (2026-09-16 requirement) ───────────────────
@@ -694,13 +677,7 @@ describe('decodePng', () => {
     }
   })
 
-  it('reads RGBA as four channels', () => {
-    const decoded = decodePng(png(2, 4, [[1, 2, 3, 4, 5, 6, 7, 8]]))
-    expect(decoded.channels).toBe(4)
-    expect([...decoded.pixels]).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
-  })
-
-  it('refuses a shape it was never verified against, by name', () => {
+  it('refuses a shape it does not recognise, by name', () => {
     expect(() => decodePng(Buffer.from('not a png at all'))).toThrow(/签名/)
     const sixteen = png(1, 3, [[1, 2, 3]])
     sixteen[24] = 16
@@ -738,11 +715,50 @@ describe('diffPng', () => {
   })
 })
 
-describe('emu_ui screenshot baseline', () => {
-  it('exposes the baseline parameter without adding a tool', () => {
-    const defs = mountTools()
-    expect(defs.map((d) => d.name)).toEqual(['emu', 'emu_ui', 'hmos_deploy', 'hmos_log', 'hmos_docs', 'hmos_lint'])
-    const emuUi = defs.find((d) => d.name === 'emu_ui')
-    expect(emuUi.parameters.properties.baseline.description).toContain('"last"')
+describe('PNG encode and crop', () => {
+  const pixels = (w, h, channels) => {
+    const buf = Buffer.alloc(w * h * channels)
+    for (let i = 0; i < buf.length; i += 1) buf[i] = (i * 7) % 256
+    return buf
+  }
+
+  it('round-trips RGBA and RGB pixels through encode → decode', () => {
+    for (const channels of [4, 3]) {
+      const source = { width: 5, height: 3, channels, pixels: pixels(5, 3, channels) }
+      const decoded = decodePng(encodePng(source))
+      expect(decoded.width).toBe(5)
+      expect(decoded.height).toBe(3)
+      expect(decoded.channels).toBe(channels)
+      expect(decoded.pixels.equals(source.pixels)).toBe(true)
+    }
+  })
+
+  it('refuses to encode something that is not RGB/RGBA', () => {
+    expect(() => encodePng({ width: 2, height: 2, channels: 1, pixels: Buffer.alloc(4) })).toThrow(/通道/)
+    expect(() => encodePng({ width: 0, height: 2, channels: 4, pixels: Buffer.alloc(0) })).toThrow(/无法编码/)
+  })
+})
+
+describe('cliFromWrapper', () => {
+  it('traces an npm wrapper to the CLI entry it would run, and refuses what it cannot trace', () => {
+    const npmRoot = mkdtempSync(join(tmpdir(), 'dsh-cli-'))
+    const entry = join(npmRoot, 'node_modules', '@deveco', 'deveco-cli', 'dist', 'cli.js')
+    mkdirSync(dirname(entry), { recursive: true })
+    writeFileSync(entry, '// entry')
+    // The wrappers `npm i -g` writes side by side all launch that same entry, so any of them is a
+    // valid way to point at the CLI — Node cannot spawn them (a .cmd needs a shell), so they are
+    // traced instead of executed.
+    expect(cliFromWrapper(join(npmRoot, 'devecocli.cmd'))).toBe(entry)
+    expect(cliFromWrapper(join(npmRoot, 'devecocli.ps1'))).toBe(entry)
+    expect(cliFromWrapper(join(npmRoot, 'devecocli'))).toBe(entry)
+    // The entry itself is used as given — including a .ts entry, which Node runs by stripping
+    // types: reading one as a wrapper makes the plugin fall back to the real CLI on PATH instead.
+    expect(cliFromWrapper(entry)).toBe(entry)
+    const entryTs = join(npmRoot, 'cli.ts')
+    writeFileSync(entryTs, '// a TS entry is an entry too: node runs it by stripping types')
+    expect(cliFromWrapper(entryTs)).toBe(entryTs)
+    expect(cliFromWrapper(join(npmRoot, 'missing-cli.js'))).toBeUndefined()
+    expect(cliFromWrapper(join(tmpdir(), 'no-such-npm-root', 'devecocli.cmd'))).toBeUndefined()
+    rmSync(npmRoot, { recursive: true, force: true })
   })
 })

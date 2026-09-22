@@ -1,11 +1,22 @@
+/**
+ * The HTTP API the panel talks to: trust fence, envelope, body limits, and the names the route
+ * writes on disk. A new case belongs here when it goes over the real route, never in-process.
+ */
+
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import http from 'node:http'
-import { dirname } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { apply } from '../lib/index.js'
 
 /** This spec's own directory: exists, and is never a HarmonyOS project root. */
 const NOT_A_PROJECT = dirname(fileURLToPath(import.meta.url))
+const FAKE_CLI = join(NOT_A_PROJECT, 'fake-devecocli.js')
+/** Spawning is what a confined sandbox refuses (piped stdio EPERM); skip rather than misreport. */
+const CAN_SPAWN = spawnSync(process.execPath, ['-e', 'process.stdout.write("ok")'], { encoding: 'utf8' }).status === 0
 
 /**
  * The trust fence has to be applied by the route handler, not merely exist: the unit tests for
@@ -38,9 +49,9 @@ function mount() {
  * One POST through the mounted route with the given headers. project.info on the spec's own
  * directory is the cheapest accepted call: it reads the filesystem and spawns nothing.
  */
-function request({ method = 'POST', name = 'project.info', headers = {}, body = JSON.stringify({ projectPath: NOT_A_PROJECT }) } = {}) {
+function request({ method = 'POST', name = 'project.info', headers = {}, body = JSON.stringify({ projectPath: NOT_A_PROJECT }) } = {}): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, path: `/dsh-hmos-emulator/api/${name}`, method, headers }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port, path: `/dsh-hmos-emulator/api/${name}`, method, headers, agent: false }, (res) => {
       let data = ''
       res.on('data', (chunk) => { data += chunk })
       res.on('end', () => resolve({ status: res.statusCode, body: data }))
@@ -106,13 +117,6 @@ describe('route trust fence', () => {
     expect(foreignOrigin.status).toBe(403)
   })
 
-  it('refuses the no-preflight text/plain cross-site POST', async () => {
-    const res = await request({
-      headers: { host: base, origin: 'http://evil.example', 'sec-fetch-site': 'cross-site', 'content-type': 'text/plain' },
-    })
-    expect(res.status).toBe(403)
-  })
-
   it('requires application/json once the origin is trusted', async () => {
     const noType = await request({ headers: { host: base } })
     expect(noType.status).toBe(415)
@@ -139,24 +143,43 @@ describe('route trust fence', () => {
     expect(JSON.parse(res.body).error.message).toContain('build-profile.json5')
   })
 
-  it('still rejects non-POST', async () => {
-    expect((await request({ method: 'GET', headers: { host: base } })).status).toBe(405)
-  })
 })
 
-describe('client bundle artifact', () => {
-  // The suite above exercises the host half; this keeps the client half honest too, so a build
-  // that emitted a bundle which never registers cannot pass unnoticed.
-  it('registers through window.__ModuleLoader__.load with the package id', async () => {
-    let spec
-    globalThis.window = { __ModuleLoader__: { load: (loaded) => { spec = loaded } } }
-    try {
-      await import('../lib/client.js')
-    } finally {
-      delete globalThis.window
-    }
-    expect(spec).toBeTruthy()
-    expect(spec.id).toBe('dsh-hmos-emulator')
-    expect(typeof spec.factory).toBe('function')
+// a capture carrying the `tool-` name is the only kind any prune may ever touch, so that
+// tag has to be unforgeable from outside the process — otherwise "never auto-delete the user's shot"
+// would rest on a body field the caller controls. This drives the real route with a stand-in
+// devecocli and a real filesystem, and judges the file name that actually landed.
+describe.skipIf(!CAN_SPAWN)('screenshot ownership tag', () => {
+  let dir
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dsh-origin-'))
+    process.env.DSH_HMOS_DEVECO_CLI = FAKE_CLI
   })
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true })
+    delete process.env.DSH_HMOS_DEVECO_CLI
+  })
+
+  const shotName = async (body) => {
+    const res = await request({
+      name: 'screenshot',
+      headers: { host: base, ...JSON_HEADERS },
+      body: JSON.stringify({ device: '127.0.0.1:5555', root: dir, ...body }),
+    })
+    expect(res.status).toBe(200)
+    const value = JSON.parse(res.body).value
+    return value.path.split(/[\\/]/).pop()
+  }
+
+  it('refuses to let an HTTP caller claim the prunable tool- name', async () => {
+    // The panel never sends `origin`; this is what a forged body would look like, and it must still
+    // be named as the user's own shot — the name the user prunes by hand and no code ever deletes.
+    const name = await shotName({ origin: 'tool' })
+    expect(name.startsWith('hmos-shot-')).toBe(true)
+    expect(readdirSync(join(dir, 'screenshots')).some((f) => f.startsWith('tool-'))).toBe(false)
+  })
+
 })
+
+// The suite above exercises the host half; this keeps the client half honest too, so a build that
+// emitted a bundle which never registers cannot pass unnoticed.

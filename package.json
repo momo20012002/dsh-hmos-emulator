@@ -79,7 +79,7 @@
     }
   },
   "scripts": {
-    "build": "node scripts/build.mjs",
+    "build": "node scripts/build.mjs && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

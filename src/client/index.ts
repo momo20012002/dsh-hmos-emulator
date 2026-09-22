@@ -81,7 +81,8 @@
     const btnDanger = { ...btnBase, border: `1px solid ${s.danger}`, color: s.danger, background: 'transparent' }
     const btnDangerSolid = { ...btnBase, background: s.danger, color: '#fff' }
     const logLine = (kind) => ({
-      fontSize: 11, lineHeight: 1.55, whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: s.fg,
+      fontSize: 11, lineHeight: 1.55, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+      color: kind === 'err' ? s.danger : kind === 'ok' ? s.ok : kind === 'info' ? s.muted : s.fg,
     })
     const warnBox = { background: 'rgba(229,72,77,.12)', border: `1px solid ${s.danger}`, color: s.danger, borderRadius: 8, padding: 8, fontSize: 12, marginBottom: 10, lineHeight: 1.5 }
 
@@ -266,7 +267,7 @@
         mounted.current = true
         refresh()
       }, [])
-      // A check prints nothing until it is done (verified: codelinter buffers its whole run), so
+      // A check prints nothing until it is done (codelinter buffers its whole run), so
       // the panel runs its own clock to show the work is still going on.
       useEffect(() => {
         if (!busy.startsWith('lint-')) return undefined
@@ -284,7 +285,7 @@
       }, [project, scanRoot, instanceSel, moduleSel])
       // Fill the scan root from the session working directory as soon as it is known: it is an
       // optional field of the tab's scope, so on a fresh panel it can still be undefined while the
-      // panel is already rendered (the previous one-shot default inside refresh() never ran again).
+      // panel is already rendered.
       useEffect(() => {
         if (!scopeCwd || scanRootEdited.current) return
         setScanRoot((prev) => prev || scopeCwd)
@@ -327,8 +328,7 @@
       // Use the host-native directory picker. The button sits on the scan-root row, so the picked
       // directory goes there; the project row then follows the same rule as the scan button: the
       // directory itself when it is a project root, otherwise the first project found inside it.
-      // (Setting the project alone used to leave the row showing its placeholder, because the
-      // dropdown can only render a value it has an option for.)
+      // (The dropdown can only render a value it has an option for, so the option is set with it.)
       const pickNative = async () => {
         setBusy('browse')
         try {
@@ -890,7 +890,7 @@
           },
         }, logs.length === 0
           ? '(构建/部署信息将显示在这里)'
-          : logs.map((l, i) => h('div', { key: i, style: { ...logLine(l.kind), color: l.kind === 'err' ? s.danger : l.kind === 'ok' ? s.ok : l.kind === 'info' ? s.muted : s.fg } }, l.text))),
+          : logs.map((l, i) => h('div', { key: i, style: logLine(l.kind) }, l.text))),
       ))
 
       if (tcMsg) nodes.push(h('div', { key: 'tcerr', style: { color: s.danger, fontSize: 12, marginTop: 6 } }, tcMsg))
