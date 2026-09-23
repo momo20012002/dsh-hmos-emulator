@@ -290,6 +290,18 @@
         if (!scopeCwd || scanRootEdited.current) return
         setScanRoot((prev) => prev || scopeCwd)
       }, [scopeCwd])
+      // Opening the panel with the directory already known should not leave the project row on its
+      // "扫描后选择项目" placeholder until someone clicks 扫描 — the panel does that first scan
+      // itself. The signal is the empty option list, not an empty selection: a restored project has
+      // no option to render yet, so gating on the selection alone left the row on the placeholder
+      // and never scanned. Once per directory.
+      const autoScanRoot = useRef('')
+      useEffect(() => {
+        const root = scanRoot.trim()
+        if (!root || autoScanRoot.current === root || projectOptions.length > 0) return
+        autoScanRoot.current = root
+        runScan(true)
+      }, [scanRoot, projectOptions.length])
       // A check authorizes fixing only that same project, so switching project locks both again —
       // and the cached check result stops being deliverable, since it describes the old project.
       useEffect(() => {
@@ -358,25 +370,29 @@
       }
       // Scan a root for projects and fill the project dropdown. Shared by the scan and browse
       // buttons, so picking a directory that merely contains projects refreshes the project row.
-      const scanInto = async (root) => {
+      const scanInto = async (root, keepSelection = false) => {
         const value = await rpc('scan', { root })
-        setProjectOptions(value.projects || [])
-        if (value.projects && value.projects.length) {
-          // Selecting the project is enough: the project effect loads its entry modules.
-          setProject(value.projects[0])
-          pushLog('info', `扫描「${value.root}」发现 ${value.projects.length} 个项目,已默认选中第一个`)
+        const found = value.projects || []
+        setProjectOptions(found)
+        if (found.length) {
+          // A selection the scan still finds stays selected — otherwise every open would silently
+          // switch the project. A stale one is replaced by the first hit, which is the only value
+          // the dropdown can actually render.
+          const keep = keepSelection && project && found.includes(project) ? project : found[0]
+          setProject(keep)
+          pushLog('info', `扫描「${value.root}」发现 ${found.length} 个项目,已选中 ${keep}`)
         } else {
           setModules([]); setModuleSel('')
           pushLog('info', `“${value.root}”下(≤3 层)未发现鸿蒙项目`)
         }
-        return value.projects || []
+        return found
       }
-      const runScan = async () => {
+      const runScan = async (keepSelection = false) => {
         const root = scanRoot.trim()
         if (!root) { pushLog('err', '请先填写扫描目录'); return }
         setBusy('scan')
         try {
-          await scanInto(root)
+          await scanInto(root, keepSelection)
         } catch (error) {
           pushLog('err', `扫描失败:${error.message}`)
         } finally {
@@ -794,7 +810,7 @@
             options: projectOptions.map((p) => ({ value: p, label: p })),
             onChange: setProject,
           }),
-          h(Btn, { icon: IC.scan, secondary: true, disabled: busy !== '', onClick: runScan }, busy === 'scan' ? '扫描中' : '扫描')),
+          h(Btn, { icon: IC.scan, secondary: true, disabled: busy !== '', onClick: () => runScan() }, busy === 'scan' ? '扫描中' : '扫描')),
         modules.length > 1 ? h('div', { style: row, key: 'moduleRow' },
           h('span', { style: label }, '入口模块'),
           h(Dropdown, { value: moduleSel, placeholder: '选择入口模块', options: modules.map((m) => ({ value: m, label: m })), onChange: setModuleSel }),
