@@ -268,6 +268,85 @@ describe.skipIf(!CAN_SPAWN)('emu_ui per-step depth', () => {
   })
 })
 
+// A focused-window dump omits every other window: system pickers, permission dialogs and
+// UIExtension panels are not in it at all, so the window selection has to reach devecocli as-is.
+describe.skipIf(!CAN_SPAWN)('emu_ui window scope', () => {
+  const windowFlags = () => readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8')
+    .trim().split('\n').map((line) => JSON.parse(line))
+    .filter((a) => a[0] === 'ui' && a[1] === 'layout')
+    .map((a) => {
+      if (a.includes('--all-windows')) return ['--all-windows']
+      const at = a.indexOf('--window')
+      return at >= 0 ? ['--window', a[at + 1]] : []
+    })
+
+  it('passes --all-windows through, and --window when one id is asked for', async () => {
+    const emuUi = mountTools()
+    await emuUi.execute({ action: 'layout', allWindows: true }, exec)
+    await emuUi.execute({ action: 'layout', window: 31 }, exec)
+    expect(windowFlags()).toEqual([['--all-windows'], ['--window', '31']])
+  })
+
+  it('inherits the call window scope in a step, and lets a step override it', async () => {
+    const emuUi = mountTools()
+    await emuUi.execute({
+      action: 'steps', window: 31,
+      steps: [{ action: 'layout' }, { action: 'layout', window: 7 }, { action: 'layout', allWindows: true }],
+    }, exec)
+    expect(windowFlags()).toEqual([['--window', '31'], ['--window', '7'], ['--all-windows']])
+  })
+
+  it('pins the depth to 0 for allWindows, which answers with empty subtrees otherwise', async () => {
+    const emuUi = mountTools()
+    // Any positive depth returns the window roots alone, so `allWindows` + `depth:3` reads as
+    // "this screen has nothing on it" — the depth is dropped and the result says so.
+    const result = await emuUi.execute({ action: 'layout', depth: 3, allWindows: true }, exec)
+    const argv = readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line))
+      .filter((a) => a[0] === 'ui' && a[1] === 'layout').pop()
+    expect(argv[argv.indexOf('--depth') + 1]).toBe('0')
+    expect(result.note).toContain('allWindows')
+  })
+})
+
+// devecocli synthesizes a gesture from `--speed`, and reports success either way: `swipe`/`fling`
+// never forwarded the speed at all, while a drag without one moved nothing.
+describe.skipIf(!CAN_SPAWN)('emu_ui gesture speed', () => {
+  const speedOf = (cmd) => readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8')
+    .trim().split('\n').map((line) => JSON.parse(line))
+    .filter((a) => a[0] === 'ui' && a[1] === cmd)
+    .map((a) => {
+      const at = a.indexOf('--speed')
+      return at >= 0 ? a[at + 1] : null
+    })
+
+  it('forwards an explicit speed for swipe and fling', async () => {
+    const emuUi = mountTools()
+    await emuUi.execute({ action: 'swipe', x: 1, y: 2, x2: 3, y2: 4, velocity: 250 }, exec)
+    await emuUi.execute({ action: 'fling', x: 1, y: 2, x2: 3, y2: 4, velocity: 900 }, exec)
+    expect(speedOf('swipe')).toEqual(['250'])
+    expect(speedOf('fling')).toEqual(['900'])
+  })
+
+  it('gives a drag the speed it needs to move anything, and keeps an explicit one', async () => {
+    const emuUi = mountTools()
+    await emuUi.execute({ action: 'drag', x: 1, y: 2, x2: 3, y2: 4 }, exec)
+    await emuUi.execute({ action: 'drag', x: 1, y: 2, x2: 3, y2: 4, velocity: 120 }, exec)
+    expect(speedOf('drag')).toEqual(['400', '120'])
+  })
+
+  it('rounds fractional coordinates, which devecocli refuses outright', async () => {
+    const emuUi = mountTools()
+    // A node centre is (x1+x2)/2, so .5 coordinates are the norm rather than the exception.
+    const press = await emuUi.execute({ action: 'click', x: 10.4, y: 20.6 }, exec)
+    await emuUi.execute({ action: 'swipe', x: 1.4, y: 2.6, x2: 3.5, y2: 4.4 }, exec)
+    const argv = readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    expect(argv.find((a) => a[1] === 'click').slice(2, 4)).toEqual(['10', '21'])
+    expect(argv.find((a) => a[1] === 'swipe').slice(2, 6)).toEqual(['1', '3', '4', '4'])
+    expect([press.x, press.y]).toEqual([10, 21])
+  })
+})
+
 // `stoppedAt` was reported for every failing step, so a `continue` batch — which runs all of
 // them — answered `stoppedAt: 40` for a 41-step batch in which nothing was stopped. The field now
 // means what it says, and the mode that does not stop reports the failing indices instead.
@@ -554,8 +633,6 @@ describe.skipIf(!CAN_SPAWN)('emu_ui screenshot keep', () => {
 // failure paths do, so it needs a cap of its own — and that cap is only defensible because the file
 // name records who wrote it: `tool-*` is the tool's, `hmos-shot-*` is the panel's, i.e. the user's.
 describe.skipIf(!CAN_SPAWN)('emu_ui screenshot ownership', () => {
-  const shotDir = () => join(dir, 'screenshots')
-
   it('names its captures tool-*, and never the panel\'s hmos-shot-*', async () => {
     const emuUi = mountTools()
     const value = await emuUi.execute({ action: 'screenshot', root: dir }, exec)

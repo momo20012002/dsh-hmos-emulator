@@ -1986,9 +1986,12 @@ function createToolDefs(api, ctx = null) {
     },
   }
 
+  /** Speed (px/s) for a drag that did not ask for one: devecocli synthesizes the gesture from it. */
+  const DRAG_SPEED = 400
+
   const emuUi = {
     name: 'emu_ui',
-    description: 'Drive the emulator screen via devecocli ui. layout: tree lines (#id Type [x1,y1,x2,y2] "text" flags) + page title; click/longPress/doubleTap by label, id or x/y (results carry an ancestors breadcrumb, and matchCount/candidates when a label is ambiguous); waitFor/waitForChange/waitForIdle instead of sleeping; steps batches actions; drag/fling/dircfling/swipe/text/screenshot.',
+    description: 'Drive the emulator screen via devecocli ui. layout: tree lines (#id Type [x1,y1,x2,y2] "text" flags) + page title (window/allWindows reach system and UIExtension windows); click/longPress/doubleTap by label, id or x/y (results carry an ancestors breadcrumb, and matchCount/candidates when a label is ambiguous); waitFor/waitForChange/waitForIdle instead of sleeping; steps batches actions; drag/fling/dircfling/swipe/text/screenshot. Screenshots are static frames only; pinch/zoom (multi-finger) is unsupported.',
     parameters: {
       type: 'object',
       properties: {
@@ -2004,6 +2007,8 @@ function createToolDefs(api, ctx = null) {
         filter: { type: 'object', description: 'layout/thenLayout: node filter', properties: { type: { type: 'string' }, textRegex: { type: 'string' }, clickableOnly: { type: 'boolean' } } },
         full: { type: 'boolean', description: 'layout: include unlabeled/inert nodes (--mode full)' },
         asJson: { type: 'boolean', description: 'layout: flat JSON nodes (label: inherited text)' },
+        window: { type: 'integer', description: 'layout: window id from `devecocli ui window list`' },
+        allWindows: { type: 'boolean', description: 'layout: every window incl. system/UIExtension ones (--all-windows; for pickers, permission dialogs)' },
         textRegex: { type: 'string', description: 'waitFor: JS regex on node text' },
         clickableOnly: { type: 'boolean', description: 'waitFor: clickable only' },
         absent: { type: 'boolean', description: 'waitFor: succeed when the match is gone instead of present' },
@@ -2028,7 +2033,7 @@ function createToolDefs(api, ctx = null) {
         y: { type: 'integer', description: 'press/swipe/drag: start y' },
         x2: { type: 'integer', description: 'swipe/drag: end x' },
         y2: { type: 'integer', description: 'swipe/drag: end y' },
-        velocity: { type: 'integer', description: 'drag: px/s' },
+        velocity: { type: 'integer', description: 'drag/swipe/fling: px/s; drag defaults to 400 (a speedless drag can be a silent no-op)' },
         direction: { type: 'string', description: 'dircfling: left|right|up|down' },
         text: { type: 'string', description: 'text: string to type, or the waitFor match' },
         root: { type: 'string', description: 'screenshot: dir for the PNG (default: workspace)' },
@@ -2073,15 +2078,36 @@ function createToolDefs(api, ctx = null) {
       /** Where screenshots go: the session workspace, so the path it hands back can be read again. */
       const shotRoot = sessionWorkspace(exec)
 
+      /** devecocli takes integer screen coordinates; a node centre lands on .5, so round on the way out. */
+      const px = (n: number) => String(Math.round(Number(n)))
+
+      /**
+       * A step's own window selection wins, otherwise the call's — the same rule `depth` follows.
+       * Returned as a scope object because the caller also needs it to report the depth override
+       * `allWindows` forces.
+       */
+      const windowScope = (step?: Record<string, unknown>) => ({
+        win: Number.isFinite(step?.window) ? Number(step?.window) : (Number.isFinite(args?.window) ? Number(args.window) : undefined),
+        every: typeof step?.allWindows === 'boolean' ? step.allWindows : args?.allWindows === true,
+      })
+
       /**
        * Dump the tree and remember it. A dump taken right after a navigation can come back with
        * only the progress line, so retry briefly before believing it. `full` switches devecocli to `--mode full`, the only mode that keeps
        * unlabeled and inert containers (much longer than the default mode for the same screen) — the
        * default prunes the very node that can be swallowing a tap.
        */
-      const dumpLayout = async (full = false, atDepth = depth): Promise<{ ok: boolean; lines: LayoutLine[]; error?: string }> => {
-        const argv = ['ui', 'layout', '--device', device, '--depth', String(atDepth)]
+      const dumpLayout = async (full = false, atDepth = depth, step?: Record<string, unknown>): Promise<{ ok: boolean; lines: LayoutLine[]; error?: string }> => {
+        const { win, every } = windowScope(step)
+        // Any positive depth answers with the window roots alone, whose subtrees are empty — which
+        // reads as "this screen has nothing on it". All windows means the content, so depth is 0.
+        const at = every ? 0 : atDepth
+        const argv = ['ui', 'layout', '--device', device, '--depth', String(at)]
         if (full) argv.push('--mode', 'full')
+        // Other windows (system pickers, permission dialogs, UIExtension panels) are simply absent
+        // from a focused-window dump; `--all-windows` is the only way to see them at all.
+        if (every) argv.push('--all-windows')
+        else if (win !== undefined) argv.push('--window', String(Math.floor(win)))
         for (let attempt = 0; attempt < 3; attempt += 1) {
           const r = await run(argv, 30000)
           if (r.code !== 0) return { ok: false, lines: [], error: tailText(r.output, 6) }
@@ -2159,7 +2185,7 @@ function createToolDefs(api, ctx = null) {
         }
         if (action === 'layout') {
           const at = depthOf(a)
-          const dump = await dumpLayout(a?.full === true, at)
+          const dump = await dumpLayout(a?.full === true, at, a)
           if (!dump.ok) return { ok: false, device, error: dump.error }
           const rows = selectLayoutLines(dump.lines, a?.filter)
           const page = pageTitle(dump.lines)
@@ -2168,9 +2194,12 @@ function createToolDefs(api, ctx = null) {
           // page. A caller that asked for a shallow full dump gets containers only and could read
           // that as "the page is empty"; say what happened instead of guessing a corrected depth.
           const textless = at > 0 && !dump.lines.some((line) => line.text)
-          const note = textless
-            ? `这次 dump 只有容器、没有任何文字:depth=${at} 只到第 ${at} 层${a?.full === true ? '(full 模式还会多出 window/root 两层)' : ''};要看内容请用 depth:0 或不传 depth。`
-            : undefined
+          const overrode = windowScope(a).every && at > 0
+          const note = overrode
+            ? `allWindows 已按 depth:0 执行:depth=${at} 时 devecocli 只回窗口根、子树全空(容易被读成"这屏什么都没有");看到的这棵树是全部窗口的完整内容。`
+            : textless
+              ? `这次 dump 只有容器、没有任何文字:depth=${at} 只到第 ${at} 层${a?.full === true ? '(full 模式还会多出 window/root 两层)' : ''};要看内容请用 depth:0 或不传 depth。`
+              : undefined
           return a?.asJson
             ? { ok: true, device, total: dump.lines.length, page: page || null, ...(note ? { note } : {}), nodes: layoutJson(rows, dump.lines) }
             : { ok: true, device, total: dump.lines.length, page: page || null, ...(note ? { note } : {}), tree: renderFor(rows, a?.changedOnly === true) }
@@ -2225,9 +2254,9 @@ function createToolDefs(api, ctx = null) {
             page = pageTitle(dump.lines)
             inexact = !match.exact
           } else return { ok: false, error: `${action} needs id, label or x/y` }
-          const r = await run(['ui', verb, String(point.x), String(point.y), '--device', device], 20000)
+          const r = await run(['ui', verb, px(point.x), px(point.y), '--device', device], 20000)
           if (r.code !== 0) return { ok: false, device, error: tailText(r.output, 4) }
-          const result: any = { ok: true, device, x: point.x, y: point.y }
+          const result: any = { ok: true, device, x: Math.round(point.x), y: Math.round(point.y) }
           if (usedId !== null) result.id = usedId
           // `page` is always present, `null` when the tree carries no title — "no title" and
           // "the field is missing" looked the same to a caller, and only one of them is a signal.
@@ -2279,7 +2308,11 @@ function createToolDefs(api, ctx = null) {
         }
         if (action === 'swipe') {
           if (![a?.x, a?.y, a?.x2, a?.y2].every((n) => Number.isFinite(n))) return { ok: false, error: 'swipe needs x, y, x2, y2' }
-          const r = await run(['ui', 'swipe', String(a.x), String(a.y), String(a.x2), String(a.y2), '--device', device], 20000)
+          const argv = ['ui', 'swipe', px(a.x), px(a.y), px(a.x2), px(a.y2), '--device', device]
+          // devecocli's swipe takes a speed like drag/fling does; without it a slow, threshold-y
+          // swipe cannot be reproduced at all.
+          if (Number.isFinite(a?.velocity)) argv.push('--speed', String(Math.max(1, Math.floor(a.velocity))))
+          const r = await run(argv, 20000)
           return { ok: r.code === 0, device, error: r.code === 0 ? '' : tailText(r.output, 4) }
         }
         if (action === 'screenshot') {
@@ -2395,8 +2428,11 @@ function createToolDefs(api, ctx = null) {
         }
         if (action === 'drag' || action === 'fling') {
           if (![a?.x, a?.y, a?.x2, a?.y2].every((n) => Number.isFinite(n))) return { ok: false, error: `${action} needs x, y, x2, y2` }
-          const argv = ['ui', action, String(a.x), String(a.y), String(a.x2), String(a.y2), '--device', device]
-          if (action === 'drag' && Number.isFinite(a?.velocity)) argv.push('--speed', String(Math.max(1, Math.floor(a.velocity))))
+          const argv = ['ui', action, px(a.x), px(a.y), px(a.x2), px(a.y2), '--device', device]
+          // devecocli synthesizes the gesture from the speed: a speedless drag moves nothing and
+          // still reports success, so a drag that did not ask for one gets a working default.
+          const speed = Number.isFinite(a?.velocity) ? Math.max(1, Math.floor(a.velocity)) : (action === 'drag' ? DRAG_SPEED : null)
+          if (speed !== null) argv.push('--speed', String(speed))
           const r = await run(argv, 20000)
           return { ok: r.code === 0, device, error: r.code === 0 ? '' : tailText(r.output, 4) }
         }
