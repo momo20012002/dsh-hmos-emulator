@@ -45,11 +45,11 @@ describe('emu_ui batch surface', () => {
     // The resident schema (every tool name, description and parameter list) is spent on every
     // request, so it has a budget test. The bound is not a goal: a necessary capability may raise
     // it, but the same commit must say what the extra text buys, and wording that gets shorter
-    // keeps the bound honest. Raised 8 000 → 8 450 for the layout window scope (`window` /
+    // keeps the bound honest. The bound covers the layout window scope (`window` /
     // `allWindows`: a focused-window dump leaves out system pickers and UIExtension panels
-    // entirely, which cost about eight wasted rounds in one session), the gesture-speed fixes
+    // entirely), the gesture-speed fixes
     // (`swipe`/`fling` never forwarded it, a speedless drag moved nothing) and the two capability
-    // notes; measured 8 393 after two descriptions were shortened in the same change.
+    // notes; measured 8 393.
     const total = mountTools()
       .reduce((sum, def) => sum + JSON.stringify({ name: def.name, description: def.description, parameters: def.parameters }).length, 0)
     expect(total).toBeLessThan(8450)

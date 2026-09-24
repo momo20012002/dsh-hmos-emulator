@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import http from 'node:http'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -179,6 +179,46 @@ describe.skipIf(!CAN_SPAWN)('screenshot ownership tag', () => {
     expect(readdirSync(join(dir, 'screenshots')).some((f) => f.startsWith('tool-'))).toBe(false)
   })
 
+})
+
+// The panel asks for the toolchain report on every open, and producing it costs a devecocli spawn
+// (~0.6 s, mostly Node startup) — the biggest single part of its first-paint wait. So the host
+// caches it, while the panel's 刷新 button and the install/update path must still be able to force
+// a fresh probe. The spawn count is the observable: the stand-in CLI logs every argv it is given.
+describe.skipIf(!CAN_SPAWN)('toolchain report cache', () => {
+  let dir
+  let log
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dsh-toolchain-'))
+    log = join(dir, 'argv.log')
+    process.env.DSH_HMOS_DEVECO_CLI = FAKE_CLI
+    process.env.DSH_FAKE_ARGV_LOG = log
+  })
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true })
+    delete process.env.DSH_HMOS_DEVECO_CLI
+    delete process.env.DSH_FAKE_ARGV_LOG
+  })
+
+  const probes = () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((line) => line.includes('--version')).length : 0)
+  const toolchain = async (body) => {
+    const res = await request({ name: 'toolchain', headers: { host: base, ...JSON_HEADERS }, body: JSON.stringify(body) })
+    expect(res.status).toBe(200)
+    return JSON.parse(res.body).value
+  }
+
+  it('probes once, then serves the cache until refresh is asked for', async () => {
+    const first = await toolchain({ refresh: true })
+    const afterProbe = probes()
+    expect(afterProbe).toBeGreaterThan(0)
+    expect(first.devecoCliJs).toBe(FAKE_CLI)
+    // Two more reads ride the cache: the panel opens often, the answer barely changes.
+    expect((await toolchain({})).devecoCliJs).toBe(FAKE_CLI)
+    expect((await toolchain({})).devecoCliJs).toBe(FAKE_CLI)
+    expect(probes()).toBe(afterProbe)
+    await toolchain({ refresh: true })
+    expect(probes()).toBe(afterProbe + 1)
+  })
 })
 
 // The suite above exercises the host half; this keeps the client half honest too, so a build that

@@ -160,13 +160,17 @@
       const LS_PREFIX = 'dsh-hmos-emulator:'
       const lsGet = (k) => { try { return localStorage.getItem(LS_PREFIX + k) || '' } catch { return '' } }
       const lsSet = (k, v) => { try { localStorage.setItem(LS_PREFIX + k, v) } catch { /* ignore */ } }
+      // The last toolchain / instance / device answers are cached too, so the panel paints them
+      // immediately and only refreshes them in the background — each probe costs a devecocli spawn.
+      const lsGetJson = (k) => { try { const raw = lsGet(k); return raw ? JSON.parse(raw) : undefined } catch { return undefined } }
+      const lsSetJson = (k, v) => { try { localStorage.setItem(LS_PREFIX + k, JSON.stringify(v)) } catch { /* ignore */ } }
       // localStorage is shared by every session of this origin, but a scan root and a project
       // belong to one workspace: keyed per session, so opening another session does not restore
       // the previous workspace's selection instead of its own.
       const lsSessionKey = (k) => ((scope && scope.sessionId) ? `${k}:${scope.sessionId}` : k)
       // An entry module name only means something inside the project it came from.
       const lsModuleKey = (p) => (p ? `module:${p}` : 'module')
-      const [tc, setTc] = useState(null)
+      const [tc, setTc] = useState(() => lsGetJson('toolchain') || null)
       const [tcMsg, setTcMsg] = useState('')
       const [project, setProject] = useState(() => lsGet(lsSessionKey('project')))
       // Default the scan root to the session working directory. scope.cwd is optional and arrives
@@ -178,9 +182,9 @@
       const [projectOptions, setProjectOptions] = useState([])
       const [modules, setModules] = useState([])
       const [moduleSel, setModuleSel] = useState(() => lsGet(lsModuleKey(project)))
-      const [emuRaw, setEmuRaw] = useState('')
+      const [emuRaw, setEmuRaw] = useState(() => { const cached = lsGetJson('emuRaw'); return typeof cached === 'string' ? cached : '' })
       const [emuTarget, setEmuTarget] = useState('')
-      const [instances, setInstances] = useState([])
+      const [instances, setInstances] = useState(() => lsGetJson('instances') || [])
       const [instanceSel, setInstanceSel] = useState(() => lsGet('instance'))
       const [shot, setShotState] = useState(lastShot)
       const [copied, setCopied] = useState(false)
@@ -209,7 +213,7 @@
           setManualOs((v) => v || selInst.osVersion || '')
         }
       }
-      const [devices, setDevices] = useState([])
+      const [devices, setDevices] = useState(() => lsGetJson('devices') || [])
       const [device, setDevice] = useState('')
       // Deploy target: an explicit pick (auto/manual/device dropdown) wins, else the instance serial.
       const targetDevice = device || (selInst && selInst.serial) || ''
@@ -231,31 +235,53 @@
         if (box) box.scrollTop = box.scrollHeight
       }, [logs])
 
-      const refresh = async () => {
+      /**
+       * The three start-up reads each apply their own result the moment it lands, so the panel paints
+       * as answers arrive. Awaiting all three together keeps it blank until the slowest returns, and
+       * every devecocli spawn costs ~0.6 s (mostly Node startup, more when three run at once).
+       * `force` re-probes the toolchain (the cache in the host is what makes this cheap).
+       */
+      const refresh = async (force = false) => {
         if (busy === 'refresh') return
         setBusy('refresh')
+        const toolchain = rpc('toolchain', force ? { refresh: true } : undefined)
+          .then((value) => {
+            setTc(value)
+            setTcMsg('')
+            lsSetJson('toolchain', value)
+            pushLog('info', '已刷新:工具链就绪' + (value.devecoCliJs ? '' : '(devecocli 未找到)'))
+          })
+          .catch((error) => {
+            setTcMsg(error.message)
+            pushLog('err', `工具链查询失败:${error.message}`)
+          })
+        const emuRead = rpc('emu.list')
+          .then((emu) => {
+            setEmuRaw(emu.raw || '(空)')
+            lsSetJson('emuRaw', emu.raw || '(空)')
+            const list = emu.instances || []
+            lsSetJson('instances', list)
+            setInstances(list)
+            // The selection is resolved from the list just fetched, not from `instances`, which
+            // still holds this render's value: looking the instance up there misses its serial and
+            // silently falls back to the first device whenever more than one is online.
+            setInstanceSel((prev) => prev || list[0]?.name || '')
+            return list
+          })
+          .catch((error) => { setEmuRaw(`获取失败:${error.message}`); return [] })
+        const deviceRead = rpc('devices')
+          .then((dev) => {
+            const list = dev.devices || []
+            lsSetJson('devices', list)
+            setDevices(list)
+            return list
+          })
+          .catch(() => [])
         try {
-          const [toolchain, emu, dev] = await Promise.all([
-            rpc('toolchain'), rpc('emu.list').catch((e) => ({ raw: `获取失败:${e.message}` })), rpc('devices'),
-          ])
-          setTc(toolchain)
-          setTcMsg('')
-          setEmuRaw(emu.raw || '(空)')
-          // Resolve the target from the list just fetched: the state variables still hold this
-          // render's values here, so looking the instance up in `instances` misses its serial and
-          // silently falls back to the first device whenever more than one is online.
-          const list = emu.instances || []
+          const [list, devList] = await Promise.all([emuRead, deviceRead])
           const selName = instanceSel || list[0]?.name || ''
-          setInstances(list)
-          setInstanceSel((prev) => prev || selName)
-          setDevices(dev.devices || [])
-          if (dev.devices && dev.devices.length) {
-            setDevice(pickDevice(dev.devices, list.find((it) => it.name === selName)?.serial))
-          }
-          pushLog('info', '已刷新:工具链就绪' + (toolchain.devecoCliJs ? '' : '(devecocli 未找到)'))
-        } catch (error) {
-          pushLog('err', `刷新失败:${error.message}`)
-          setTcMsg(error.message)
+          if (devList.length) setDevice(pickDevice(devList, list.find((it) => it.name === selName)?.serial))
+          await toolchain
         } finally {
           setBusy('')
         }
@@ -644,7 +670,7 @@
           const v = await rpc('deveco.install')
           pushLog(v.code === 0 ? 'ok' : 'err', `${v.note}\n${v.output}`)
           if (v.code === 0) {
-            const t = await rpc('toolchain')
+            const t = await rpc('toolchain', { refresh: true })
             setTc(t)
             pushLog('ok', '已重新检测工具链')
           }
@@ -713,7 +739,7 @@
           const v = await rpc('deveco.update')
           pushLog(v.code === 0 ? 'ok' : 'err', `${v.note}\n${v.output}`)
           if (v.code === 0) {
-            const t = await rpc('toolchain')
+            const t = await rpc('toolchain', { refresh: true })
             setTc(t)
             pushLog('ok', '已重新检测工具链')
           }
@@ -732,7 +758,7 @@
         h('div', { style: { flex: 1 } },
           h('div', { style: { fontSize: 14, fontWeight: 600 } }, '鸿蒙模拟器'),
           h('div', { style: { fontSize: 11, color: s.muted } }, 'DevEco 部署控制台')),
-        h(Btn, { icon: IC.refresh, ghost: true, disabled: busy === 'refresh', onClick: refresh, title: '刷新' }, '刷新'),
+        h(Btn, { icon: IC.refresh, ghost: true, disabled: busy === 'refresh', onClick: () => refresh(true), title: '刷新' }, '刷新'),
       ))
 
       // devecocli version row (one-click update; keeps CLI and IDE toolchains in sync)

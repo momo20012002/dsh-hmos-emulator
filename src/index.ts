@@ -452,7 +452,19 @@ let lintDeliveries = 0
 function createApi() {
   const api: Record<string, (payload?: any, res?: any) => Promise<any>> = {}
 
-  api.toolchain = async () => {
+  /**
+   * The report below is session-stable (paths, versions) but costs a devecocli spawn — ~0.6 s on
+   * Windows, mostly Node startup — and the panel asks for it on every open, so it is the single
+   * biggest part of the wait before the panel's first paint. `refresh: true` bypasses the cache
+   * (the panel's own 刷新 button, and the install/update path where the version really did change).
+   */
+  const TOOLCHAIN_TTL_MS = 5 * 60 * 1000
+  let toolchainCache: { at: number; value: any } | null = null
+
+  api.toolchain = async (payload?: any) => {
+    if (payload?.refresh !== true && toolchainCache !== null && Date.now() - toolchainCache.at < TOOLCHAIN_TTL_MS) {
+      return toolchainCache.value
+    }
     // SDK root comes from the environment only: this value is reported to the panel, and hdc is
     // resolved from the same variable, so a row-config override could only report a path that
     // discovery does not actually use.
@@ -468,7 +480,7 @@ function createApi() {
     const sdkExample = process.platform === 'win32'
       ? '如 C:\\Program Files\\Huawei\\DevEco Studio\\sdk'
       : '指向本机安装的 DevEco Studio SDK 目录(以实际安装为准)'
-    return {
+    const report = {
       platform: process.platform,
       home: homedir(),
       node: process.execPath,
@@ -484,6 +496,8 @@ function createApi() {
           ? 'Linux 模拟器来自 Command Line Tools(需 26.0.0 Release 及以上):把 DEVECO_CLI_CLT_PATH 指向其安装目录。'
           : ''),
     }
+    toolchainCache = { at: Date.now(), value: report }
+    return report
   }
 
   api['deveco.update'] = async () => {
