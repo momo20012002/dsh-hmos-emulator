@@ -133,7 +133,7 @@ describe('parseBuildErrors', () => {
     // never reach the log — the message has to say that itself. Both wordings are the same trap.
     const masked = '\u001b[31m10906403 ArkTS Compiler Error\nError Message: Page \'C:/proj/entry/src/main/ets/pages/Gone.ets\' does not exist. \u001b[39m'
     expect(pageMissingHint(stripAnsi(masked))).toContain('页面开始编译之前')
-    expect(pageMissingHint("The buildFunction of page 'Gone' does not exist.")).toContain('页面开始编译之前')
+    expect(pageMissingHint("The buildFunction 'Gone' configured in the routerMap json file does not exist")).toContain('页面开始编译之前')
     expect(pageMissingHint(BUILD_FAILURE)).toBe('')
   })
 })
