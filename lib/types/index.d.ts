@@ -225,6 +225,20 @@ export declare function parseBuildErrors(text: string): {
     warnCount: number;
 };
 /**
+ * hvigor prints errors and progress inside colour frames (`\u001b[31m…\u001b[39m`) and redraws
+ * progress lines with `\r`. A tool result is read as plain text, so both are removed before the
+ * output is parsed or tailed.
+ */
+export declare function stripAnsi(text: string): string;
+/**
+ * The toolchain checks the module's page list against disk while it assembles the entry list, and
+ * throws `10906403 … Page '<path>' does not exist.` when the resolved name has no `.ets` file; a
+ * routerMap entry whose buildFunction never got emitted fails the same way. That happens before any
+ * page is compiled, so the page's own syntax and type errors are never printed and the build log
+ * stops at a message that points away from the real problem.
+ */
+export declare function pageMissingHint(text: string): string;
+/**
  * Furthest deploy stage the output reached, from the stage markers `devecocli run` prints:
  *   `[hvigor build] Running...`      → `Build completed successfully.`
  *   `Installing artifacts to device` → `App installed successfully`

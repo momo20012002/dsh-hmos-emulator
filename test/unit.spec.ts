@@ -23,6 +23,7 @@ import {
   layoutJson,
   lintScope,
   nodeLabel,
+  pageMissingHint,
   pageTitle,
   parseLintTable,
   parseBuildErrors,
@@ -35,6 +36,7 @@ import {
   SHOT_KEEP,
   sliceText,
   stepSummary,
+  stripAnsi,
   untrackedCodeFiles,
 } from '../lib/index.js'
 
@@ -122,6 +124,18 @@ describe('parseBuildErrors', () => {
     expect(warnCount).toBe(27)
   })
 
+  it('cleans colour frames and explains a page error that hides the real one', () => {
+    // hvigor writes both errors and progress inside SGR frames, and redraws progress with `\r`;
+    // the tool result is plain text, so both are dropped.
+    expect(stripAnsi('\u001b[1;31m10906403 ArkTS Compiler Error\u001b[39m')).toBe('10906403 ArkTS Compiler Error')
+    expect(stripAnsi('progress 1%\rprogress 2%\n')).toBe('progress 1%progress 2%\n')
+    // The entry-list check throws this before any page compiles, so the page's own diagnostics
+    // never reach the log — the message has to say that itself. Both wordings are the same trap.
+    const masked = '\u001b[31m10906403 ArkTS Compiler Error\nError Message: Page \'C:/proj/entry/src/main/ets/pages/Gone.ets\' does not exist. \u001b[39m'
+    expect(pageMissingHint(stripAnsi(masked))).toContain('页面开始编译之前')
+    expect(pageMissingHint("The buildFunction of page 'Gone' does not exist.")).toContain('页面开始编译之前')
+    expect(pageMissingHint(BUILD_FAILURE)).toBe('')
+  })
 })
 
 describe('deployPhase', () => {

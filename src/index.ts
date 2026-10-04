@@ -1581,6 +1581,28 @@ export function parseBuildErrors(text: string): { errors: BuildError[]; errorCou
   return { errors, errorCount: counts ? Number(counts[1]) : errors.length, warnCount: counts ? Number(counts[2]) : 0 }
 }
 
+/**
+ * hvigor prints errors and progress inside colour frames (`\u001b[31m…\u001b[39m`) and redraws
+ * progress lines with `\r`. A tool result is read as plain text, so both are removed before the
+ * output is parsed or tailed.
+ */
+export function stripAnsi(text: string): string {
+  return String(text || '').replace(/\u001b\[[0-9;]*[A-Za-z]/g, '').replace(/\r/g, '')
+}
+
+/**
+ * The toolchain checks the module's page list against disk while it assembles the entry list, and
+ * throws `10906403 … Page '<path>' does not exist.` when the resolved name has no `.ets` file; a
+ * routerMap entry whose buildFunction never got emitted fails the same way. That happens before any
+ * page is compiled, so the page's own syntax and type errors are never printed and the build log
+ * stops at a message that points away from the real problem.
+ */
+export function pageMissingHint(text: string): string {
+  const src = String(text || '')
+  if (!/10906403|Page '[^']*' does not exist|buildFunction[^\n]*does not exist|routerMap[^\n]*does not exist/i.test(src)) return ''
+  return '工具链在装配入口页清单时找不到页面或它的 buildFunction(报 does not exist):这一步在页面开始编译之前,所以页面自身的语法/类型错误不会被打出来——先按报错里的路径核对页名与文件是否一致(重命名、挪目录、大小写,或页面在另一个 module),再回看页面源码。'
+}
+
 /** Strip the project root from a report path, so a finding reads like the lint File column does. */
 function relativeTo(root: string, file: string): string {
   const norm = (s: string) => String(s || '').replace(/\\/g, '/').replace(/\/+$/, '')
@@ -2671,6 +2693,9 @@ function createToolDefs(api, ctx = null) {
         const errorCode = error && typeof error === 'object' && 'code' in error ? String(error.code) : 'internal'
         return { ok: false, device, phase: 'build', durationMs: Date.now() - started, errorCode, error: error instanceof Error ? error.message : String(error) }
       }
+      // Colour frames and `\r` redraws are noise once the output is a tool result: strip them
+      // before both the error parse and the tail see it.
+      output = stripAnsi(output)
       const { errors, errorCount, warnCount } = parseBuildErrors(output)
       const ok = code === 0
       const result: any = {
@@ -2688,6 +2713,12 @@ function createToolDefs(api, ctx = null) {
       const hap = chosen ? hapPathOf(projectPath, chosen) : null
       if (hap) result.hapPath = hap
       if (!ok && note) result.note = note
+      // A failed build can end at the entry-list check, whose message hides the page's own
+      // diagnostics; say so next to it rather than letting it read as the real error.
+      if (!ok) {
+        const masked = pageMissingHint(output)
+        if (masked) result.note = result.note ? `${result.note} ${masked}` : masked
+      }
       // A readable-looking project whose module list could not be parsed is worth saying out loud,
       // on success too: the caller cannot otherwise tell why `--module` was or was not passed.
       if (unreadNote) result.note = result.note ? `${result.note} ${unreadNote}` : unreadNote
@@ -2868,7 +2899,10 @@ function createToolDefs(api, ctx = null) {
       // cwd = project: codelinter prints File paths relative to the process cwd,
       // so this is what makes the returned paths project-relative instead of host-cwd-relative.
       const r = await runCli(argv, { cwd: project, timeoutMs: full ? 600000 : 300000 })
-      const { findings, summary } = parseLintTable(r.output)
+      // Same toolchain, same colour frames as a build: the table parser and the raw tail both read
+      // better without them.
+      const out = stripAnsi(r.output)
+      const { findings, summary } = parseLintTable(out)
       const bySeverity = (want: string) => findings.filter((f) => f.severity === want)
       const errors = bySeverity('Error')
       const warnings = bySeverity('Warning')
@@ -2907,7 +2941,7 @@ function createToolDefs(api, ctx = null) {
           suggestions: Math.max(0, suggestions.length - cap),
         },
         stats: outcome.stats,
-        rawTail: tailText(r.output, 2),
+        rawTail: tailText(out, 2),
       }
     },
   }

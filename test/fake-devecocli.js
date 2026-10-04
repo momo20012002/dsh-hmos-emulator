@@ -14,6 +14,7 @@
  *   DSH_FAKE_LAYOUT_LATER    stdout from the second call on (defaults to FIRST)
  *   DSH_FAKE_INSTANCES       stdout for `emulator list --format json`
  *   DSH_FAKE_PNG             bytes written for `ui screenshot`
+ *   DSH_FAKE_BUILD           stdout for `build` (with DSH_FAKE_BUILD_CODE as its exit code)
  *   DSH_FAKE_ARGV_LOG        file each invocation's argv is appended to (one JSON array per line)
  */
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -68,6 +69,13 @@ if (group === 'docs' && verb === 'read') {
 
 // `log` answers canned hilog lines, so `observe {log:…}` can be asserted.
 if (group === 'log') out(process.env.DSH_FAKE_LOG || '')
+
+// `build` answers canned build output with a chosen exit code, so a failed `hmos_deploy` can be
+// asserted (colour frames, error wording) without running hvigor.
+if (group === 'build') {
+  if (process.env.DSH_FAKE_BUILD) process.stdout.write(process.env.DSH_FAKE_BUILD)
+  process.exit(Number(process.env.DSH_FAKE_BUILD_CODE || '0'))
+}
 
 // Interaction verbs (click/text/swipe/...) succeed silently: argv shape is asserted by the caller.
 out('')

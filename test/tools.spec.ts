@@ -89,7 +89,7 @@ beforeAll(() => {
 afterAll(() => {
   if (savedCli === undefined) delete process.env.DSH_HMOS_DEVECO_CLI
   else process.env.DSH_HMOS_DEVECO_CLI = savedCli
-  for (const key of ['DSH_FAKE_INSTANCES', 'DSH_FAKE_STATE', 'DSH_FAKE_ARGV_LOG', 'DSH_FAKE_PNG_B64', 'DSH_FAKE_LOG', 'DSH_FAKE_LAYOUT_FIRST', 'DSH_FAKE_LAYOUT_LATER']) delete process.env[key]
+  for (const key of ['DSH_FAKE_INSTANCES', 'DSH_FAKE_STATE', 'DSH_FAKE_ARGV_LOG', 'DSH_FAKE_PNG_B64', 'DSH_FAKE_LOG', 'DSH_FAKE_LAYOUT_FIRST', 'DSH_FAKE_LAYOUT_LATER', 'DSH_FAKE_BUILD', 'DSH_FAKE_BUILD_CODE']) delete process.env[key]
 })
 
 beforeEach(() => {
@@ -515,6 +515,30 @@ describe.skipIf(!CAN_SPAWN)('deploy module list', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toContain('不属于该工程')
     expect(result.error).toContain('entry')
+  })
+})
+
+// A failed build reaches the caller twice — the parsed errors and the tail — and hvigor writes
+// both inside colour frames. Its entry-list check also stops the build with a message that hides
+// the page's own diagnostics, so the message has to carry that warning itself.
+describe.skipIf(!CAN_SPAWN)('deploy failure output', () => {
+  it('strips the colour frames and explains the page-missing message', async () => {
+    mkdirSync(join(dir, 'proj3'), { recursive: true })
+    writeFileSync(join(dir, 'proj3', 'build-profile.json5'), '{ "modules": [{ "name": "entry" }] }')
+    process.env.DSH_FAKE_BUILD = [
+      '\u001b[31m10906403 ArkTS Compiler Error',
+      "Error Message: Page 'C:/Temp/proj3/entry/src/main/ets/pages/Gone.ets' does not exist. \u001b[39m",
+      '\u001b[32mBUILD FAILED\u001b[39m',
+    ].join('\r\n')
+    process.env.DSH_FAKE_BUILD_CODE = '1'
+    const deploy = mountAll().find((def) => def.name === 'hmos_deploy')
+    const result = await deploy.execute({ projectPath: 'proj3', buildOnly: true, module: 'entry' }, exec)
+    delete process.env.DSH_FAKE_BUILD
+    delete process.env.DSH_FAKE_BUILD_CODE
+    expect(result.ok).toBe(false)
+    expect(result.tail).not.toContain('\u001b')
+    expect(result.tail).toContain('does not exist')
+    expect(result.note).toContain('页面开始编译之前')
   })
 })
 
