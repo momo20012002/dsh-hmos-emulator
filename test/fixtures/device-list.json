@@ -1,0 +1,8 @@
+[
+  {
+    "name": "Pura 90",
+    "serial": "127.0.0.1:5555",
+    "kind": "emulator",
+    "deviceType": "phone"
+  }
+]

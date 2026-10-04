@@ -1,0 +1,26 @@
+[
+    {
+        "SoftWareVersion": "7.0.0.107",
+        "deviceType": "2in1",
+        "downloaded": "false",
+        "osVersion": "HarmonyOS 7.0.0(26.0.0)",
+        "releaseType": "Release",
+        "upgradable": "false"
+    },
+    {
+        "SoftWareVersion": "7.0.0.107",
+        "deviceType": "2in1 Foldable",
+        "downloaded": "false",
+        "osVersion": "HarmonyOS 7.0.0(26.0.0)",
+        "releaseType": "Release",
+        "upgradable": "false"
+    },
+    {
+        "SoftWareVersion": "7.0.0.107",
+        "deviceType": "phone",
+        "downloaded": "false",
+        "osVersion": "HarmonyOS 7.0.0(26.0.0)",
+        "releaseType": "Release",
+        "upgradable": "false"
+    }
+]

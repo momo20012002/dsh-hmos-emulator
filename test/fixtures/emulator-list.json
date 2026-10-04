@@ -1,0 +1,16 @@
+[
+  {
+    "name": "Pura 90",
+    "status": "running",
+    "serial": "127.0.0.1:5555",
+    "deviceType": "phone",
+    "osVersion": "HarmonyOS 6.1.1(24)"
+  },
+  {
+    "name": "Pura X View",
+    "status": "stopped",
+    "serial": null,
+    "deviceType": "phone",
+    "osVersion": "HarmonyOS 7.0.0(26.0.0)"
+  }
+]

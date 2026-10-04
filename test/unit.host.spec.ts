@@ -4,7 +4,8 @@
  * A new case belongs here when it does NOT go through `createToolDefs(...).execute()`.
  */
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
+import { loggerOf } from '../src/log.js'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -774,5 +775,38 @@ describe('cliFromWrapper', () => {
     expect(cliFromWrapper(join(npmRoot, 'missing-cli.js'))).toBeUndefined()
     expect(cliFromWrapper(join(tmpdir(), 'no-such-npm-root', 'devecocli.cmd'))).toBeUndefined()
     rmSync(npmRoot, { recursive: true, force: true })
+  })
+})
+
+describe('host logger', () => {
+  it('prefers the context logger and keeps every argument', () => {
+    const seen: any[][] = []
+    const log = loggerOf({
+      logger: { error: (...args: any[]) => seen.push(['error', ...args]), warn: (...args: any[]) => seen.push(['warn', ...args]) },
+    })
+    log.error('[dsh-hmos-emulator] 工具 x 注册失败(其余继续):', new Error('taken'))
+    log.warn('plain')
+    expect(seen).toEqual([
+      ['error', '[dsh-hmos-emulator] 工具 x 注册失败(其余继续):', expect.any(Error)],
+      ['warn', 'plain'],
+    ])
+  })
+
+  it('falls back to the console, and sends warnings to error when there is no warn', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const warns = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      loggerOf(undefined).error('a')
+      loggerOf({}).warn('b')
+      expect(errors).toHaveBeenCalledWith('a')
+      expect(warns).toHaveBeenCalledWith('b')
+      // A logger implementing only error still receives warnings instead of dropping them.
+      const onlyError: any[][] = []
+      loggerOf({ logger: { error: (...args: any[]) => onlyError.push(args) } }).warn('c')
+      expect(onlyError).toEqual([['c']])
+    } finally {
+      errors.mockRestore()
+      warns.mockRestore()
+    }
   })
 })

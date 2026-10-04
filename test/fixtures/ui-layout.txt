@@ -1,0 +1,28 @@
+- Dumping layout…
+[0,0,1320,2856]
+  TextInput [56,164,1265,319] clickable longClickable scrollable
+  Image [1131,199,1215,283] clickable
+  Scroll [0,360,1320,2688] scrollable
+    Swiper [56,360,1264,948] scrollable
+    Text [231,1046,281,1144] "0"
+    Text [193,1158,320,1207] "样本一"
+    Text [635,1046,685,1144] "0"
+    Text [576,1158,745,1207] "样本二"
+    Text [1039,1046,1089,1144] "0"
+    Text [980,1158,1149,1207] "样本三"
+    Column [112,1361,355,1616] clickable
+    Column [397,1361,640,1616] clickable
+    Column [681,1361,924,1616] clickable
+    Column [966,1361,1209,1616] clickable
+    Row [112,1798,1208,2064] clickable
+    Row [112,2068,1208,2334] clickable
+    Row [112,2337,1208,2603] clickable
+    Row [112,2607,1208,2688] clickable
+  Column [0,2688,330,2856] clickable
+    Text [116,2807,215,2856] "样本四"
+  Column [330,2688,660,2856] clickable
+    Text [446,2807,545,2856] "样本五"
+  Column [660,2688,990,2856] clickable
+    Text [776,2807,875,2856] "样本六"
+  Column [990,2688,1320,2856] clickable
+    Text [1106,2807,1205,2856] "样本七"

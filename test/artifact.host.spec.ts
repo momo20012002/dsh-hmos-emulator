@@ -1,25 +1,15 @@
 /**
- * The shape of what this plugin delivers: the tools it registers, the JSON schema they must keep
- * (a lowercase subset, `additionalProperties` boolean, inside a size budget) and the client bundle
- * the page loads. Nothing here drives a device or a screen — it is the contract a consumer sees.
+ * The shape of what this plugin delivers to the host: the tools it registers, the JSON schema they
+ * must keep (a lowercase subset, `additionalProperties` boolean, inside a size budget), and the
+ * registration contract. Nothing here drives a device or a screen.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { apply } from '../lib/index.js'
+import { createHostContext, mountPlugin } from './harness.js'
 
-/** Mount the plugin the way the host does, with every service it polls for already present. */
+/** Every tool the plugin registers, in order. */
 function mountTools() {
-  const registered = []
-  const ctx = {
-    get: (n) => {
-      if (n === 'tools') return { register: (def) => { registered.push(def); return () => {} } }
-      if (n === 'webServer') return { host: '127.0.0.1', register: () => () => {} }
-      if (n === 'systemPrompt') return { context: () => () => {} }
-      return undefined
-    },
-    effect: (fn) => fn(),
-  }
-  apply(ctx, {})
-  return registered
+  return mountPlugin().tools
 }
 
 describe('tool surface', () => {
@@ -49,10 +39,22 @@ describe('emu_ui batch surface', () => {
     // `allWindows`: a focused-window dump leaves out system pickers and UIExtension panels
     // entirely), the gesture-speed fixes
     // (`swipe`/`fling` never forwarded it, a speedless drag moved nothing) and the two capability
-    // notes; measured 8 393.
+    // notes; measured 8 237 after `thenWaitFor` stopped restating `waitFor`'s fields.
     const total = mountTools()
       .reduce((sum, def) => sum + JSON.stringify({ name: def.name, description: def.description, parameters: def.parameters }).length, 0)
-    expect(total).toBeLessThan(8450)
+    expect(total).toBeLessThan(8300)
+  })
+
+  it('keeps every tool inside its own share of the budget', () => {
+    // One composite tool carries the whole action surface, so it gets the only large share; every
+    // other tool is a single-purpose wrapper and must stay small. Caps sit just above the measured
+    // cost (emu_ui 4 765, hmos_log 913, hmos_deploy 838, hmos_docs 771, hmos_lint 607, emu 343), so
+    // a message that grows them has to be a deliberate edit here.
+    const caps = { emu_ui: 4900, hmos_log: 1000, hmos_deploy: 1000, hmos_docs: 1000, hmos_lint: 1000, emu: 500 }
+    const over = mountTools()
+      .map((def) => ({ name: def.name, cost: JSON.stringify({ name: def.name, description: def.description, parameters: def.parameters }).length }))
+      .filter((tool) => tool.cost >= caps[tool.name])
+    expect(over).toEqual([])
   })
 })
 
@@ -72,17 +74,28 @@ describe('emu_ui resident schema', () => {
   })
 })
 
-describe('client bundle artifact', () => {
-  it('registers through window.__ModuleLoader__.load with the package id', async () => {
-    let spec
-    ;(globalThis as any).window = { __ModuleLoader__: { load: (loaded) => { spec = loaded } } }
-    try {
-      await import('../lib/client.js')
-    } finally {
-      delete (globalThis as any).window
+describe('tool registration resilience', () => {
+  it('registers each name once per registry and keeps going when one name is taken', () => {
+    // A live patch reload reuses the registry instance, so a second mount must not re-register; and
+    // one taken name must not strand the tools that come after it.
+    const registered = []
+    const registry = {
+      register: (def) => {
+        if (def.name === 'hmos_log') throw new Error('name already taken')
+        registered.push(def)
+        return () => {}
+      },
     }
-    expect(spec).toBeTruthy()
-    expect(spec.id).toBe('dsh-hmos-emulator')
-    expect(typeof spec.factory).toBe('function')
+    const { ctx } = createHostContext({ tools: registry })
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      apply(ctx, {})
+      const afterFirstMount = registered.map((d) => d.name)
+      apply(ctx, {})
+      expect(afterFirstMount).toEqual(['emu', 'emu_ui', 'hmos_deploy', 'hmos_docs', 'hmos_lint'])
+      expect(registered.map((d) => d.name)).toEqual(afterFirstMount)
+    } finally {
+      logged.mockRestore()
+    }
   })
 })

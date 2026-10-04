@@ -14,7 +14,8 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os'
 import { join, basename, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { apply, decodePng, encodePng } from '../lib/index.js'
+import { decodePng, encodePng } from '../lib/index.js'
+import { mountPlugin } from './harness.js'
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), 'fake-devecocli.js')
 
@@ -51,26 +52,15 @@ let savedImages
 
 /** Mount the plugin with an attachment service (or without one); every registered tool by name. */
 function mountAll({ attachments = true } = {}) {
-  const registered = []
-  const ctx = {
-    get: (name) => {
-      if (name === 'tools') return { register: (def) => { registered.push(def); return () => {} } }
-      if (name === 'webServer') return { host: '127.0.0.1', register: () => () => {} }
-      if (name === 'systemPrompt') return { context: () => () => {} }
-      if (name === 'attachments' && attachments) {
-        return {
-          saveImage: async (input) => {
-            savedImages.push(input)
-            return { attachmentId: 'sha256:fake', mediaType: input.mediaType, bytes: input.data.length, width: 1320, height: 2856, name: input.name }
-          },
-        }
+  const attachmentService = attachments
+    ? {
+        saveImage: async (input) => {
+          savedImages.push(input)
+          return { attachmentId: 'sha256:fake', mediaType: input.mediaType, bytes: input.data.length, width: 1320, height: 2856, name: input.name }
+        },
       }
-      return undefined
-    },
-    effect: (fn) => fn(),
-  }
-  apply(ctx, {})
-  return registered
+    : undefined
+  return mountPlugin({ attachments: attachmentService }).tools
 }
 
 const mountTools = (options = {}) => mountAll(options).find((def) => def.name === 'emu_ui')

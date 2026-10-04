@@ -35,3 +35,37 @@ jobs:
 
       - name: Test (vitest)
         run: pnpm test
+
+  # What a consumer installs is the manifest's publication view, not the working tree: this job packs
+  # the package and checks that every declared entry (main, types, exports, files) resolves.
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build (src → lib)
+        run: pnpm build
+
+      - name: Check the published package
+        run: pnpm lint:package
+
+  # One check to require in a branch rule: a job added later is not enforced until it is listed here.
+  gate:
+    needs: [build, package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required jobs succeeded
+        run: echo "build and package passed"

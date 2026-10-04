@@ -13,6 +13,11 @@
  *   DSH_FAKE_LAYOUT_FIRST    stdout for the first layout call
  *   DSH_FAKE_LAYOUT_LATER    stdout from the second call on (defaults to FIRST)
  *   DSH_FAKE_INSTANCES       stdout for `emulator list --format json`
+ *   DSH_FAKE_IMAGES          stdout for `emulator image list --format json`
+ *   DSH_FAKE_DEVICES         stdout for `device list --format json`
+ *   DSH_FAKE_START/_CODE     stdout and exit code for `emulator start`
+ *   DSH_FAKE_STOP/_CODE      stdout and exit code for `emulator stop`
+ *   DSH_FAKE_UPDATE/_CODE    stdout and exit code for `update`
  *   DSH_FAKE_PNG             bytes written for `ui screenshot`
  *   DSH_FAKE_BUILD           stdout for `build` (with DSH_FAKE_BUILD_CODE as its exit code)
  *   DSH_FAKE_ARGV_LOG        file each invocation's argv is appended to (one JSON array per line)
@@ -31,6 +36,25 @@ if (process.env.DSH_FAKE_ARGV_LOG) {
 }
 
 if (group === 'emulator' && verb === 'list') out(process.env.DSH_FAKE_INSTANCES || '[]')
+
+// System images back the pre-start check: an instance whose image is missing must not be started.
+if (group === 'emulator' && verb === 'image') out(process.env.DSH_FAKE_IMAGES || '[]')
+
+// Emulator lifecycle: the caller asserts the argv and the exit code, never a window.
+if (group === 'emulator' && (verb === 'start' || verb === 'stop')) {
+  const text = process.env[verb === 'start' ? 'DSH_FAKE_START' : 'DSH_FAKE_STOP']
+  if (text) process.stdout.write(text)
+  process.exit(Number(process.env[verb === 'start' ? 'DSH_FAKE_START_CODE' : 'DSH_FAKE_STOP_CODE'] || '0'))
+}
+
+// Device enumeration: the same JSON shape the real CLI prints for `device list --format json`.
+if (group === 'device' && verb === 'list') out(process.env.DSH_FAKE_DEVICES || '[]')
+
+// `update` reinstalls the CLI; here it only reports what the caller asked to see.
+if (group === 'update') {
+  if (process.env.DSH_FAKE_UPDATE) process.stdout.write(process.env.DSH_FAKE_UPDATE)
+  process.exit(Number(process.env.DSH_FAKE_UPDATE_CODE || '0'))
+}
 
 if (group === 'ui' && verb === 'layout') {
   const state = process.env.DSH_FAKE_STATE
@@ -77,5 +101,13 @@ if (group === 'build') {
   process.exit(Number(process.env.DSH_FAKE_BUILD_CODE || '0'))
 }
 
-// Interaction verbs (click/text/swipe/...) succeed silently: argv shape is asserted by the caller.
-out('')
+// A stand-in for a long build. `DSH_FAKE_STUBBORN` makes it ignore SIGTERM, so only the caller's
+// SIGKILL escalation ends it — the case that matters when a cancelled build would otherwise keep
+// holding the device.
+if (process.env.DSH_FAKE_SLEEP_MS) {
+  if (process.env.DSH_FAKE_STUBBORN) process.on('SIGTERM', () => { /* hold on until SIGKILL */ })
+  setTimeout(() => process.exit(0), Number(process.env.DSH_FAKE_SLEEP_MS))
+} else {
+  // Interaction verbs (click/text/swipe/...) succeed silently: argv shape is asserted by the caller.
+  out('')
+}

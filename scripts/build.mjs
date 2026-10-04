@@ -1,6 +1,7 @@
-// dsh-hmos-emulator 构建脚本(esbuild,与 dsh-cost-meter 同款模式)。
-//   宿主: src/index.ts           → lib/index.js   (ESM, node, 保留 node: 内建)
-//   客户端: src/client/index.ts  → lib/client.js  (__ModuleLoader__ 封装产物)
+// dsh-hmos-emulator build script (esbuild).
+//   host:   src/index.ts          -> lib/index.js   (ESM, node builtins kept)
+//   client: src/client/index.ts   -> lib/client.js  (wrapped for __ModuleLoader__)
+// Artifacts stay single-file: bundle both halves, and take react from the loader's require.
 import { createRequire } from 'node:module'
 import { rmSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -21,19 +22,19 @@ const ID = 'dsh-hmos-emulator'
 
 mkdirSync(join(root, 'lib'), { recursive: true })
 
-// 宿主 ESM
+// Host (ESM)
 await build({
   entryPoints: [join(root, 'src', 'index.ts')],
   outfile: join(root, 'lib', 'index.js'),
   format: 'esm',
   platform: 'node',
-  bundle: false,
+  bundle: true,
   target: 'node20',
   sourcemap: false,
   logLevel: 'warning',
 })
 
-// 客户端:封装为 window.__ModuleLoader__.load 产物(与 DSH 官方一致)
+// Client: wrapped as a window.__ModuleLoader__.load artifact (the DSH convention).
 const clientBanner = `window.__ModuleLoader__.load({ id: ${JSON.stringify(ID)}, factory: (require) => { const module = { exports: {} }; const exports = module.exports; Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });`
 const clientFooter = `return module.exports; } });`
 await build({
@@ -41,7 +42,8 @@ await build({
   outfile: join(root, 'lib', 'client.js'),
   format: 'cjs',
   platform: 'browser',
-  bundle: false,
+  bundle: true,
+  external: ['react'],
   target: 'es2020',
   banner: { js: clientBanner },
   footer: { js: clientFooter },
