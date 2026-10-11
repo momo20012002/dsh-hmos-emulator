@@ -37,6 +37,10 @@ if (process.env.DSH_FAKE_ARGV_LOG) {
 
 if (group === 'emulator' && verb === 'list') out(process.env.DSH_FAKE_INSTANCES || '[]')
 
+// `--version` reports which build is installed, so an upgrade's dist-tag can be asserted: the plugin
+// reads this to decide the channel it follows.
+if (argv[0] === '--version') out(process.env.DSH_FAKE_VERSION || '1.3.0-stable')
+
 // System images back the pre-start check: an instance whose image is missing must not be started.
 if (group === 'emulator' && verb === 'image') out(process.env.DSH_FAKE_IMAGES || '[]')
 

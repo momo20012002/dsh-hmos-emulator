@@ -3,7 +3,7 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { AUTO_SHOT_PREFIX, TOOL_SHOT_PREFIX, pruneAutoShots, pruneToolShots, readDataUrl } from './shots.js'
 import { countChangedCode, hashTree } from './git.js'
-import { devecoCliHint, ensureImageReady, resolveDevecoCli, resolveHdc, runCli, runCliStream, waitDeviceReady } from './toolchain.js'
+import { cliChannel, cliInstallSpec, cliUpdateChannel, devecoCliHint, ensureImageReady, npmCommand, npmInvocation, resolveDevecoCli, resolveHdc, runCli, runCliStream, versionFromOutput, waitDeviceReady } from './toolchain.js'
 import { headText, tailText } from './text.js'
 import { LINT_LABELS, fixStats, lintOutcome, parseLintSummary } from './parsers/lint.js'
 import { PROJECT_MARK, normalizeDir, readModules, scanProjects } from './workspace.js'
@@ -11,6 +11,8 @@ import { PROJECT_MARK, normalizeDir, readModules, scanProjects } from './workspa
  * The HTTP API behind the panel: toolchain, emulator, device, project, lint and deploy methods,
  * plus the background the model tools read through. Nothing here touches a model tool schema.
  */
+/** How long a version check may take in total: a probe plus a registry lookup, both under one cap. */
+const PLAN_BUDGET_MS = 25000
 // Latest code-check result. It is cached here on every check, and only handed to the model
 // when the user presses "send to AI" (lint.notify) — never automatically. The queued notice also
 // remembers which session asked for it: this module is shared by every session, so without that
@@ -45,11 +47,13 @@ export function createApi() {
     // discovery does not actually use.
     const sdk = process.env.DEVECO_SDK_HOME || ''
     const cliPath = resolveDevecoCli()
-    // Local devecocli version (shown in the panel; helps spot an outdated CLI).
+    // Local devecocli version (shown in the panel; helps spot an outdated CLI). Read by shape, the same
+    // way the upgrade plan reads the registry answer: both go through one merged output buffer, and a
+    // version is a bare `x.y.z` in it, never simply the first line.
     let cliVersion = null
     if (cliPath) {
       const v = await runCli([process.execPath, cliPath, '--version'], { timeoutMs: 20000 })
-      if (v.code === 0) cliVersion = (v.output.trim().split(/\r?\n/)[0] || '') || null
+      if (v.code === 0) cliVersion = versionFromOutput(v.output) || null
     }
     // Give a platform-appropriate SDK path example instead of hardcoding Windows.
     const sdkExample = process.platform === 'win32'
@@ -61,6 +65,8 @@ export function createApi() {
       node: process.execPath,
       devecoCliJs: cliPath ?? null,
       devecoCliVersion: cliVersion,
+      // The line an upgrade would follow; the panel labels the update action with it.
+      devecoCliChannel: cliPath ? cliChannel(cliVersion) : null,
       hdcExe: resolveHdc() ?? null,
       sdkHome: sdk || null,
       hint:
@@ -75,27 +81,71 @@ export function createApi() {
     return report
   }
 
-  api['deveco.update'] = async (_payload, _res, ctl) => {
+  api['deveco.plan'] = async (payload, _res, ctl) => {
+    // What an update would install, resolved before anything is touched: the channel, the spec, and
+    // the build that channel points at right now. The target comes from the registry, so a failed
+    // lookup is reported as unknown instead of assumed.
+    //
+    // One budget covers both steps: the user is waiting on this answer while a button says "检查中…",
+    // so it must not sit for the sum of two child processes' timeouts.
+    const deadline = Date.now() + PLAN_BUDGET_MS
+    const left = (): number => Math.max(1000, deadline - Date.now())
+    const cli = resolveDevecoCli()
+    let installed = ''
+    if (cli) {
+      const probe = await runCli([process.execPath, cli, '--version'], { timeoutMs: left(), signal: ctl?.signal })
+      // Read by shape, not by line: this goes through the same merged buffer npm does, and the two
+      // sides of the comparison the panel makes have to be normalised the same way to be comparable.
+      if (probe.code === 0) installed = versionFromOutput(probe.output)
+    }
+    const channel = cliUpdateChannel(installed, payload?.channel)
+    const spec = cliInstallSpec(channel)
+    const { file, args } = npmCommand(['view', spec, 'version'])
+    const view = await runCli([file, ...args], { timeoutMs: left(), signal: ctl?.signal })
+    const target = view.code === 0 ? versionFromOutput(view.output) : ''
+    return { channel, spec, installed: installed || null, target: target || null, checked: target !== '' }
+  }
+
+  api['deveco.update'] = async (payload, _res, ctl) => {
     const cli = resolveDevecoCli()
     if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
-    const result = await runCli([process.execPath, cli, 'update'], { timeoutMs: 240000, signal: ctl?.signal })
+    // Upgrade on the channel the panel asked for, falling back to the one the installed build came
+    // from. `devecocli update` takes no channel argument (its help reads "update deveco-cli to
+    // latest"), so an explicit dist-tag through npm is the only way to keep — or deliberately
+    // leave — the stable line.
+    const probe = await runCli([process.execPath, cli, '--version'], { timeoutMs: 20000, signal: ctl?.signal })
+    const installed = probe.code === 0 ? (probe.output.trim().split(/\r?\n/)[0] || '') : ''
+    const channel = cliUpdateChannel(installed, payload?.channel)
+    const spec = cliInstallSpec(channel)
+    const { file, args } = npmInvocation(spec)
+    const result = await runCli([file, ...args], { timeoutMs: 240000, signal: ctl?.signal })
     return {
       code: result.code,
       timedOut: result.timedOut,
       output: result.output,
-      note: result.code === 0 ? 'devecocli 已更新;若宿主端路径变化,建议重启 dsh web。' : '更新失败,请查看输出(可能是 npm 源/网络问题)。',
+      channel,
+      spec,
+      note: result.code === 0
+        ? `已按 ${channel} 通道更新(${spec});若宿主端路径变化,建议重启 dsh web。`
+        : '更新失败,请查看输出(可能是 npm 源/网络问题)。',
     }
   }
 
   api['deveco.install'] = async () => {
-    // Install @deveco/deveco-cli globally (CLI only; hdc/emulator still need the DevEco SDK).
-    if (process.platform === 'win32') {
-      const cmd = process.env.ComSpec || 'cmd.exe'
-      const result = await runCli([cmd, '/c', 'npm', 'install', '-g', '@deveco/deveco-cli'], { timeoutMs: 240000 })
-      return { code: result.code, timedOut: result.timedOut, output: result.output, note: result.code === 0 ? 'devecocli 安装完成,请重启 dsh web 生效;hdc 仍需安装 DevEco Studio SDK 并设置 DEVECO_SDK_HOME。' : '安装失败,请查看输出;也可能是 npm 源/权限问题。' }
+    // Install @deveco/deveco-cli globally (CLI only; hdc/emulator still need the DevEco SDK). A fresh
+    // install has no channel to follow, so it takes npm's default tag — named explicitly.
+    const spec = cliInstallSpec('latest')
+    const { file, args } = npmInvocation(spec)
+    const result = await runCli([file, ...args], { timeoutMs: 240000 })
+    return {
+      code: result.code,
+      timedOut: result.timedOut,
+      output: result.output,
+      spec,
+      note: result.code === 0
+        ? `devecocli 安装完成(${spec}),请重启 dsh web 生效;hdc 仍需安装 DevEco Studio SDK 并设置 DEVECO_SDK_HOME。`
+        : '安装失败,请查看输出;也可能是 npm 源/权限问题。',
     }
-    const result = await runCli(['npm', 'install', '-g', '@deveco/deveco-cli'], { timeoutMs: 240000 })
-    return { code: result.code, timedOut: result.timedOut, output: result.output, note: result.code === 0 ? 'devecocli 安装完成,请重启 dsh web 生效;hdc 仍需安装 DevEco Studio SDK 并设置 DEVECO_SDK_HOME。' : '安装失败,请查看输出;也可能是 npm 源/权限问题。' }
   }
 
   api['emu.list'] = async () => {

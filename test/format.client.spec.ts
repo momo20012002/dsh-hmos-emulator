@@ -3,7 +3,7 @@
  * precisely so a duration, a path or a CLI line can be asserted directly instead of through the DOM.
  */
 import { describe, it, expect } from 'vitest'
-import { LINT_TITLES, cleanCliLine, exitCodeOf, fmtDur, lintStatusLine, shortPath } from '../src/client/format.js'
+import { ANSI_PALETTE, LINT_TITLES, ansiRuns, cleanCliLine, exitCodeOf, fmtDur, lintStatusLine, shortPath } from '../src/client/format.js'
 
 describe('panel formatting', () => {
   it('reads a duration as seconds below a minute and as minutes above', () => {
@@ -30,8 +30,37 @@ describe('panel formatting', () => {
     expect(cleanCliLine('plain')).toBe('plain')
   })
 
-  it('reads the streaming exit marker, and nothing else', () => {
-    expect(exitCodeOf('[HMOS_EXIT]=0')).toBe(0)
+  it('renders a CLI line as styled runs instead of dropping its colour', () => {
+    // What `devecocli update` prints: the ESC byte is invisible, so the old log showed a stray
+    // "[36m"; the colour itself is what should survive.
+    expect(ansiRuns('\u001b[36mChecking for updates...\u001b[39m'))
+      .toEqual([{ text: 'Checking for updates...', color: ANSI_PALETTE[36] }])
+    // An SGR reset returns the rest to the log's own colour instead of leaving the last one in force.
+    expect(ansiRuns('\u001b[32mok\u001b[39m done')).toEqual([
+      { text: 'ok', color: ANSI_PALETTE[32] },
+      { text: ' done' },
+    ])
+  })
+
+  it('consumes every escape: non-styling CSIs vanish, bold is tracked, CR is dropped', () => {
+    expect(ansiRuns('\u001b[2K\u001b[1mBUILD\u001b[22m SUCCESSFUL')).toEqual([
+      { text: 'BUILD', bold: true },
+      { text: ' SUCCESSFUL' },
+    ])
+    expect(ansiRuns('a\rb')).toEqual([{ text: 'ab' }])
+    expect(ansiRuns('plain')).toEqual([{ text: 'plain' }])
+    expect(ansiRuns('')).toEqual([])
+  })
+
+  it('consumes private-mode sequences instead of printing them', () => {
+    // A cursor hidden/shown pair (`ESC [ ? 25 l` / `h`) is a CSI whose parameters are not digits and
+    // semicolons alone: a matcher that only understood those left it in the log as the text `[?25l`.
+    expect(ansiRuns('\u001b[?25l\u001b[36mworking\u001b[39m\u001b[?25h')).toEqual([{ text: 'working', color: ANSI_PALETTE[36] }])
+    // An intermediate byte is part of the sequence too, and a colon-separated SGR is still styling.
+    expect(ansiRuns('\u001b[1 qhi')).toEqual([{ text: 'hi' }])
+  })
+
+  it('reads the streaming exit marker, and nothing else', () => {    expect(exitCodeOf('[HMOS_EXIT]=0')).toBe(0)
     expect(exitCodeOf('[HMOS_EXIT]=1')).toBe(1)
     expect(exitCodeOf('deploy finished')).toBeNull()
     expect(exitCodeOf(' x [HMOS_EXIT]=0')).toBeNull()

@@ -1,10 +1,21 @@
 import { API, rpc } from './rpc.js'
-import { Btn, Card, Dropdown, Icon, card, field, label, row, s } from './components.js'
+import { Btn, Card, Dropdown, Icon, Popover, Segmented, card, field, label, row, s } from './components.js'
 import { Ctx } from './ctx.js'
+import { mountStatus, subscribeMount, switchMount } from './mount.js'
 import { IC } from './icons.js'
-import { LINT_TITLES, cleanCliLine, exitCodeOf, fmtDur, lintStatusLine, shortPath } from './format.js'
-import { deviceLabel, keepScannedProject, pickDevice, pickModule, statusTone } from './view-model.js'
+import { LINT_TITLES, ansiRuns, cleanCliLine, exitCodeOf, fmtDur, lintStatusLine, shortPath } from './format.js'
+import { notices, ACTION_PREFIX } from './notice.js'
+import { preferenceStore } from './host-store.js'
+import { deviceLabel, isRenderableComponent, keepScannedProject, mountSwitchTitle, pickDevice, pickModule, statusTone } from './view-model.js'
 export const { createElement: h, useEffect, useRef, useState } = require('react')
+
+/**
+ * The release channel the user picked, or empty while they have never picked one — the panel then
+ * follows whatever the installed build is. Like the mount preference this persists through the shell's
+ * client store, so a reload, a `dsh web` restart or a browser restart keeps it.
+ */
+const channelStore = preferenceStore<string>('dsh-hmos-emulator:deveco-channel', '')
+
 /** The emulator panel itself: one tab component plus the small helpers only it uses. */
 // ── Design tokens (follow DSH theme variables; usable in light and dark) ──
 export const logLine = (kind) => ({
@@ -15,6 +26,70 @@ export const warnBox = { background: 'rgba(229,72,77,.12)', border: `1px solid $
 
 // Keep the last screenshot in module scope so it survives a panel remount.
 export let lastShot = null
+
+/** The shell's dialog, as this panel uses it. */
+interface HostDialog {
+  readonly Modal: (props: any) => unknown
+}
+
+/**
+ * Resolve the shell's dialog, lazily and never fatally.
+ *
+ * The panel loads on hosts that publish none of the shared primitives — the same rule the notice
+ * banner follows — and the dialog is only needed once a switch is asked for. A confirmation belongs to
+ * the shell's layer rather than this panel's chrome, so it takes the shell's own dialog; the buttons
+ * inside it are this panel's own, which is one export less to depend on.
+ * @returns the dialog, or null when this host does not publish one.
+ */
+function hostDialog(): HostDialog | null {
+  try {
+    const primitives = require('@deepseek-ai/dsh-client-ui-primitives') as Partial<HostDialog> | undefined
+    return isRenderableComponent(primitives?.Modal) ? primitives as HostDialog : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The build of the workbench this page publishes, or '' when it reports none.
+ *
+ * Asked for two readers: the confirmation names it beside the destination, and the diagnostic line
+ * records which build answered. One read, so the two can never disagree.
+ * @param ctx - the client context.
+ * @returns the version string the service reports, without decoration.
+ */
+function betterBuild(ctx: Ctx): string {
+  const better = ctx && typeof ctx.get === 'function' ? ctx.get('betterSidebar') : undefined
+  return better !== undefined && typeof better.version === 'string' ? better.version : ''
+}
+
+/**
+ * What the position choice does, in the words a user reads.
+ *
+ * One line, and only the part a user cannot work out: the panel opens where it was told to, and the
+ * right column's own new-tab control is the way back when that open does not land. The steps through
+ * that control live in the README, because the popover is a couple of hundred pixels wide and this sits
+ * under a row the reader already understands.
+ * @param mount - the switch's resolved status.
+ * @returns the hint shown under the capsule row.
+ */
+export function mountDetail(mount: { effective: string }): string {
+  if (mount.effective === 'none') return '当前没有可用的挂载位置,面板暂不显示。'
+  return '切换后,若未自动打开,请在右侧栏的「新标签页」中重新打开。'
+}
+
+/**
+ * What confirming a host switch does, shown as the body of the dialog the switch asks in.
+ *
+ * The title names the destination and the row under the capsule says how to get the panel back, so this
+ * carries what the user is deciding about: the tab in front of them closes, and the panel comes up where
+ * they asked for it. No host vocabulary and no detection report — which package answered is the capsule's
+ * tooltip and the diagnostic log's business, not a question asked of the reader.
+ * @returns the consequence sentence.
+ */
+export function mountSwitchNote(): string {
+  return '当前栏的标签页将关闭,面板将在新位置打开。'
+}
 
 export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx: Ctx }) {
   const { scope, ctx } = props
@@ -54,6 +129,75 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   // Fix buttons stay locked until the matching check has shown what is in scope.
   const [fixReady, setFixReady] = useState({ changed: false, all: false })
   const [lintSec, setLintSec] = useState(0)
+  // Which sidebar carries this panel. mount.ts owns the registration; the switch below only asks
+  // for a move and shows what happened, including a refusal that leaves the request unchanged.
+  const [mount, setMount] = useState(() => mountStatus())
+  const [showMount, setShowMount] = useState(false)
+  // The half the user picked, waiting for the shell's dialog: moving the panel takes its tab away from
+  // this host, so the switch is a two-step action, not a one-click toggle. Empty while nothing waits.
+  const [pendingMount, setPendingMount] = useState('')
+  // Which channel the 更新 button installs from. '' follows the installed build; an explicit choice
+  // is a set-once preference, so it sits behind the gear next to the mount switch.
+  const [channelChoice, setChannelChoice] = useState(() => channelStore.getSnapshot())
+  /** This panel's root node: what the version check's banner centers over. */
+  const panelRef = useRef(null)
+  /** This panel instance's token for the shared notice store; see `notices.own`. */
+  const owner = useRef({}).current
+  const cliChannel = channelChoice === 'stable' || channelChoice === 'latest'
+    ? channelChoice
+    : ((tc && tc.devecoCliChannel) || 'latest')
+  const pickCliChannel = (next) => { setChannelChoice(next); channelStore.set(next) }
+  useEffect(() => subscribeMount(() => setMount(mountStatus())), [])
+  // One diagnostic line: which host services this page publishes right now, and whether the switch has a
+  // dialog to ask in. A greyed half and a confirmation that looks unlike the expected one are both
+  // derived from exactly these facts, so such a report arrives with its cause.
+  useEffect(() => {
+    const svc = mount.services
+    const build = betterBuild(ctx)
+    pushLog('info', `挂载探测:slots=${svc.slots ? '有' : '无'} sidebarRightTabs=${svc.tabs ? '有' : '无'} betterSidebar=${svc.better ? `有${build === '' ? '' : `@${build}`}` : '无'} 确认对话框=${hostDialog() === null ? '无' : '有'}`)
+  }, [])
+  const pickMount = (mode) => {
+    const result = switchMount(ctx, mode)
+    // A switch that is turned down says so in the banner — the one surface this panel reports in — and
+    // that banner fades on its own, because a refusal needs no action.
+    if (!result.ok) notices.say({ text: result.reason, tone: 'warning' })
+    setMount(mountStatus())
+  }
+  /**
+   * Carry out the switch the confirmation was asked about: the dialog's 切换 and the banner's action
+   * both end here.
+   */
+  const confirmMount = () => {
+    const next = pendingMount
+    setPendingMount('')
+    setShowMount(false)
+    if (next !== '') pickMount(next)
+  }
+  /**
+   * Ask before moving the panel, or answer why the pick cannot be honoured.
+   *
+   * The question goes to the shell's dialog when this host publishes one, and to its banner when it does
+   * not — the banner is where this panel already reports, and a standing question there is dismissed by
+   * the same click outside that closes a popover, so the cancel needs no button of its own. A host this
+   * deployment cannot provide is answered by the banner too, and that one fades by itself.
+   * @param next - the host the user picked.
+   */
+  const askMount = (next) => {
+    if (next === mount.effective) return
+    if (!(next === 'native' ? mount.nativeReady : mount.betterReady)) {
+      // Refused now rather than after the click: the reason belongs to the moment the user asked, and a
+      // host that cannot take the panel is never recorded as the choice. The switch produces that reason
+      // itself, in one place.
+      pickMount(next)
+      return
+    }
+    if (hostDialog() !== null) { setPendingMount(next); return }
+    notices.say({
+      text: mountSwitchTitle(next, betterBuild(ctx)),
+      action: { prefix: ACTION_PREFIX, label: '切换' },
+      persist: true,
+    }, () => { setShowMount(false); pickMount(next) })
+  }
   // Screenshot viewport: zoom and pan share one atomic state (cursor-anchored zoom updates both).
   const [shotView, setShotView] = useState({ zoom: 1, x: 0, y: 0 })
   const shotBoxRef = useRef(null)
@@ -89,7 +233,9 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   const logBox = useRef(null)
 
   const pushLog = (kind, text) => {
-    const line = `${new Date().toLocaleTimeString()} ${text}`
+    // Stored raw: the renderer turns the CLI's colour escapes into styled runs, so a tool that
+    // colours its progress shows those colours instead of a stray `[36m`.
+    const line = `${new Date().toLocaleTimeString()} ${String(text)}`
     setLogs((prev) => [...prev.slice(-200), { kind, text: line }])
   }
   const clearLogs = () => setLogs([])
@@ -515,8 +661,11 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
       setBusy('')
     }
   }
+  // One global install at a time: this panel's one-click install and the banner's action rewrite the
+  // same global tree, so neither may start while the other runs.
+  const installing = busy === 'cli' || busy === 'cli-up'
   const installCli = async () => {
-    if (busy === 'cli') return
+    if (installing) return
     setBusy('cli')
     try {
       const v = await rpc('deveco.install')
@@ -578,12 +727,14 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
     }
   }
 
-  // Update devecocli (devecocli update) so an outdated CLI can be fixed in one click.
-  const updateCli = async () => {
-    if (busy === 'cli-up') return
+  // Update devecocli: the check names the build its channel points at, and the banner's own action runs
+  // this install. The channel travels with the notice rather than being read here: a standing banner can
+  // outlive a change of this setting, and it must install what its own sentence said.
+  const updateCli = async (named?: string) => {
+    if (installing) return
     setBusy('cli-up')
     try {
-      const v = await rpc('deveco.update')
+      const v = await rpc('deveco.update', { channel: named || cliChannel })
       pushLog(v.code === 0 ? 'ok' : 'err', `${v.note}\n${v.output}`)
       if (v.code === 0) {
         const t = await rpc('toolchain', { refresh: true })
@@ -597,23 +748,133 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
     }
   }
 
+  /**
+   * The check reports through the shell's banner, which is not part of this panel: ask the host what
+   * the chosen channel points at and hand the answer to the notice source.
+   */
+  const askUpdateCli = async () => {
+    if (busy !== '') return
+    setBusy('cli-plan')
+    try {
+      notices.show(await rpc('deveco.plan', { channel: cliChannel }))
+    } catch (error) {
+      notices.fail(error)
+      pushLog('err', `无法确认更新目标:${error.message}`)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  // The banner's action installs, and the banner can outlive the render that raised it, so the run is
+  // refreshed after every render. This panel instance owns the store while it is mounted: a host switch
+  // can hold two panels for a moment, and the retiring one's cleanup must not clear what the arriving
+  // one published.
+  useEffect(() => { notices.own(owner) })
+  useEffect(() => { notices.setInstallRunner(updateCli) })
+  useEffect(() => () => { notices.release(owner) }, [])
+  // The banner follows this column rather than the middle of the window, and only the panel knows
+  // which node that is. It is fixed near the window top either way; this only moves it sideways.
+  //
+  // Nothing clears the anchor here: `release` does, and it is guarded by ownership. A switch holds two
+  // panels for a moment, and an unguarded clear from the retiring one would centre the arriving one's
+  // banner on the window instead of its column.
+  useEffect(() => { notices.setAnchor(panelRef.current) }, [])
+
   // ── Render ──────────────────────────────────────────────────────────
   const nodes = []
+  // The shell's dialog, read once per render: only a mount confirmation needs it.
+  const dialog = hostDialog()
   // Header
-  nodes.push(h('div', { key: 'head', style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 } },
+  nodes.push(h('div', { key: 'headWrap', style: { position: 'relative' } },
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 } },
     h('span', { style: { width: 20, height: 20, display: 'inline-flex', color: s.accent } }, h(Icon, { src: IC.emulator, size: 20 })),
-    h('div', { style: { flex: 1 } },
-      h('div', { style: { fontSize: 14, fontWeight: 600 } }, '鸿蒙模拟器'),
-      h('div', { style: { fontSize: 11, color: s.muted } }, 'DevEco 部署控制台')),
-    h(Btn, { icon: IC.refresh, ghost: true, disabled: busy === 'refresh', onClick: () => refresh(true), title: '刷新' }, '刷新'),
-  ))
+    h('div', { style: { flex: 1, fontSize: 15, fontWeight: 600, whiteSpace: 'nowrap' } }, '鸿蒙模拟器'),
+    // One tight cluster: the two header actions read as a pair, not as two corners.
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 2, flex: '0 0 auto' } },
+      h(Btn, {
+        icon: IC.refresh, ghost: true, disabled: busy === 'refresh', title: '刷新',
+        style: { padding: '6px 8px' }, onClick: () => refresh(true),
+      }, '刷新'),
+      h(Btn, {
+        icon: IC.settings,
+        ghost: true,
+        // The tooltip names what the button opens, which is the popover's own title.
+        title: '设置',
+        style: { padding: '6px 6px', ...(showMount ? { color: s.accent } : undefined) },
+        onClick: () => { setShowMount((open) => !open) },
+      }))),
+    // Anchored under the header row, over the panel's own scroll area; its scrim closes it.
+    showMount ? h(Popover, {
+      key: 'mountPopover',
+      onClose: () => { setShowMount(false) },
+    },
+      // Title, top-left: this popover is where the panel's set-once preferences live. The three sizes
+      // here are the shell's own settings scale — a row label is 14, its control 13, its description 12
+      // (see ui-permission-presets) — so the popover reads as one level of the shell rather than a flat
+      // block of small print.
+      h('div', { style: { fontSize: 14, fontWeight: 600, marginBottom: 10 } }, '设置'),
+      // One row: what the choice binds, then the capsule naming both hosts inside itself. It wraps when
+      // the column cannot hold both, so the capsule moves under the label instead of leaving the panel.
+      h('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 6 } },
+        h('span', { style: { flex: 1, fontSize: 14, whiteSpace: 'nowrap' } }, '挂载方式'),
+        h(Segmented, {
+          value: mount.effective,
+          options: [
+            // Each half names a host, and each tooltip names the package behind it: the built-in
+            // right column (`@deepseek-ai/dsh-client-ui-sidebar-right`, scope dropped) and the
+            // third-party workbench (`dsh-better-sidebar`), whose own registration id is shorter.
+            { value: 'native', label: '内置右侧栏', title: 'dsh-client-ui-sidebar-right', disabled: !mount.nativeReady },
+            { value: 'better', label: 'better-sidebar', title: 'dsh-better-sidebar', disabled: !mount.betterReady },
+          ],
+          // Picking a half asks first: the shell's dialog carries the consequences when this host has
+          // one, and its banner asks the same question when it does not — see `askMount`.
+          onChange: (next) => { askMount(next) },
+        })),
+      // The confirmation, in the shell's own layer: portaled to the body, centered, with the shell's own
+      // scrim and Escape handling. A card nested in this popover would be a box inside a box, and the row
+      // below already says how the panel comes back, so the body carries only what is being accepted.
+      pendingMount === '' || dialog === null ? null : h(dialog.Modal, {
+        key: 'mountConfirm',
+        open: true,
+        title: mountSwitchTitle(pendingMount, betterBuild(ctx)),
+        closeLabel: '关闭',
+        onClose: () => setPendingMount(''),
+        footer: h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
+          h(Btn, { ghost: true, style: { padding: '4px 10px' }, onClick: () => setPendingMount('') }, '取消'),
+          h(Btn, { primary: true, style: { padding: '4px 12px' }, onClick: confirmMount }, '切换')),
+      }, h('div', { style: { fontSize: 12, lineHeight: 1.7 } }, mountSwitchNote())),
+      h('div', { style: { fontSize: 12, color: s.faint, marginTop: 2, lineHeight: 1.6 } }, mountDetail(mount)),
+      // A second setting, separated so the two do not read as one block: which channel the panel's
+      // 更新 button takes devecocli from. Shown only while the CLI is there to upgrade.
+      tc && tc.devecoCliJs ? h('div', { key: 'cliChannel', style: { borderTop: `1px solid ${s.border}`, marginTop: 8, paddingTop: 8 } },
+        // The row explains itself: the label names the channel setting, each option's tooltip names the
+        // channel it selects, and the version check's own tooltip names the channel it will read. A
+        // caption saying which features consult it would only repeat that, in the reader's way.
+        h('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 } },
+          h('span', { style: { flex: 1, fontSize: 14, whiteSpace: 'nowrap' } }, 'devecocli 更新通道'),
+          h(Segmented, {
+            value: cliChannel,
+            options: [
+              { value: 'stable', label: 'stable', title: 'stable:厂商稳定通道' },
+              { value: 'latest', label: 'latest', title: 'latest:最新发布通道' },
+            ],
+            onChange: (next) => pickCliChannel(next),
+          }))) : null,
+      mount.reason ? h('div', { style: { fontSize: 12, color: s.faint, marginTop: 4, lineHeight: 1.6 } }, mount.reason) : null,
+    ) : null))
 
-  // devecocli version row (one-click update; keeps CLI and IDE toolchains in sync)
+  // devecocli version row: the installed version, and the check that reports which build the chosen
+  // channel points at. What the check finds is reported by the shell's own banner (`shell.overlay`),
+  // not by anything this panel draws: it needs no placement, no scrim and no closing, and it carries
+  // the install as the sentence's own continuation.
   if (tc && tc.devecoCliJs) {
-    nodes.push(h('div', { key: 'cliVer', style: { display: 'flex', alignItems: 'center', gap: 6, margin: '-4px 0 8px', fontSize: 11, color: s.faint } },
-      h('span', null, `devecocli ${tc.devecoCliVersion || '版本未知'}`),
-      h(Btn, { ghost: true, disabled: busy !== '', onClick: updateCli, style: { padding: '2px 8px' } }, busy === 'cli-up' ? '更新中…' : '更新'),
-    ))
+    nodes.push(h('div', { key: 'cliVer', style: { position: 'relative', margin: '-4px 0 8px' } },
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: s.faint } },
+        h('span', null, `devecocli ${tc.devecoCliVersion || '版本未知'}`),
+        h(Btn, {
+          ghost: true, disabled: busy !== '', onClick: askUpdateCli, style: { padding: '2px 8px' },
+          title: `检查 @deveco/deveco-cli@${cliChannel} 的最新版本`,
+        }, busy === 'cli-plan' ? '检查中…' : '版本检查'))))
   }
 
   // Toolchain banners so a missing CLI surfaces before the user clicks anything
@@ -621,7 +882,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
     if (!tc.devecoCliJs) nodes.push(h('div', { key: 'warnCli', style: warnBox },
       h('div', null, '未检测到 devecocli:启动/部署功能不可用。'),
       h('div', { style: { fontSize: 11, marginTop: 2, marginBottom: 6, opacity: .85 } }, '建议安装 @deveco/deveco-cli(仅覆盖 CLI;hdc/模拟器仍需安装 DevEco Studio SDK 并设置 DEVECO_SDK_HOME)。'),
-      h(Btn, { secondary: true, disabled: busy === 'cli', onClick: installCli }, busy === 'cli' ? '安装中…' : '一键安装 devecocli')))
+      h(Btn, { secondary: true, disabled: installing, onClick: installCli }, busy === 'cli' ? '安装中…' : '一键安装 devecocli')))
     if (!tc.hdcExe) nodes.push(h('div', { key: 'warnHdc', style: warnBox }, '未检测到 hdc:请设置环境变量 DEVECO_SDK_HOME(指向 DevEco Studio SDK 目录)后重启 dsh web。'))
   }
 
@@ -640,9 +901,11 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
       h(Btn, { icon: IC.stop, dangerSolid: true, disabled: busy !== '', onClick: emuStop }, '停止')),
     h('div', { style: row },
       h('span', { style: label }, '状态'),
-      selInst ? h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: selToneColor } },
+      // A value, so it reads at the size values read at — it used to sit at hint size beside a 12px
+      // button, which made the state of the emulator the smallest thing on its own row.
+      selInst ? h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: selToneColor } },
         h('span', { style: { width: 8, height: 8, borderRadius: '50%', background: selToneColor } }),
-        selTone.label) : h('span', { style: { fontSize: 11, color: s.faint } }, '未实例'),
+        selTone.label) : h('span', { style: { fontSize: 12, color: s.faint } }, '未实例'),
       h('div', { style: { flex: 1 } }),
       h(Btn, { secondary: true, disabled: busy !== '', onClick: checkReady, title: '检测模拟器串号是否已上线' }, '检测就绪'),
       h(Btn, { ghost: true, disabled: busy !== '', onClick: toggleManual }, showManual ? '收起手动输入' : '手动输入'),
@@ -767,7 +1030,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   // Debug output
   nodes.push(h('div', { key: 'logWrap', style: { ...card, marginTop: 4, padding: 8, marginBottom: 0 } },
     h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 } },
-      h('span', { style: { fontSize: 11, color: s.muted, letterSpacing: '.06em', textTransform: 'uppercase' } }, '调试输出'),
+      h('span', { style: { fontSize: 13, fontWeight: 600, color: s.fg } }, '调试输出'),
       h('div', { style: { flex: 1 } }),
       h(Btn, { ghost: true, onClick: clearLogs, style: { padding: '2px 8px' } }, '清空')),
     h('pre', {
@@ -776,7 +1039,12 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
       },
     }, logs.length === 0
       ? '(构建/部署信息将显示在这里)'
-      : logs.map((l, i) => h('div', { key: i, style: logLine(l.kind) }, l.text))),
+      // Each entry renders as styled runs, so a CLI's own colour survives into the log.
+      : logs.map((l, i) => h('div', { key: i, style: logLine(l.kind) },
+        ansiRuns(l.text).map((run, at) => h('span', {
+          key: at,
+          style: { color: run.color, fontWeight: run.bold ? 600 : undefined },
+        }, run.text))))),
   ))
 
   if (tcMsg) nodes.push(h('div', { key: 'tcerr', style: { color: s.danger, fontSize: 12, marginTop: 6 } }, tcMsg))
@@ -825,6 +1093,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   // Frosted glass only on the panel content: the theme base color stays translucent
   // and blurs whatever sits behind it, so text stays readable without a black slab.
   return h('div', {
+    ref: panelRef,
     onMouseDown: onPanelDragStart,
     style: {
       padding: 8, color: s.fg, height: '100%', overflowY: 'auto', boxSizing: 'border-box',

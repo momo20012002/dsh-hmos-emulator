@@ -7,7 +7,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { loggerOf } from '../src/log.js'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { deflateSync } from 'node:zlib'
@@ -15,7 +15,10 @@ import {
   ancestorLabels,
   capLines,
   changedCodeFiles,
+  cliChannel,
   cliFromWrapper,
+  cliInstallSpec,
+  cliUpdateChannel,
   decodePng,
   diffLines,
   diffPng,
@@ -24,6 +27,7 @@ import {
   layoutJson,
   lintScope,
   nodeLabel,
+  npmInvocation,
   pageMissingHint,
   pageTitle,
   parseLintTable,
@@ -39,6 +43,7 @@ import {
   stepSummary,
   stripAnsi,
   untrackedCodeFiles,
+  versionFromOutput,
 } from '../lib/index.js'
 
 /**
@@ -755,6 +760,20 @@ describe('PNG encode and crop', () => {
 })
 
 describe('cliFromWrapper', () => {
+  /** Windows only creates a file symlink with Developer Mode or elevation; the case skips without it. */
+  const CAN_SYMLINK = (() => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-link-probe-'))
+    try {
+      writeFileSync(join(dir, 'target.js'), '// entry')
+      symlinkSync(join(dir, 'target.js'), join(dir, 'link'))
+      return true
+    } catch {
+      return false
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })()
+
   it('traces an npm wrapper to the CLI entry it would run, and refuses what it cannot trace', () => {
     const npmRoot = mkdtempSync(join(tmpdir(), 'dsh-cli-'))
     const entry = join(npmRoot, 'node_modules', '@deveco', 'deveco-cli', 'dist', 'cli.js')
@@ -775,6 +794,60 @@ describe('cliFromWrapper', () => {
     expect(cliFromWrapper(join(npmRoot, 'missing-cli.js'))).toBeUndefined()
     expect(cliFromWrapper(join(tmpdir(), 'no-such-npm-root', 'devecocli.cmd'))).toBeUndefined()
     rmSync(npmRoot, { recursive: true, force: true })
+  })
+
+  it('follows the package\'s own bin field, which moved between CLI versions', () => {
+    // 1.3.0-stable shipped `dist/cli.js`; 1.3.4 ships `cli.js` at the package root and declares it in
+    // `bin`. A hardcoded layout would lose the CLI on the upgrade, so the manifest is authoritative.
+    const npmRoot = mkdtempSync(join(tmpdir(), 'dsh-cli-bin-'))
+    const pkgDir = join(npmRoot, 'node_modules', '@deveco', 'deveco-cli')
+    mkdirSync(pkgDir, { recursive: true })
+    const entry = join(pkgDir, 'cli.js')
+    writeFileSync(entry, '// entry')
+    writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name: '@deveco/deveco-cli', version: '1.3.4', bin: { devecocli: 'cli.js' } }))
+    expect(cliFromWrapper(join(npmRoot, 'devecocli.cmd'))).toBe(entry)
+    // A manifest whose bin points nowhere falls back to the known layouts instead of giving up.
+    rmSync(entry)
+    const legacy = join(pkgDir, 'dist', 'cli.js')
+    mkdirSync(dirname(legacy), { recursive: true })
+    writeFileSync(legacy, '// legacy entry')
+    expect(cliFromWrapper(join(npmRoot, 'devecocli.cmd'))).toBe(legacy)
+    // An unparseable manifest is not fatal either.
+    writeFileSync(join(pkgDir, 'package.json'), '{ not json')
+    expect(cliFromWrapper(join(npmRoot, 'devecocli.cmd'))).toBe(legacy)
+    rmSync(npmRoot, { recursive: true, force: true })
+  })
+
+  it('reads the launcher\'s own target, which no package layout can describe', () => {
+    // pnpm and friends install the package outside `<binDir>/node_modules`, and the launcher is the
+    // only thing that knows where it went — so its target is read before any directory is guessed.
+    const binDir = mkdtempSync(join(tmpdir(), 'dsh-cli-shim-'))
+    const entry = join(binDir, 'store', '@deveco', 'deveco-cli', 'cli.js')
+    mkdirSync(dirname(entry), { recursive: true })
+    writeFileSync(entry, '// entry')
+    // No package.json anywhere: this path must not need one.
+    const cmd = join(binDir, 'devecocli.cmd')
+    writeFileSync(cmd, '@ECHO off\r\n"%_prog%" "%dp0%\\store\\@deveco\\deveco-cli\\cli.js" %*\r\n')
+    expect(cliFromWrapper(cmd)).toBe(entry)
+    const ps1 = join(binDir, 'devecocli.ps1')
+    writeFileSync(ps1, '& "node" "$PSScriptRoot\\store\\@deveco\\deveco-cli\\cli.js" $args')
+    expect(cliFromWrapper(ps1)).toBe(entry)
+    // A launcher naming a path that is not there names nothing: no guessing, no wrong answer.
+    const stale = join(binDir, 'stale.cmd')
+    writeFileSync(stale, '"%dp0%\\gone\\@deveco\\deveco-cli\\cli.js" %*')
+    expect(cliFromWrapper(stale)).toBeUndefined()
+    rmSync(binDir, { recursive: true, force: true })
+  })
+
+  it.skipIf(!CAN_SYMLINK)('follows a POSIX launcher symlink to the entry it points at', () => {
+    const binDir = mkdtempSync(join(tmpdir(), 'dsh-cli-link-'))
+    const entry = join(binDir, 'lib', 'node_modules', '@deveco', 'deveco-cli', 'cli.js')
+    mkdirSync(dirname(entry), { recursive: true })
+    writeFileSync(entry, '// entry')
+    const link = join(binDir, 'devecocli')
+    symlinkSync(entry, link, 'file')
+    expect(cliFromWrapper(link)).toBe(entry)
+    rmSync(binDir, { recursive: true, force: true })
   })
 })
 
@@ -807,6 +880,75 @@ describe('host logger', () => {
     } finally {
       errors.mockRestore()
       warns.mockRestore()
+    }
+  })
+})
+
+describe('devecocli upgrade target', () => {
+  it('follows the channel the installed build came from', () => {
+    // The vendor's `devecocli update` only ever targets latest, so the channel has to come from the
+    // installed version string: a stable build must stay on stable.
+    expect(cliChannel('1.3.0-stable')).toBe('stable')
+    expect(cliChannel('1.3.4')).toBe('latest')
+    expect(cliChannel('')).toBe('latest')
+    expect(cliChannel(null)).toBe('latest')
+    expect(cliChannel(undefined)).toBe('latest')
+    expect(cliInstallSpec('stable')).toBe('@deveco/deveco-cli@stable')
+    expect(cliInstallSpec('latest')).toBe('@deveco/deveco-cli@latest')
+  })
+
+  it('prefers an explicitly chosen channel over the installed one', () => {
+    // The panel's channel switch is the only way to move a machine between the two lines on purpose.
+    expect(cliUpdateChannel('1.3.0-stable', 'latest')).toBe('latest')
+    expect(cliUpdateChannel('1.3.4', 'stable')).toBe('stable')
+    // Without a choice, the install's own channel is kept — including for junk payloads.
+    expect(cliUpdateChannel('1.3.0-stable', undefined)).toBe('stable')
+    expect(cliUpdateChannel('1.3.4', '')).toBe('latest')
+    expect(cliUpdateChannel('1.3.4', 'next')).toBe('latest')
+    expect(cliUpdateChannel(undefined, null)).toBe('latest')
+  })
+
+  it('reads the version out of a version call, and reads none when there is none', () => {
+    // runCli merges stderr into the buffer the answer arrives on, so a tool's warnings can sit above
+    // it: the version is found by shape, never by being the first line (which once showed a warning as
+    // the update target). The same rule serves the CLI probe and the registry answer, so the two are
+    // comparable when the check decides whether anything is installed.
+    expect(versionFromOutput('npm warn Unknown env config "manage-package-manager-versions". This will stop working in the next major version of npm.\n1.3.4')).toBe('1.3.4')
+    expect(versionFromOutput('1.3.0-stable')).toBe('1.3.0-stable')
+    expect(versionFromOutput('v1.3.4\r\n')).toBe('1.3.4')
+    expect(versionFromOutput('npm warn deprecated prebuild-install@7.1.3: no longer maintained\n\n1.3.4\n')).toBe('1.3.4')
+    // A warning that merely mentions a version is not an answer, and a warning glued to the answer
+    // without a newline is deliberately not recovered either: the looser rule that would read it also
+    // reads `needs node 1.2.3`, and a wrong target version is worse than making the user check again.
+    expect(versionFromOutput('npm warn something needs node 1.2.3 or newer')).toBe('')
+    expect(versionFromOutput('npm warn deprecated prebuild-install@7.1.3: no longer maintained1.3.4')).toBe('')
+    expect(versionFromOutput('')).toBe('')
+    expect(versionFromOutput(undefined)).toBe('')
+  })
+
+  it('runs npm through the stand-in when one is configured, and through the shell on Windows', () => {
+    const saved = process.env.DSH_HMOS_NPM
+    const savedComspec = process.env.ComSpec
+    try {
+      process.env.DSH_HMOS_NPM = 'C:/tmp/fake-npm.js'
+      expect(npmInvocation('@deveco/deveco-cli@stable')).toEqual({
+        file: process.execPath,
+        args: ['C:/tmp/fake-npm.js', 'install', '-g', '@deveco/deveco-cli@stable'],
+      })
+      delete process.env.DSH_HMOS_NPM
+      process.env.ComSpec = 'C:/Windows/System32/cmd.exe'
+      const invocation = npmInvocation('@deveco/deveco-cli@latest')
+      if (process.platform === 'win32') {
+        // `npm` is a .cmd on Windows, so it needs the shell; the spec stays one argv entry.
+        expect(invocation).toEqual({ file: 'C:/Windows/System32/cmd.exe', args: ['/c', 'npm', 'install', '-g', '@deveco/deveco-cli@latest'] })
+      } else {
+        expect(invocation).toEqual({ file: 'npm', args: ['install', '-g', '@deveco/deveco-cli@latest'] })
+      }
+    } finally {
+      if (saved === undefined) delete process.env.DSH_HMOS_NPM
+      else process.env.DSH_HMOS_NPM = saved
+      if (savedComspec === undefined) delete process.env.ComSpec
+      else process.env.ComSpec = savedComspec
     }
   })
 })

@@ -343,7 +343,7 @@ describe.skipIf(!CAN_SPAWN)('panel-only routes', () => {
     delete process.env.DSH_FAKE_DEVICES
   })
 
-  it('queues the check result only after a check, and reports an update honestly', async () => {
+  it('queues the check result only after a check, and upgrades devecocli on the installed channel', async () => {
     // Nothing has run a check in this fresh plugin instance, so the panel's "send to AI" must be
     // refused with the reason rather than queueing an empty notice.
     expect((await post('lint.notify', {})).status).toBe(400)
@@ -352,10 +352,63 @@ describe.skipIf(!CAN_SPAWN)('panel-only routes', () => {
     const queued = await call('lint.notify', { sessionId: 'session-1' })
     expect(queued.sent).toBe(true)
     expect(queued.bytes).toBeGreaterThan(0)
-    process.env.DSH_FAKE_UPDATE_CODE = '1'
-    const updated = await call('deveco.update')
-    expect(updated.code).toBe(1)
-    expect(updated.note).toContain('更新失败')
-    delete process.env.DSH_FAKE_UPDATE_CODE
+    // The upgrade follows the channel the installed build came from: `devecocli update` itself only
+    // ever targets `latest`, so the plugin drives npm with a pinned dist-tag instead.
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-hmos-npm-'))
+    const argvLog = join(dir, 'argv.log')
+    process.env.DSH_HMOS_DEVECO_CLI = FAKE_CLI
+    process.env.DSH_HMOS_NPM = join(NOT_A_PROJECT, 'fake-npm.js')
+    process.env.DSH_FAKE_NPM_LOG = argvLog
+    try {
+      process.env.DSH_FAKE_VERSION = '1.3.0-stable'
+      // The confirmation is planned first: it names the build the chosen channel points at, and the
+      // registry answer turns that tag into a version — even when npm's own warning sits above it,
+      // because runCli merges stderr into the same buffer the answer arrives on.
+      process.env.DSH_FAKE_NPM_VIEW_WARN = 'npm warn Unknown env config "manage-package-manager-versions". This will stop working in the next major version of npm.'
+      const plan = await call('deveco.plan', { channel: 'latest' })
+      expect(plan).toMatchObject({ channel: 'latest', spec: '@deveco/deveco-cli@latest', installed: '1.3.0-stable', target: '1.3.4', checked: true })
+      delete process.env.DSH_FAKE_NPM_VIEW_WARN
+      // A lookup the host cannot complete reads as unknown, never as a version.
+      process.env.DSH_FAKE_NPM_VIEW_CODE = '1'
+      const unknown = await call('deveco.plan', {})
+      expect(unknown).toMatchObject({ checked: false, target: null, channel: 'stable' })
+      delete process.env.DSH_FAKE_NPM_VIEW_CODE
+      const stable = await call('deveco.update')
+      expect(stable.code).toBe(0)
+      expect(stable.channel).toBe('stable')
+      expect(stable.spec).toBe('@deveco/deveco-cli@stable')
+      expect(stable.note).toContain('@deveco/deveco-cli@stable')
+      // The stable install must not be moved onto the latest line.
+      process.env.DSH_FAKE_VERSION = '1.3.4'
+      const latest = await call('deveco.update')
+      expect(latest.channel).toBe('latest')
+      expect(latest.spec).toBe('@deveco/deveco-cli@latest')
+      // An explicit choice — the panel's channel switch — wins over the installed one, which is the
+      // only way a stable machine can be moved onto latest on purpose.
+      process.env.DSH_FAKE_VERSION = '1.3.0-stable'
+      const forced = await call('deveco.update', { channel: 'latest' })
+      expect(forced.channel).toBe('latest')
+      expect(forced.spec).toBe('@deveco/deveco-cli@latest')
+      // Every call the plugin made, in order: the two plans ask the registry, the updates install.
+      expect(readFileSync(argvLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))).toEqual([
+        ['view', '@deveco/deveco-cli@latest', 'version'],
+        ['view', '@deveco/deveco-cli@stable', 'version'],
+        ['install', '-g', '@deveco/deveco-cli@stable'],
+        ['install', '-g', '@deveco/deveco-cli@latest'],
+        ['install', '-g', '@deveco/deveco-cli@latest'],
+      ])
+      // A failed install is reported as a failure, not as a silent success.
+      process.env.DSH_FAKE_UPDATE_CODE = '1'
+      const updated = await call('deveco.update')
+      expect(updated.code).toBe(1)
+      expect(updated.note).toContain('更新失败')
+    } finally {
+      delete process.env.DSH_FAKE_UPDATE_CODE
+      delete process.env.DSH_FAKE_VERSION
+      delete process.env.DSH_FAKE_NPM_LOG
+      delete process.env.DSH_HMOS_NPM
+      delete process.env.DSH_HMOS_DEVECO_CLI
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

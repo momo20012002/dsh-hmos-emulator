@@ -35,6 +35,9 @@ await build({
 })
 
 // Client: wrapped as a window.__ModuleLoader__.load artifact (the DSH convention).
+// Externals are the modules the shell's module table resolves at runtime — react, the shared UI
+// primitives the overlay banner comes from, and the client store the two settings persist through —
+// so nothing of theirs is bundled here.
 const clientBanner = `window.__ModuleLoader__.load({ id: ${JSON.stringify(ID)}, factory: (require) => { const module = { exports: {} }; const exports = module.exports; Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });`
 const clientFooter = `return module.exports; } });`
 await build({
@@ -43,7 +46,7 @@ await build({
   format: 'cjs',
   platform: 'browser',
   bundle: true,
-  external: ['react'],
+  external: ['react', '@deepseek-ai/dsh-client-ui-primitives', '@deepseek-ai/dsh-client-store'],
   target: 'es2020',
   banner: { js: clientBanner },
   footer: { js: clientFooter },

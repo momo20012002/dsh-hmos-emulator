@@ -1,5 +1,5 @@
 import { IC } from './icons.js'
-/** Style atoms and the four shared UI pieces: Icon, Btn, Card, Dropdown. */
+/** Style atoms and the shared UI pieces: Icon, Btn, Segmented, Card, Dropdown. */
 export const { createElement: h, useState } = require('react')
 /**
  * Brand and action colors are deliberately fixed, not themed: the primary and destructive button
@@ -57,11 +57,79 @@ export function Btn({ children, icon, primary, secondary, danger, dangerSolid, g
     disabled, onClick, title,
   }, icon ? h(Icon, { src: icon, size: 15 }) : null, children)
 }
+/**
+ * Capsule choice for a preference with two named states: both labels live inside the pill, the
+ * chosen half carries the accent, and an unavailable half greys out on its own. A half may carry a
+ * longer tooltip so a short on-screen label can still name its full subject on hover.
+ */
+export function Segmented({ value, options, onChange }: {
+  value?: string
+  options: { value: string; label: string; title?: string; disabled?: boolean }[]
+  onChange?: (value: string) => void
+}) {
+  return h('div', {
+    style: {
+      display: 'inline-flex', alignItems: 'center', flex: '0 0 auto', padding: 2, gap: 2,
+      borderRadius: 999, border: `1px solid ${s.border}`, background: s.bg2,
+    },
+  }, options.map((option) => {
+    const active = option.value === value
+    return h('button', {
+      key: option.value,
+      type: 'button',
+      disabled: option.disabled,
+      'aria-pressed': active,
+      title: option.title === undefined ? option.label : option.title,
+      onClick: () => { if (!option.disabled && !active && onChange) onChange(option.value) },
+      style: {
+        // The shell's own control size in a settings row: 13 at weight 500 (see ui-permission-presets'
+        // selector). It sits under a 14px label and above a 12px description, which is what gives the
+        // popover a level of its own instead of one flat size.
+        border: 'none', borderRadius: 999, padding: '4px 10px', fontSize: 13, fontWeight: 500, lineHeight: 1.4,
+        font: 'inherit', whiteSpace: 'nowrap', transition: 'background .15s, color .15s',
+        background: active ? ACTION_PRIMARY : 'transparent',
+        color: active ? '#fff' : s.muted,
+        cursor: option.disabled || active ? 'default' : 'pointer',
+        opacity: option.disabled ? .5 : 1,
+      },
+    }, option.label)
+  }))
+}
+
+/**
+ * An anchored floating panel: the shell's surface for a set-once preference, hung off the button that
+ * opens it (the header's gear) and sized for its rows. `onClose` adds the scrim — clicking outside
+ * calls it — while the panel itself stays interactive above the scrim.
+ *
+ * The width is the one the widest row needs (a 14px label beside a 13px two-half capsule) and it is
+ * capped at whatever the column offers, so a narrow column shrinks the panel instead of letting a row
+ * hang out of it.
+ */
+export function Popover({ onClose, children }: { onClose?: () => void; children?: any }) {
+  return h('div', null,
+    onClose ? h('div', { style: { position: 'fixed', inset: 0, zIndex: 20 }, onClick: onClose }) : null,
+    h('div', {
+      style: {
+        position: 'absolute', right: 0, top: '100%', marginTop: -6, width: 'min(322px, 100%)', zIndex: 21,
+        boxSizing: 'border-box',
+        background: s.solid, border: `1px solid ${s.border}`, borderRadius: 10, padding: 10,
+        boxShadow: 'var(--dsw-shadow-lv3, 0 8px 24px rgba(0,0,0,.45))',
+      },
+    }, children))
+}
+
 /** Card block. action renders at the right of the title row; style overrides the card. */
+/**
+ * Card block. action renders at the right of the title row; style overrides the card.
+ *
+ * The title is the level between the panel's own name (15) and its row labels (12): 13 at weight 600 in
+ * the foreground colour. It used to be smaller than those labels — 11, muted, with tracking meant for
+ * Latin small caps — which inverted the hierarchy on every card.
+ */
 export function Card({ title, action, style, children }: { title?: string; action?: any; style?: any; children?: any }) {
   return h('div', { style: { ...card, ...style } },
     (title || action) ? h('div', { style: { display: 'flex', alignItems: 'center', marginBottom: 8 } },
-      title ? h('span', { style: { fontSize: 11, color: s.muted, letterSpacing: '.06em', textTransform: 'uppercase' } }, title) : null,
+      title ? h('span', { style: { fontSize: 13, fontWeight: 600, color: s.fg } }, title) : null,
       h('div', { style: { flex: 1 } }),
       action || null) : null,
     children)

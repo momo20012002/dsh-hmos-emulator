@@ -5,9 +5,13 @@ export interface CtxLogger { error(...args: any[]): void; warn(...args: any[]): 
 
 export interface Ctx {
   get(name: string): any
-  effect(callback: () => any, label?: string): void
-  /** Run `callback` in a fiber that lives only while every named service is published. */
-  inject(names: string[], callback: (scoped: Ctx) => void): void
+  /** Returns the disposer Cordis owns for the effect, when the runtime hands one back. */
+  effect(callback: () => any, label?: string): any
+  /**
+   * Run `callback` in a fiber that lives only while every named service is published. The returned
+   * fiber is disposable, which is how a host switch tears the previous registration down.
+   */
+  inject(names: string[], callback: (scoped: Ctx) => void): any
   logger?: CtxLogger
 }
 

@@ -1,5 +1,5 @@
-import { dirname, join } from 'node:path'
-import { existsSync } from 'node:fs'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 /**
  * Locating and running the external CLIs (devecocli, hdc): path probes, wrapper unwrapping,
@@ -23,22 +23,161 @@ export function whichFirst(bare) {
   }
 }
 
+/**
+ * The JS entry inside one installed copy of @deveco/deveco-cli.
+ *
+ * The package's own `bin` field is authoritative, and the layout has moved before: 1.3.0-stable
+ * shipped `dist/cli.js`, 1.3.4 ships `cli.js` at the package root. Reading the manifest handles both
+ * and whatever npm writes next; the two known layouts stay as a fallback for an unreadable manifest.
+ */
+export function cliEntryIn(pkgDir) {
+  const manifest = join(pkgDir, 'package.json')
+  if (existsSync(manifest)) {
+    try {
+      const parsed = JSON.parse(readFileSync(manifest, 'utf8'))
+      const bin = typeof parsed?.bin === 'string' ? parsed.bin : parsed?.bin?.devecocli
+      for (const field of [bin, parsed?.main]) {
+        if (typeof field !== 'string' || field === '') continue
+        const candidate = join(pkgDir, field)
+        if (existsSync(candidate)) return candidate
+      }
+    } catch { /* an unreadable manifest falls through to the known layouts */ }
+  }
+  for (const layout of [join('dist', 'cli.js'), 'cli.js']) {
+    const candidate = join(pkgDir, layout)
+    if (existsSync(candidate)) return candidate
+  }
+  return undefined
+}
+
+/** The JS/TS entry extensions this plugin can hand to node. */
+const CLI_ENTRY_EXT = /\.(c|m)?(js|ts)$/i
+
+/**
+ * The entry a launcher file names by itself — no assumption about where the package lives.
+ *
+ * Windows: npm writes `devecocli.cmd` / `.ps1` whose text spells the target out relative to the
+ * launcher (`%dp0%`, `$PSScriptRoot`). POSIX: `bin/devecocli` is a symlink to the entry. Reading that
+ * first also covers layouts npm's own answers do not describe (pnpm's global dirs, a moved prefix),
+ * and it needs neither the package manifest nor a directory guess.
+ * @param shimPath - the launcher found on PATH.
+ * @returns the entry it launches, or undefined when the file names none (never a guessed path).
+ */
+export function cliTargetFromShim(shimPath: string): string | undefined {
+  const dir = dirname(shimPath)
+  try {
+    const real = realpathSync(shimPath)
+    if (real !== shimPath && existsSync(real) && CLI_ENTRY_EXT.test(real)) return real
+  } catch { /* not a link, or unreadable: the launcher text is the other way to know */ }
+  let text = ''
+  try { text = readFileSync(shimPath, 'utf8') } catch { return undefined }
+  const named = text.match(/["']?([^"'\s]*@deveco[\\/]deveco-cli[\\/][^"'\s]+\.(?:c|m)?(?:js|ts))["']?/i)
+  if (named === null) return undefined
+  const spelled = named[1].replace(/%~?dp0%?/gi, dir).replace(/\$PSScriptRoot/gi, dir)
+  const target = isAbsolute(spelled) ? spelled : resolve(dir, spelled)
+  return existsSync(target) ? target : undefined
+}
+
 /** Derive the @deveco/deveco-cli node entry from an npm global root. */
 export function cliUnderNpmRoot(npmRoot) {
   if (!npmRoot) return undefined
-  const cli = join(npmRoot, 'node_modules', '@deveco', 'deveco-cli', 'dist', 'cli.js')
-  return existsSync(cli) ? cli : undefined
+  return cliEntryIn(join(npmRoot, 'node_modules', '@deveco', 'deveco-cli'))
+}
+
+/** A released devecocli line: the npm dist-tag an upgrade follows. */
+export type CliChannel = 'stable' | 'latest'
+
+/**
+ * Which channel an upgrade follows, derived from what is installed: a `-stable` build stays on the
+ * vendor's stable tag, anything else follows `latest`.
+ *
+ * `devecocli update` cannot express this — its help reads "Update deveco-cli to latest" and it takes
+ * no options — so the channel has to be pinned through npm to be selectable.
+ */
+export function cliChannel(installedVersion: string | null | undefined): CliChannel {
+  return typeof installedVersion === 'string' && installedVersion.includes('-stable') ? 'stable' : 'latest'
+}
+
+/** The npm spec a global install/upgrade uses for one channel. */
+export function cliInstallSpec(channel: CliChannel): string {
+  return `@deveco/deveco-cli@${channel}`
+}
+
+/**
+ * The channel an upgrade actually installs: an explicit request wins, and without one the channel
+ * the installed build came from is kept.
+ * @param installedVersion - what `devecocli --version` reported, if it answered at all.
+ * @param requested - a channel chosen in the panel, or anything else for "follow the install".
+ * @returns the channel to install from.
+ */
+export function cliUpdateChannel(installedVersion: string | null | undefined, requested?: unknown): CliChannel {
+  return requested === 'stable' || requested === 'latest' ? requested : cliChannel(installedVersion)
+}
+
+/**
+ * How a global npm install runs on this machine.
+ *
+ * `DSH_HMOS_NPM` points at a stand-in program run by node, mirroring how `DSH_HMOS_DEVECO_CLI`
+ * stands in for the CLI: it lets a test assert the exact argv of a path that would otherwise reach
+ * the registry. Windows needs the shell (`npm` is a `.cmd` there), and the spec is a single argv
+ * entry, so no shell quoting can reach it.
+ */
+/**
+ * The version a version call reports, or '' when it reports none.
+ *
+ * `runCli` merges stderr into the same buffer, so a tool's warnings can sit above its answer, and the
+ * answer is therefore found by shape rather than by being the first line. Only a line that is a
+ * version by itself counts: a looser rule would also accept the version inside a warning ("… needs
+ * node 1.2.3"), which is the one outcome worth avoiding — a wrong target version the panel would
+ * offer to install. A warning written without a newline can therefore hide the answer, and that
+ * costs a retry, not a wrong answer.
+ * @param output - the merged stdout/stderr of a version call.
+ * @returns the version with any `v` prefix dropped, or '' when none could be read.
+ */
+export function versionFromOutput(output: unknown): string {
+  for (const line of String(output).split(/\r?\n/)) {
+    const match = line.trim().match(/^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/)
+    if (match !== null) return match[1]
+  }
+  return ''
+}
+
+/**
+ * How an npm command runs on this machine.
+ *
+ * `DSH_HMOS_NPM` points at a stand-in program run by node, mirroring how `DSH_HMOS_DEVECO_CLI`
+ * stands in for the CLI: it lets a test assert the exact argv of a path that would otherwise reach
+ * the registry. Windows needs the shell (`npm` is a `.cmd` there), and every argument is its own
+ * argv entry, so no shell quoting can reach them.
+ * @param args - the npm arguments, e.g. `['install', '-g', spec]`.
+ * @returns the file to spawn, and its argv.
+ */
+export function npmCommand(args: string[]): { file: string; args: string[] } {
+  const override = process.env.DSH_HMOS_NPM || ''
+  if (override !== '') return { file: process.execPath, args: [override, ...args] }
+  return process.platform === 'win32'
+    ? { file: process.env.ComSpec || 'cmd.exe', args: ['/c', 'npm', ...args] }
+    : { file: 'npm', args }
+}
+
+/** The global install that puts one channel in place. */
+export function npmInvocation(spec: string): { file: string; args: string[] } {
+  return npmCommand(['install', '-g', spec])
 }
 
 /**
  * The JS entry a devecocli path stands for. `npm i -g` writes `devecocli.cmd` / `.ps1` / an
- * extension-less sh shim side by side in the global bin dir, and each is only a launcher whose last
- * line runs `<its dir>/node_modules/@deveco/deveco-cli/dist/cli.js`. Node cannot spawn such a
- * wrapper — a `.cmd` needs a shell, and going through cmd.exe would re-quote the Chinese labels and
- * regexes this plugin passes — so a wrapper is traced to its target and never executed.
+ * extension-less sh shim side by side in the global bin dir, and each is only a launcher that runs
+ * the package's own entry. The launcher's own target is read first ({@link cliTargetFromShim}), and
+ * only when it names none does this fall back to the package directory's manifest
+ * ({@link cliEntryIn}). Node cannot spawn such a wrapper — a `.cmd` needs a shell, and going through
+ * cmd.exe would re-quote the Chinese labels and regexes this plugin passes — so a wrapper is traced
+ * to its target, never run.
  */
 export function cliFromWrapper(candidate: string): string | undefined {
-  if (/\.(c|m)?(js|ts)$/i.test(candidate)) return existsSync(candidate) ? candidate : undefined
+  if (CLI_ENTRY_EXT.test(candidate)) return existsSync(candidate) ? candidate : undefined
+  const named = cliTargetFromShim(candidate)
+  if (named !== undefined) return named
   const dir = dirname(candidate)
   return cliUnderNpmRoot(dir) ?? cliUnderNpmRoot(dirname(dir))
 }
@@ -51,7 +190,7 @@ export function devecoCliHint(): string {
   const traced = cliFromWrapper(explicit)
   if (traced === explicit) return ''
   if (traced) return ` DSH_HMOS_DEVECO_CLI 指向的是 npm 包装脚本(垫片),已按它的目标改用 JS 入口:${traced}`
-  return ` 🔴 DSH_HMOS_DEVECO_CLI 指向的不是 devecocli 的 JS 入口(npm 包装脚本的目录下也没有 node_modules/@deveco/deveco-cli/dist/cli.js),已忽略并回退自动探测:${explicit}`
+  return ` 🔴 DSH_HMOS_DEVECO_CLI 指向的不是 devecocli 的 JS 入口(npm 包装脚本的目录下也找不到 @deveco/deveco-cli 的入口),已忽略并回退自动探测:${explicit}`
 }
 
 export function resolveDevecoCli() {
