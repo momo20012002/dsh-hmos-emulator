@@ -1,18 +1,24 @@
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { AUTO_SHOT_PREFIX, TOOL_SHOT_PREFIX, pruneAutoShots, pruneToolShots, readDataUrl } from './shots.js'
 import { countChangedCode, hashTree } from './git.js'
-import { cliChannel, cliInstallSpec, cliUpdateChannel, devecoCliHint, ensureImageReady, npmCommand, npmInvocation, resolveDevecoCli, resolveHdc, runCli, runCliStream, versionFromOutput, waitDeviceReady } from './toolchain.js'
+import { cliChannel, cliInstallSpec, cliUpdateChannel, devecoCliHint, ensureImageReady, firstRunningSerial, npmCommand, npmInvocation, resolveDevecoCli, resolveHdc, runCli, runCliStream, versionFromOutput, waitDeviceReady } from './toolchain.js'
 import { headText, tailText } from './text.js'
 import { LINT_LABELS, fixStats, lintOutcome, parseLintSummary } from './parsers/lint.js'
 import { PROJECT_MARK, normalizeDir, readModules, scanProjects } from './workspace.js'
+import { absoluteLocal, localPathFor } from './local-path.js'
 /**
  * The HTTP API behind the panel: toolchain, emulator, device, project, lint and deploy methods,
  * plus the background the model tools read through. Nothing here touches a model tool schema.
  */
 /** How long a version check may take in total: a probe plus a registry lookup, both under one cap. */
 const PLAN_BUDGET_MS = 25000
+/**
+ * The emulator controls the panel offers: one entry each, nothing to type in. The controls that take
+ * values (battery, geolocation, sensor) are deliberately absent — a dropdown cannot fill arguments.
+ */
+const EMU_CONTROLS = ['rotate', 'power', 'volume']
 // Latest code-check result. It is cached here on every check, and only handed to the model
 // when the user presses "send to AI" (lint.notify) — never automatically. The queued notice also
 // remembers which session asked for it: this module is shared by every session, so without that
@@ -205,6 +211,36 @@ export function createApi() {
     return { code: result.code, timedOut: result.timedOut, aborted: result.aborted, output: result.output }
   }
 
+  /**
+   * The emulator controls that need nothing typed in: rotate, power and volume. They are the three the
+   * panel can put behind one dropdown and one button, and the argv is the model tool's byte for byte —
+   * the spec asserts it, which is what keeps the two in step without sharing code. The controls that
+   * take values (battery, geolocation, sensor) stay with the tool, where their arguments can be filled.
+   */
+  api['emu.control'] = async (payload, _res, ctl) => {
+    const cli = resolveDevecoCli()
+    if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
+    const action = String(payload?.action || '')
+    if (!EMU_CONTROLS.includes(action)) {
+      throw Object.assign(new Error(`不支持的控制动作:${action || '(空)'}`), { code: 'bad-request' })
+    }
+    const target = typeof payload?.target === 'string' && payload.target.trim() ? payload.target.trim() : null
+    if (!target) throw Object.assign(new Error('缺少模拟器实例名(先执行“列出模拟器”查看实例名)'), { code: 'bad-request' })
+    const argv = ['emulator', action, '--target', target]
+    if (action !== 'power') {
+      const direction = String(payload?.direction || '')
+      const allowed = action === 'rotate' ? ['left', 'right'] : ['up', 'down']
+      // The CLI narrows each verb to its own two choices; saying so here answers with the wording the
+      // panel shows, instead of a refusal that only makes sense after reading the CLI's own help.
+      if (!allowed.includes(direction)) {
+        throw Object.assign(new Error(`${action === 'rotate' ? '旋转' : '音量'}只支持 ${allowed.join(' 或 ')}`), { code: 'bad-request' })
+      }
+      argv.push(direction)
+    }
+    const result = await runCli([process.execPath, cli, ...argv], { timeoutMs: 60000, signal: ctl?.signal })
+    return { code: result.code, timedOut: result.timedOut, aborted: result.aborted, action, target, output: result.output }
+  }
+
   api.devices = async () => {
     const cli = resolveDevecoCli()
     const devices = []
@@ -337,8 +373,14 @@ export function createApi() {
     }
     const device = typeof payload?.device === 'string' && payload.device.trim() ? payload.device.trim() : null
     if (!device) throw Object.assign(new Error('请先“刷新设备”并选择一个模拟器设备'), { code: 'bad-request' })
-    // Pre-check that the device is online (cross-platform) before a build that takes minutes.
-    if (cli) {
+    // Three panel intents share this route: clean (no device, no module), build only, and the full
+    // run. Only the run needs a device, so only the run takes the pre-check and the device argument.
+    const mode = payload?.mode === 'clean' ? 'clean'
+      : payload?.mode === 'skipbuild' || payload?.skipBuild === true ? 'skipbuild'
+        : payload?.buildOnly === true ? 'build' : 'run'
+    // Pre-check that the device is online (cross-platform) before a build that takes minutes. The two
+    // modes that reach a device need it; the two that never touch one must not be blocked by it.
+    if ((mode === 'run' || mode === 'skipbuild') && cli) {
       const probe = await runCli([process.execPath, cli, 'device', 'list', '--format', 'json'], { timeoutMs: 15000, signal: ctl?.signal })
       let online = false
       if (probe.code === 0) {
@@ -351,19 +393,38 @@ export function createApi() {
         throw Object.assign(new Error(`设备 ${device} 当前未在线——请先点“启动”模拟器(或连接设备),再点“扫描可用”后重试`), { code: 'device-offline' })
       }
     }
-    // Multi-module: choose --module (entry when present, else the first module).
+    // Multi-module: choose --module (entry when present, else the first module). The panel may also
+    // narrow a build to several modules; the single `module` stays for callers written before it.
     const modules = readModules(project)
-    // A panel that switched project can still be holding the previous project's module name, so a
-    // name this project does not have is refused instead of being handed to the build.
-    if (payload?.module !== undefined && payload?.module !== null && !modules.includes(String(payload.module))) {
+    const asked = Array.isArray(payload?.modules) ? payload.modules.map((m) => String(m)).filter(Boolean) : []
+    // A panel that switched project can still be holding the previous project's module names, so a
+    // name this project does not have is refused instead of being handed to the build. An unreadable
+    // module list (no marker, or JSON5 the reader does not cover) cannot judge them, so it does not.
+    const unknown = modules.length ? asked.filter((m) => !modules.includes(m)) : []
+    if (unknown.length) {
+      throw Object.assign(new Error(`模块“${unknown.join('、')}”不属于该工程(可选:${modules.join('、')})`), { code: 'bad-request' })
+    }
+    if (modules.length && payload?.module !== undefined && payload?.module !== null && !modules.includes(String(payload.module))) {
       throw Object.assign(new Error(`模块“${payload.module}”不属于该工程(可选:${modules.join('、') || '无'})`), { code: 'bad-request' })
     }
-    const chosen = payload?.module ? String(payload.module) : modules.includes('entry') ? 'entry' : modules[0]
-    const cmd = [process.execPath, cli, 'run', '--device', device]
-    if (chosen) cmd.push('--module', chosen)
+    const chosen = asked[0] ?? (payload?.module ? String(payload.module) : modules.includes('entry') ? 'entry' : modules[0])
+    const cmd = mode === 'clean'
+      ? [process.execPath, cli, 'build', 'clean']
+      : mode === 'build'
+        ? [process.execPath, cli, 'build', ...(asked.length ? ['--modules', ...asked] : chosen ? ['--module', chosen] : [])]
+        : [process.execPath, cli, 'run', '--device', device, ...(chosen ? ['--module', chosen] : []), ...(mode === 'skipbuild' ? ['--skip-build'] : [])]
+    // A log line is a record, so the run says where it deployed; build and clean have no device to name.
+    const what = mode === 'clean'
+      ? '清理构建'
+      : mode === 'build'
+        ? `构建${chosen ? `(模块 ${chosen})` : ''}`
+        : `${mode === 'skipbuild' ? '部署(不构建)' : '构建并部署'}到 ${device}${chosen ? `(模块 ${chosen})` : ''}`
     const note = (code: number | null) => code === 0
-      ? '构建、安装、启动完成。(hvigor 的 “No signingConfigs” 只是警告,模拟器可装未签名 debug 包)'
-      : '部署失败,请查看上方输出;常见原因:签名未配置 / 设备未就绪。'
+      ? (mode === 'run'
+        ? '构建、安装、启动完成。(hvigor 的 “No signingConfigs” 只是警告,模拟器可装未签名 debug 包)'
+        : mode === 'skipbuild'
+          ? '安装、启动完成,未重新构建。'
+          : mode === 'build' ? '构建完成,未安装到设备。' : '构建产物已清理。')      : `${mode === 'clean' ? '清理' : mode === 'skipbuild' ? '部署' : '构建'}失败,请查看上方输出${mode === 'run' || mode === 'skipbuild' ? ';常见原因:签名未配置 / 设备未就绪' : ''}。`
     // Streaming: push to res as the command runs (live panel log).
     // cache-control must include no-transform: DSH webServer enables gzip (compression
     // middleware), which proxies chunked text/plain through zlib without flushing, so logs
@@ -371,7 +432,7 @@ export function createApi() {
     // that keeps the response identity and line-by-line.
     if (res && typeof res.write === 'function') {
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache, no-transform' })
-      res.write(`[dsh-hmos-emulator] 部署 ${device}${chosen ? `(模块 ${chosen})` : ''}\n`)
+      res.write(`[dsh-hmos-emulator] ${what}\n`)
       const { code, aborted } = await runCliStream(cmd, {
         cwd: project,
         timeoutMs: 20 * 60 * 1000,
@@ -379,9 +440,9 @@ export function createApi() {
         onChunk: (chunk) => { try { res.write(chunk) } catch { /* client disconnected */ } },
       })
       // -2 is the route's "did not finish" marker; the panel renders it as such either way.
-      res.write(`\n${aborted ? '已取消:构建进程已终止,设备已释放。' : note(code)}\n`)
-      res.write(`[HMOS_EXIT]=${aborted ? -2 : code ?? -1}\n`)
-      res.end()
+      writeTail(res,
+        `\n${aborted ? `已取消:${mode === 'run' || mode === 'skipbuild' ? '进程已终止,设备已释放。' : '进程已终止。'}` : note(code)}\n`,
+        `[HMOS_EXIT]=${aborted ? -2 : code ?? -1}\n`)
       return
     }
     // Non-streaming path (backwards compatible / tests): buffer the whole output.
@@ -393,6 +454,98 @@ export function createApi() {
       output: result.output,
       note: result.aborted ? '已取消:构建进程已终止。' : note(result.code),
     }
+  }
+
+  /**
+   * One device log snapshot for the panel — the command the model tool runs, with the same flags, so
+   * both sides read a device the same way. A snapshot returns, which is what makes it safe to run from
+   * a request; following a log is a different thing and does not belong here. The spec asserts the
+   * argv, which is what keeps this in step with tools/log.ts without the two sharing code.
+   */
+  api['log.snapshot'] = async (payload) => {
+    const cli = resolveDevecoCli()
+    if (!cli) throw Object.assign(new Error('未检测到 devecocli,请先在设置中指定入口'), { code: 'no-cli' })
+    const device = typeof payload?.device === 'string' && payload.device.trim() ? payload.device.trim() : await firstRunningSerial(cli)
+    if (!device) throw Object.assign(new Error('尚无运行中的模拟器,请先启动一个实例'), { code: 'device-offline' })
+    const tail = Number.isFinite(Number(payload?.tail)) ? Math.max(1, Math.min(500, Number(payload.tail))) : 50
+    const argv = ['log', '--device', device, '--tail', String(tail)]
+    if (typeof payload?.level === 'string' && payload.level) argv.push('--level', String(payload.level))
+    if (typeof payload?.bundle === 'string' && payload.bundle.trim()) argv.push('--bundle-name', payload.bundle.trim())
+    if (typeof payload?.keyword === 'string' && payload.keyword.trim()) argv.push('--keyword', payload.keyword.trim())
+    // `from` is an offset back from now ("5m", "30s", "120"), not a clock time; the model tool calls it
+    // `since` and the CLI flag is `--from`.
+    if (typeof payload?.from === 'string' && payload.from.trim()) argv.push('--from', payload.from.trim())
+    // No signal: a snapshot is capped at a minute by the CLI's own timeout, and the panel is the only
+    // caller, so there is nothing here that a cancelled turn needs to interrupt.
+    const r = await runCli([process.execPath, cli, ...argv], { timeoutMs: 60000 })
+    return { code: r.code, output: r.output, device, tail, timedOut: r.timedOut === true }
+  }
+
+  /**
+   * Follow a device log until the panel stops asking. This is the one method that never ends on its
+   * own, so its lifetime belongs to the caller: the panel aborts its fetch, the request closes, and the
+   * route's cancellation signal kills the CLI. A cap sits underneath, because a forgotten tab must not
+   * leave a log-producing process running all day.
+   */
+  /**
+   * The closing lines of a streamed route. A client that has already gone away destroys the response, and
+   * writing to a destroyed one raises an error on it — unhandled, that escapes the route instead of ending
+   * it quietly. Streaming routes hand their last lines to this instead of touching `res` directly.
+   */
+  function writeTail(res: any, ...chunks: string[]): void {
+    try {
+      if (res.writableEnded || res.destroyed) return
+      for (const chunk of chunks) res.write(chunk)
+      res.end()
+    } catch { /* the client is gone; there is nobody left to tell */ }
+  }
+
+  api['log.follow'] = async (payload, res, ctl) => {
+    const cli = resolveDevecoCli()
+    if (!cli) throw Object.assign(new Error('未检测到 devecocli,请先在设置中指定入口'), { code: 'no-cli' })
+    const device = typeof payload?.device === 'string' && payload.device.trim() ? payload.device.trim() : await firstRunningSerial(cli)
+    if (!device) throw Object.assign(new Error('尚无运行中的模拟器,请先启动一个实例'), { code: 'device-offline' })
+    if (!res || typeof res.write !== 'function') {
+      throw Object.assign(new Error('日志监听需要流式响应'), { code: 'bad-request' })
+    }
+    const argv = ['log', '--device', device, '--follow']
+    if (typeof payload?.level === 'string' && payload.level) argv.push('--level', String(payload.level))
+    if (typeof payload?.bundle === 'string' && payload.bundle.trim()) argv.push('--bundle-name', payload.bundle.trim())
+    if (typeof payload?.keyword === 'string' && payload.keyword.trim()) argv.push('--keyword', payload.keyword.trim())
+    // A live follow takes the same narrowing as a snapshot, so the panel's filter row means one thing
+    // for both buttons. `--from` is accepted here too (it emits the recent tail before following).
+    if (typeof payload?.from === 'string' && payload.from.trim()) argv.push('--from', payload.from.trim())
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache, no-transform' })
+    res.write(`[dsh-hmos-emulator] 实时监听 ${device} 的日志(最长 30 分钟)\n`)
+    const { code, aborted, timedOut } = await runCliStream([process.execPath, cli, ...argv], {
+      timeoutMs: 30 * 60 * 1000,
+      signal: ctl?.signal,
+      onChunk: (chunk) => { try { res.write(chunk) } catch { /* client disconnected */ } },
+    })
+    // The cap is a third outcome: reported as an ordinary end it looks exactly like the device dropping the
+    // stream, and the reader has no way to know the follow was cut short rather than finished.
+    writeTail(res,
+      `\n${aborted ? '已停止监听。' : timedOut ? '已达 30 分钟上限,监听已停止。' : `监听结束(退出码 ${code ?? '未知'})。`}\n`,
+      `[HMOS_EXIT]=${aborted ? -2 : code ?? -1}\n`)
+  }
+
+  /**
+   * Save the panel's own log box to a file. The panel holds the lines — they arrived as streamed CLI
+   * output — so this route is only the writer: the folder arrives with the request (the panel picked it),
+   * the name carries the device and the moment, and the colours are already gone by the time it gets here.
+   */
+  api['log.export'] = async (payload) => {
+    const dir = typeof payload?.dir === 'string' && payload.dir.trim() ? payload.dir.trim() : null
+    if (!dir || !existsSync(dir)) throw Object.assign(new Error('缺少保存文件夹(导出时选择)'), { code: 'bad-request' })
+    const text = typeof payload?.text === 'string' ? payload.text : ''
+    if (!text.trim()) throw Object.assign(new Error('面板暂无日志可导出'), { code: 'bad-request' })
+    const device = typeof payload?.device === 'string' && payload.device.trim() ? payload.device.trim() : ''
+    const safe = device.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 24)
+    const file = join(dir, `hmos-log-${Date.now()}${safe ? `-${safe}` : ''}.log`)
+    try { writeFileSync(file, text, 'utf8') } catch (error) {
+      throw Object.assign(new Error(`写入日志失败:${error instanceof Error ? error.message : String(error)}`), { code: 'fs-error' })
+    }
+    return { path: file, bytes: Buffer.byteLength(text, 'utf8') }
   }
 
   api['device.ready'] = async (payload) => {
@@ -413,6 +566,61 @@ export function createApi() {
       } catch { /* parse failed: treat as offline */ }
     }
     return { online, serial, devices }
+  }
+
+  /**
+   * One file transfer for the panel — the command the model tool builds, so the human and the model
+   * move a file the same way. `send` uploads one local file, `recv` pulls one back; a local path that
+   * is not absolute is read against the workspace, which is what lets "save it into the workspace" be
+   * a plain name. Both argvs are asserted by the spec, as they are for the other shared commands.
+   */
+  api['device.file'] = async (payload) => {
+    const direction = String(payload?.direction || '')
+    // The direction decides which command this is, so an unknown one is answered before anything is
+    // probed: a device lookup that ran first would report "no device" to a caller whose mistake was
+    // the direction, and it would cost a spawn on every such call.
+    if (direction !== 'send' && direction !== 'recv') {
+      throw Object.assign(new Error(`不支持的文件方向:${direction || '(空)'}`), { code: 'bad-request' })
+    }
+    const cli = resolveDevecoCli()
+    if (!cli) throw Object.assign(new Error('未找到 devecocli(见工具链提示)'), { code: 'toolchain' })
+    const device = typeof payload?.device === 'string' && payload.device.trim() ? payload.device.trim() : null
+    if (!device) throw Object.assign(new Error('缺少目标设备串号(先在“设备操作”选择在线设备)'), { code: 'bad-request' })
+    const remote = typeof payload?.remote === 'string' ? payload.remote.trim() : ''
+    const asked = typeof payload?.local === 'string' ? payload.local.trim() : ''
+    if (!remote) throw Object.assign(new Error('缺少设备上的路径'), { code: 'bad-request' })
+    if (!asked) throw Object.assign(new Error(direction === 'send' ? '缺少要发送的本地文件' : '缺少保存位置'), { code: 'bad-request' })
+    const root = typeof payload?.root === 'string' && payload.root.trim() ? payload.root.trim() : ''
+    // Only a relative local path needs the workspace; an absolute one is its own answer.
+    if (!absoluteLocal(asked) && !root) {
+      throw Object.assign(new Error('缺少工作区根目录(相对路径需要它)'), { code: 'bad-request' })
+    }
+    const local = localPathFor(asked, root || process.cwd())
+    // Uploading a path that is not there is worth saying before a device round trip; a download into a
+    // directory that does not exist yet is not the caller's problem to solve.
+    if (direction === 'send') {
+      const stat = existsSync(local) ? statSync(local) : null
+      if (!stat) throw Object.assign(new Error(`本地文件不存在:${local}`), { code: 'bad-request' })
+      // The panel's own chooser picks directories only, so handing one in is the easy mistake to make.
+      if (stat.isDirectory()) throw Object.assign(new Error(`本地路径是个文件夹,请补上文件名:${local}`), { code: 'bad-request' })
+    }
+    if (direction === 'recv') {
+      // Wrapped: an unreadable parent (a wrong drive, a path under a file) is the caller's mistake and must
+      // come back as a readable 400, not an untagged filesystem throw that the transport turns into a 500.
+      const parent = dirname(local)
+      try { mkdirSync(parent, { recursive: true }) } catch (error) {
+        throw Object.assign(new Error(`无法创建保存目录 ${parent}:${error instanceof Error ? error.message : String(error)}`), { code: 'fs-error' })
+      }
+    }
+    const argv = direction === 'send'
+      ? ['device', 'file', 'send', '--device', device, local, remote]
+      : ['device', 'file', 'recv', '--device', device, remote, local]
+    const r = await runCli([process.execPath, cli, ...argv], { timeoutMs: 5 * 60 * 1000 })
+    if (r.code !== 0) {
+      const why = r.timedOut ? '超时' : `退出码 ${r.code}`
+      throw Object.assign(new Error(`传输失败(${why}):\n${tailText(r.output, 6)}`), { code: 'transfer-failed' })
+    }
+    return { direction, device, local, remote, output: r.output }
   }
 
   // Screenshot through devecocli ui screenshot (official command, not hdc). Passing a full

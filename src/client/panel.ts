@@ -27,6 +27,77 @@ export const warnBox = { background: 'rgba(229,72,77,.12)', border: `1px solid $
 // Keep the last screenshot in module scope so it survives a panel remount.
 export let lastShot = null
 
+/**
+ * The emulator control group. One entry per action that needs no value typed in — the controls that
+ * take arguments (battery, geolocation, sensor) belong to the model tool, where a form can fill them.
+ * Rotate and volume keep the two directions the CLI itself narrows them to.
+ */
+const EMU_CONTROLS = [
+  { value: 'rotate:left', label: '旋转:左' },
+  { value: 'rotate:right', label: '旋转:右' },
+  { value: 'power', label: '电源' },
+  { value: 'volume:up', label: '音量:加' },
+  { value: 'volume:down', label: '音量:减' },
+]
+/** The chosen control's own wording, so the log line names what was run rather than its argv. */
+const emuControlLabel = (value: string) => EMU_CONTROLS.find((c) => c.value === value)?.label || value
+
+/**
+ * The four commands the deploy button can run. The wording is the one the host's log header uses, so the
+ * menu option, the button, the panel's own log line and the host's line all say the same words for the
+ * same action. Their titles say what the user gets, not which CLI call runs underneath.
+ */
+const DEPLOY_COMMANDS = [
+  { value: 'run', label: '构建并部署', title: '编译工程,再安装并启动到所选设备' },
+  { value: 'build', label: '构建', title: '只编译工程,不安装到设备' },
+  { value: 'skipbuild', label: '部署', title: '不重新编译,把已有产物安装并启动' },
+  { value: 'clean', label: '清理构建', title: '删除该工程的构建产物,不安装、不启动' },
+]
+/** The chosen command's own wording, for the chevron's hover text. */
+const deployCommandLabel = (value: string) => DEPLOY_COMMANDS.find((c) => c.value === value)?.label || value
+
+/**
+ * The device's own two top-level user folders — the ones the Files app lists first, written out in full so
+ * a menu row says exactly what it fills in. Both were measured on a real device: an existing path answers
+ * 0, a missing one answers 1 with "no such file or directory".
+ */
+const DEVICE_PATH_PRESETS = [
+  '/storage/media/100/local/files/Docs/Download',
+  '/storage/media/100/local/files/Docs/Documents',
+]
+
+/** How many log characters one export may carry: the request body is capped, and CJK is three bytes each. */
+const LOG_EXPORT_MAX = 200_000
+
+/** How many paths each side offers back. Enough to cover the usual few, short of a history. */
+const RECENT_PATH_MAX = 6
+
+/**
+ * The log narrowing choices, one source of truth: the dropdowns render them and the line each read prints
+ * names the current pick in these same words, so the banner matches the control that produced it. The
+ * severity labels are all nouns; 严重 is the settled name for the CLI's fatal level.
+ */
+const LOG_LEVELS = [
+  // An explicit "no filter" row, the same shape the time list uses: without it a level, once picked, could not be
+  // undone — and 调试 in particular matches nothing on a device that never emits D lines. Each label carries the
+  // CLI's own code after a plain space: the letter is what every log row shows, and brackets around one letter
+  // only add width in a control this narrow.
+  { value: '', label: '全部级别' },
+  { value: 'D', label: '调试 D' }, { value: 'I', label: '信息 I' },
+  { value: 'W', label: '警告 W' }, { value: 'E', label: '错误 E' }, { value: 'F', label: '严重 F' },
+]
+const LOG_TIMES = [
+  // Measured: without --from the CLI returns what the device still holds, from its very first line on. The slot
+  // is therefore a lower bound set to "earliest available" — not "no filter", and not "since boot" as a promise.
+  // Mainstream log UIs leave this option in English (Kibana's Quick select / Relative), so the word has to carry
+  // the meaning on its own: 最早 pairs with the visible label 起始时间 and does not repeat it.
+  { value: '', label: '最早' },
+  { value: '30s', label: '30 秒前' },
+  { value: '5m', label: '5 分钟前' },
+  { value: '30m', label: '30 分钟前' },
+  { value: '60m', label: '1 小时前' },
+]
+
 /** The shell's dialog, as this panel uses it. */
 interface HostDialog {
   readonly Modal: (props: any) => unknown
@@ -119,10 +190,55 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   const [projectOptions, setProjectOptions] = useState([])
   const [modules, setModules] = useState([])
   const [moduleSel, setModuleSel] = useState(() => lsGet(lsModuleKey(project)))
+  // Build options: stop after the build, or remove what the last build produced. Both are remembered,
+  // because a choice about how to build is the same choice on the next visit.
+  // What the big button will do. One value, so the button can always name the action it runs; the older
+  // boolean is only read once, to keep a panel that had "只构建" switched on from losing that choice.
+  const [deployAction, setDeployAction] = useState(() => {
+    const saved = lsGet('deployAction')
+    return saved === 'build' || saved === 'clean' ? saved : (lsGet('buildOnly') === '1' ? 'build' : 'run')
+  })
+  // Device log snapshot: what to ask for, remembered like the other panel choices.
+  const [logLevel, setLogLevel] = useState(() => lsGet('logLevel'))
+  const [logBundle, setLogBundle] = useState(() => lsGet('logBundle'))
+  const [logKeyword, setLogKeyword] = useState(() => lsGet('logKeyword'))
+  // An offset back from now ("5m"), which is what the CLI's --from takes — not a clock time.
+  const [logFrom, setLogFrom] = useState(() => lsGet('logFrom'))
+  const [logLines, setLogLines] = useState(() => lsGet('logLines') || '50')
+  // Following ends only when someone ends it, so the panel holds the request that owns it.
+  const followCtl = useRef(null)
+  // A panel that goes away must not leave the device streaming: unmount ends any live follow.
+  useEffect(() => () => { followCtl.current?.abort() }, [])
+  const [following, setFollowing] = useState(false)
+  // Narrowing a log happens in the card's own conditions block, which is always on show, so there is
+  // nothing to fold and no state to remember.
   const [emuRaw, setEmuRaw] = useState(() => { const cached = lsGetJson('emuRaw'); return typeof cached === 'string' ? cached : '' })
   const [emuTarget, setEmuTarget] = useState('')
   const [instances, setInstances] = useState(() => lsGetJson('instances') || [])
   const [instanceSel, setInstanceSel] = useState(() => lsGet('instance'))
+  // Which emulator control the dropdown is on: remembered like the other panel choices, so a repeated
+  // action (say, several volume steps) does not need re-picking after a reload.
+  const [emuControl, setEmuControl] = useState(() => lsGet('emuControl') || EMU_CONTROLS[0].value)
+  // The file transfer's two ends, remembered like the other panel choices: pushing the same file twice,
+  // or pulling from the same directory again, is the common case. There is no direction state — the two
+  // buttons are the direction, which is what lets each field keep one meaning for good.
+  const [fileLocal, setFileLocal] = useState(() => lsGet('fileLocal'))
+  const [fileRemote, setFileRemote] = useState(() => lsGet('fileRemote'))
+  // Device paths that worked, newest first. devecocli cannot list the device, so this is what keeps a
+  // sandbox path from having to be typed from memory every time.
+  const [recentRemote, setRecentRemote] = useState(() => {
+    const cached = lsGetJson('recentRemote')
+    return Array.isArray(cached) ? cached.filter((p) => typeof p === 'string' && p !== '') : []
+  })
+  // The same for the local end: a workspace path is easier to pick back up than to retype, and the field
+  // stays typeable for everything the list does not hold.
+  const [recentLocal, setRecentLocal] = useState(() => {
+    const cached = lsGetJson('recentLocal')
+    return Array.isArray(cached) ? cached.filter((p) => typeof p === 'string' && p !== '') : []
+  })
+  // The operation card folds: its rows are reached far less often than the deploy, and folding keeps the
+  // panel short. Collapsed until asked for, and the choice is remembered like the other panel switches.
+  const [showDevOps, setShowDevOps] = useState(() => lsGet('showDevOps') === '1')
   const [shot, setShotState] = useState(lastShot)
   const [copied, setCopied] = useState(false)
   const [lintReady, setLintReady] = useState(false)
@@ -252,7 +368,9 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
    * `force` re-probes the toolchain (the cache in the host is what makes this cheap).
    */
   const refresh = async (force = false) => {
-    if (busy === 'refresh') return
+    // Any running action owns the busy flag: a refresh started over one would clear it when it finished and
+    // silently re-enable every control that gates on it (a second deploy could then be launched).
+    if (busy) return
     setBusy('refresh')
     const toolchain = rpc('toolchain', force ? { refresh: true } : undefined)
       .then((value) => {
@@ -317,8 +435,21 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
     lsSet(lsSessionKey('project'), project)
     lsSet(lsSessionKey('scanRoot'), scanRoot)
     lsSet('instance', instanceSel)
-    lsSet(lsModuleKey(project), moduleSel)
-  }, [project, scanRoot, instanceSel, moduleSel])
+    lsSet('emuControl', emuControl)
+    lsSet('fileLocal', fileLocal)
+    lsSet('fileRemote', fileRemote)
+    lsSetJson('recentRemote', recentRemote)
+    lsSetJson('recentLocal', recentLocal)
+    lsSet('showDevOps', showDevOps ? '1' : '0')
+    // The entry module is stored where it is decided, not here: this effect runs on a project switch with
+    // the previous project's module still in state, which would overwrite the incoming project's memory.
+    lsSet('deployAction', deployAction)
+    lsSet('logLevel', logLevel)
+    lsSet('logBundle', logBundle)
+    lsSet('logKeyword', logKeyword)
+    lsSet('logFrom', logFrom)
+    lsSet('logLines', logLines)
+  }, [project, scanRoot, instanceSel, emuControl, fileLocal, fileRemote, recentRemote, recentLocal, showDevOps, deployAction, logLevel, logBundle, logKeyword, logFrom, logLines])
   // Fill the scan root from the session working directory as soon as it is known: it is an
   // optional field of the tab's scope, so on a fresh panel it can still be undefined while the
   // panel is already rendered.
@@ -442,7 +573,10 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
       const mods = info.modules || []
       setModules(mods)
       const remembered = lsGet(lsModuleKey(proj))
-      setModuleSel(() => pickModule(mods, remembered))
+      const picked = pickModule(mods, remembered)
+      // Remember what this project actually resolved to, including a fallback whose remembered name is gone.
+      if (picked) lsSet(lsModuleKey(proj), picked)
+      setModuleSel(() => picked)
       return info
     } catch { return null /* a module read failure must not block the flow */ }
   }
@@ -497,7 +631,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
       setInstances(list)
       const serial = list.find((it) => it.name === name)?.serial
       if (serial) setDevice(serial)
-      else pushLog('info', `${name} 未运行(先点“启动”),部署目标保持 ${device || '无'}`)
+      else pushLog('info', `${name} 未运行(先点“启动”),当前设备保持 ${device || '无'}`)
     } catch (error) {
       pushLog('err', `同步模拟器状态失败:${error.message}`)
     }
@@ -519,7 +653,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
       const first = list[0]
       const selName = instanceSel || (first ? first.name : '')
       if (first) setInstanceSel((prev) => prev || first.name)
-      else pushLog('info', '未扫描到可用模拟器实例(可在 DevEco Device Manager 创建;若报授权请先在终端执行 devecocli emulator license accept)')
+      else pushLog('info', '未扫描到可用模拟器实例(可在 DevEco Device Manager 创建,若报授权请先在终端执行 devecocli emulator license accept)')
       // Scanning also refreshes online devices and selects the serial of the chosen instance.
       const devList = dev.devices || []
       setDevices(devList)
@@ -580,21 +714,104 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
       setBusy('')
     }
   }
-  const deploy = async () => {
+  /**
+   * One emulator control. Nothing has to be typed in for these three verbs, which is what makes them a
+   * dropdown in the first place: the choice names the whole request, and the button runs it. The target
+   * is the device the card names, so the control acts on exactly what the row above shows — which also
+   * means it waits for the same thing the screenshot does, a device that is online.
+   */
+  const runEmuControl = async () => {
+    const target = targetDevice || ''
+    if (!target) { pushLog('err', '暂无在线设备,请先启动模拟器'); return }
+    const [action, direction] = emuControl.split(':')
+    const named = emuControlLabel(emuControl)
+    setBusy('control')
+    try {
+      const value = await rpc('emu.control', { target, action, direction: direction || undefined })
+      pushLog(value.code === 0 ? 'ok' : 'err', `${named} [${target}] 退出码=${value.code ?? '-'}${value.output ? `\n${value.output}` : ''}`)
+    } catch (error) {
+      pushLog('err', `${named}失败:${error.message}`)
+    } finally {
+      setBusy('')
+    }
+  }
+  /**
+   * Pick the local end of a transfer. The shell offers a directory chooser and nothing else — its own
+   * listing cannot even enumerate files — so this fills a folder, which is exactly what a download
+   * needs: the CLI keeps the source file's own name inside it. An upload appends the file name by hand.
+   */
+  const pickLocalPath = async () => {
+    try {
+      const ui = ctx.get('uiWorkspace')
+      if (!ui || typeof ui.pickDirectory !== 'function') { pushLog('err', '系统目录选择不可用,请直接粘贴路径'); return }
+      const picked = await ui.pickDirectory()
+      if (!picked) return
+      setFileLocal(picked)
+      pushLog('info', `已选择本地目录:${picked}`)
+    } catch (error) {
+      pushLog('err', `选择目录失败:${error.message}`)
+    }
+  }
+  /**
+   * One file in or out. The direction arrives with the press, because the button that was pressed is
+   * the direction — which is what keeps each field's meaning fixed. The local end may be relative,
+   * which the host reads against the workspace, and an empty one on a fetch means the workspace itself:
+   * measured against the CLI, which then keeps the source file's own name.
+   */
+  const runFileTransfer = async (direction: 'send' | 'recv') => {
+    const device = targetDevice || ''
+    if (!device) { pushLog('err', '暂无在线设备,请先启动模拟器'); return }
+    const remote = fileRemote.trim()
+    if (!remote) { pushLog('err', '请填写设备路径'); return }
+    const asked = fileLocal.trim() || (direction === 'recv' ? scopeCwd : '')
+    if (!asked) { pushLog('err', '请填写本地路径'); return }
+    setBusy(direction === 'send' ? 'file-send' : 'file-recv')
+    try {
+      const v = await rpc('device.file', { direction, device, local: asked, remote, root: scopeCwd })
+      // Only a path that worked is worth offering back: recording every attempt would fill the list with
+      // whatever was tried first, typo included.
+      setRecentRemote((prev) => [v.remote, ...prev.filter((p) => p !== v.remote)].slice(0, RECENT_PATH_MAX))
+      setRecentLocal((prev) => [v.local, ...prev.filter((p) => p !== v.local)].slice(0, RECENT_PATH_MAX))
+      pushLog('ok', direction === 'send'
+        ? `已上传:${v.local} → ${v.remote}`
+        : `已下载:${v.remote} → ${v.local}`)
+    } catch (error) {
+      pushLog('err', `${direction === 'send' ? '上传' : '下载'}失败:${error.message}`)
+    } finally {
+      setBusy('')
+    }
+  }
+  /**
+   * One route, three intents. The button deploys, the build-only switch stops after the build, and the
+   * clean button removes what a previous build produced. Clean touches no device, so it asks for
+   * neither an online device nor a module.
+   */
+  const runDeploy = async (mode: 'run' | 'skipbuild' | 'build' | 'clean') => {
     if (!project.trim()) { pushLog('err', '请先在“应用项目”选择项目'); return }
-    if (!targetDevice) { pushLog('err', '请先在“部署目标”选择在线设备'); return }
-    setBusy('deploy')
-    pushLog('info', `开始构建并部署 → ${project} @ ${targetDevice}(构建可能需要数分钟)`)
+    if (mode !== 'clean' && !targetDevice) { pushLog('err', '请先在“设备操作”选择在线设备'); return }
+    setBusy(mode === 'clean' ? 'clean' : 'deploy')
+    pushLog('info', mode === 'clean'
+      ? `开始清理构建 → ${project}`
+      : mode === 'build'
+        ? `开始构建 → ${project}${moduleSel ? `(模块 ${moduleSel})` : ''}(构建可能需要数分钟)`
+        : `开始构建并部署 → ${project} @ ${targetDevice}(构建可能需要数分钟)`)
     try {
       const res = await fetch(`${API}/deploy`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ projectPath: project, device: targetDevice, module: modules.length > 1 ? moduleSel : undefined }),
+        body: JSON.stringify({
+          projectPath: project,
+          device: targetDevice || undefined,
+          module: modules.length > 1 ? moduleSel : undefined,
+          buildOnly: mode === 'build',
+          skipBuild: mode === 'skipbuild',
+          mode,
+        }),
       })
       if (res.status !== 200) {
         let msg = `HTTP ${res.status}`
         try { const j = await res.json(); if (j && j.error && j.error.message) msg = j.error.message } catch { /* not JSON */ }
-        pushLog('err', `部署失败:${msg}`)
+        pushLog('err', `${mode === 'clean' ? '清理' : '构建'}失败:${msg}`)
         return
       }
       if (!res.body) { pushLog('err', '宿主未返回可读内容'); return }
@@ -618,10 +835,16 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
         for (const l of lines) flushLine(l.replace(/\r$/, ''))
       }
       if (buf.trim()) flushLine(buf.replace(/\r/g, ''))
-      // -2 is the host's marker for "cancelled and the device released", not a build failure.
-      pushLog(exitCode === 0 ? 'ok' : 'err', exitCode === 0 ? '部署完成' : exitCode === -2 ? '部署已取消(设备已释放)' : `部署结束(退出码 ${exitCode ?? '未知'})`)
+      // -2 is the host's marker for "cancelled", not a build failure. The wording follows the intent:
+      // only a deploy released a device, and only a deploy installs anything.
+      const verb = mode === 'clean' ? '清理' : '构建'
+      pushLog(exitCode === 0 ? 'ok' : 'err', exitCode === 0
+        ? mode === 'clean' ? '构建产物已清理' : mode === 'build' ? '构建完成' : '部署完成'
+        : exitCode === -2
+          ? `${verb}已取消${mode === 'run' ? '(设备已释放)' : ''}`
+          : `${verb}结束(退出码 ${exitCode ?? '未知'})`)
     } catch (error) {
-      pushLog('err', `部署失败:${error instanceof Error ? error.message : String(error)}`)
+      pushLog('err', `${mode === 'clean' ? '清理' : '构建'}失败:${error instanceof Error ? error.message : String(error)}`)
     } finally {
       setBusy('')
     }
@@ -644,7 +867,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   // Screenshot: the host runs devecocli ui screenshot and stores the PNG under
   // <workspace>/screenshots.
   const takeShot = async () => {
-    if (!targetDevice) { pushLog('err', '请先选择在线设备(部署目标)'); return }
+    if (!targetDevice) { pushLog('err', '请先选择在线设备(设备操作)'); return }
     setBusy('shot')
     try {
       const root = (scope && scope.cwd) || ''
@@ -792,7 +1015,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
     // One tight cluster: the two header actions read as a pair, not as two corners.
     h('div', { style: { display: 'flex', alignItems: 'center', gap: 2, flex: '0 0 auto' } },
       h(Btn, {
-        icon: IC.refresh, ghost: true, disabled: busy === 'refresh', title: '刷新',
+        icon: IC.refresh, ghost: true, disabled: busy !== '', title: '刷新',
         style: { padding: '6px 8px' }, onClick: () => refresh(true),
       }, '刷新'),
       h(Btn, {
@@ -841,7 +1064,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
         onClose: () => setPendingMount(''),
         footer: h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
           h(Btn, { ghost: true, style: { padding: '4px 10px' }, onClick: () => setPendingMount('') }, '取消'),
-          h(Btn, { primary: true, style: { padding: '4px 12px' }, onClick: confirmMount }, '切换')),
+          h(Btn, { primary: true, style: { padding: '4px 12px' }, onClick: confirmMount, title: '确认切换挂载方式并重挂面板' }, '切换')),
       }, h('div', { style: { fontSize: 12, lineHeight: 1.7 } }, mountSwitchNote())),
       h('div', { style: { fontSize: 12, color: s.faint, marginTop: 2, lineHeight: 1.6 } }, mountDetail(mount)),
       // A second setting, separated so the two do not read as one block: which channel the panel's
@@ -881,8 +1104,8 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   if (tc) {
     if (!tc.devecoCliJs) nodes.push(h('div', { key: 'warnCli', style: warnBox },
       h('div', null, '未检测到 devecocli:启动/部署功能不可用。'),
-      h('div', { style: { fontSize: 11, marginTop: 2, marginBottom: 6, opacity: .85 } }, '建议安装 @deveco/deveco-cli(仅覆盖 CLI;hdc/模拟器仍需安装 DevEco Studio SDK 并设置 DEVECO_SDK_HOME)。'),
-      h(Btn, { secondary: true, disabled: installing, onClick: installCli }, busy === 'cli' ? '安装中…' : '一键安装 devecocli')))
+      h('div', { style: { fontSize: 11, marginTop: 2, marginBottom: 6, opacity: .85 } }, '建议安装 @deveco/deveco-cli(仅覆盖 CLI,hdc/模拟器仍需安装 DevEco Studio SDK 并设置 DEVECO_SDK_HOME)。'),
+      h(Btn, { secondary: true, disabled: installing, onClick: installCli, title: '只安装命令行工具,SDK 与模拟器仍需 DevEco Studio' }, busy === 'cli' ? '安装中…' : '一键安装 devecocli')))
     if (!tc.hdcExe) nodes.push(h('div', { key: 'warnHdc', style: warnBox }, '未检测到 hdc:请设置环境变量 DEVECO_SDK_HOME(指向 DevEco Studio SDK 目录)后重启 dsh web。'))
   }
 
@@ -896,9 +1119,9 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
           options: instances.map((it) => ({ value: it.name, label: it.name, status: it.status })),
           onChange: pickInstance,
         }),
-        h(Btn, { icon: IC.scan, secondary: true, disabled: busy !== '', onClick: scanEmus }, busy === 'scan' ? '扫描中' : '扫描可用')),
-      h(Btn, { icon: IC.play, primary: true, disabled: busy !== '' || (!instanceSel && !emuTarget.trim()), onClick: emuStart }, busy === 'start' ? '启动中' : '启动'),
-      h(Btn, { icon: IC.stop, dangerSolid: true, disabled: busy !== '', onClick: emuStop }, '停止')),
+        h(Btn, { icon: IC.scan, secondary: true, disabled: busy !== '', onClick: scanEmus, title: '列出本机可用的模拟器实例' }, busy === 'scan' ? '扫描中' : '扫描可用')),
+      h(Btn, { icon: IC.play, primary: true, disabled: busy !== '' || (!instanceSel && !emuTarget.trim()), onClick: emuStart, title: '启动选中的实例,冷启动较慢' }, busy === 'start' ? '启动中' : '启动'),
+      h(Btn, { icon: IC.stop, dangerSolid: true, disabled: busy !== '', onClick: emuStop, title: '停止选中的实例' }, '停止')),
     h('div', { style: row },
       h('span', { style: label }, '状态'),
       // A value, so it reads at the size values read at — it used to sit at hint size beside a 12px
@@ -908,8 +1131,8 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
         selTone.label) : h('span', { style: { fontSize: 12, color: s.faint } }, '未实例'),
       h('div', { style: { flex: 1 } }),
       h(Btn, { secondary: true, disabled: busy !== '', onClick: checkReady, title: '检测模拟器串号是否已上线' }, '检测就绪'),
-      h(Btn, { ghost: true, disabled: busy !== '', onClick: toggleManual }, showManual ? '收起手动输入' : '手动输入'),
-      h(Btn, { ghost: true, disabled: busy !== '', onClick: () => setShowRaw((v) => !v) }, showRaw ? '收起原始输出' : '原始输出')),
+      h(Btn, { ghost: true, disabled: busy !== '', onClick: toggleManual, title: showManual ? '收起手动输入' : '自己填设备串号,不走在线设备列表' }, showManual ? '收起手动输入' : '手动输入'),
+      h(Btn, { ghost: true, disabled: busy !== '', onClick: () => setShowRaw((v) => !v), title: showRaw ? '收起面板的原始输出' : '展开面板的原始输出,排查时看' }, showRaw ? '收起原始输出' : '原始输出')),
     showManual ? h('div', { key: 'manual', style: { marginTop: 4 } },
       h('div', { style: { ...row, marginBottom: 6 } },
         h('span', { style: { width: 56, fontSize: 12, color: s.muted } }, '实例名'),
@@ -924,8 +1147,8 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
         h('span', { style: { width: 56, fontSize: 12, color: s.muted } }, '系统版本'),
         h('input', { style: field, value: manualOs, placeholder: '如 HarmonyOS 6.1.1(24)', onChange: (e) => setManualOs(e.target.value), spellCheck: false })),
       h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 } },
-        h(Btn, { secondary: true, disabled: !manualSerial.trim(), onClick: () => setDevice(manualSerial.trim()) }, '用该串号作为部署设备'),
-        h('div', { style: { fontSize: 11, color: s.faint } }, '实例名参与启动/停止;串号可一键设为部署设备')))
+        h(Btn, { secondary: true, disabled: !manualSerial.trim(), onClick: () => setDevice(manualSerial.trim()), title: '把填写的串号设为部署目标设备' }, '用该串号作为部署设备'),
+        h('div', { style: { fontSize: 11, color: s.faint } }, '实例名参与启动/停止,串号可一键设为部署设备')))
       : null,
     showRaw && emuRaw ? h('pre', { style: { ...field, maxHeight: 110, overflow: 'auto', margin: '2px 0 0', fontSize: 10, whiteSpace: 'pre-wrap' } }, emuRaw) : null,
   ))
@@ -938,18 +1161,19 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
         style: field, value: scanRoot, placeholder: '默认为当前工作目录',
         onChange: (e) => { scanRootEdited.current = true; setScanRoot(e.target.value) }, spellCheck: false,
       }),
-      h(Btn, { icon: IC.folder, secondary: true, disabled: busy !== '', onClick: pickNative }, '浏览')),
+      h(Btn, { icon: IC.folder, secondary: true, disabled: busy !== '', onClick: pickNative, title: '选择一个本地目录作为项目根' }, '浏览')),
     h('div', { style: row },
       h('span', { style: label }, '项目'),
       h(Dropdown, {
         value: project, placeholder: projectOptions.length ? '选择扫描到的项目…' : '扫描后选择项目',
+        align: 'left',
         options: projectOptions.map((p) => ({ value: p, label: p })),
         onChange: setProject,
       }),
-      h(Btn, { icon: IC.scan, secondary: true, disabled: busy !== '', onClick: () => runScan() }, busy === 'scan' ? '扫描中' : '扫描')),
+      h(Btn, { icon: IC.scan, secondary: true, disabled: busy !== '', onClick: () => runScan(), title: '在根目录下(最多 3 层)查找鸿蒙工程' }, busy === 'scan' ? '扫描中' : '扫描')),
     modules.length > 1 ? h('div', { style: row, key: 'moduleRow' },
       h('span', { style: label }, '入口模块'),
-      h(Dropdown, { value: moduleSel, placeholder: '选择入口模块', options: modules.map((m) => ({ value: m, label: m })), onChange: setModuleSel }),
+      h(Dropdown, { value: moduleSel, placeholder: '选择入口模块', align: 'left', options: modules.map((m) => ({ value: m, label: m })), onChange: (v) => { setModuleSel(v); lsSet(lsModuleKey(project), v) } }),
     ) : null,
     // On-demand project checks (no model-tool schema cost). Details live in tooltips so
     // the panel itself stays free of explanatory clutter.
@@ -957,7 +1181,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
       h('span', { style: label }, '代码检查'),
       h(Btn, {
         secondary: true, disabled: busy !== '' || !project.trim(),
-        onClick: () => runLint('changed'), title: '只检查已跟踪文件的未提交改动(快;新建文件请用「全量检查」)',
+        onClick: () => runLint('changed'), title: '只检查已跟踪文件的未提交改动(快,新建文件请用「全量检查」)',
       }, busy === 'lint-changed' ? '检查中…' : '检查改动'),
       h(Btn, {
         secondary: true, disabled: busy !== '' || !project.trim(),
@@ -973,11 +1197,11 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
       h('span', { style: label }, '代码修复'),
       h(Btn, {
         secondary: true, disabled: busy !== '' || !fixReady.changed, onClick: () => runLint('fix'),
-        title: fixReady.changed ? '自动修复未提交改动中可修复的告警;无法自动修复的不会列出' : '先点「检查改动」查看范围后才能修复',
+        title: fixReady.changed ? '自动修复未提交改动中可修复的告警,无法自动修复的不会列出' : '先点「检查改动」查看范围后才能修复',
       }, busy === 'lint-fix' ? '修复中…' : '自动修复'),
       h(Btn, {
         secondary: true, disabled: busy !== '' || !fixReady.all, onClick: () => runLint('fix-all'),
-        title: fixReady.all ? '自动修复整个项目中可修复的告警;无法自动修复的不会列出' : '先点「全量检查」查看范围后才能修复',
+        title: fixReady.all ? '自动修复整个项目中可修复的告警,无法自动修复的不会列出' : '先点「全量检查」查看范围后才能修复',
       }, busy === 'lint-fix-all' ? '修复中…' : '全量修复')),
     // Live status while a check runs: the linter only writes its report at the end, so the
     // ticking clock is what tells the user it is still working.
@@ -987,12 +1211,13 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
     },
       h('span', { style: { display: 'inline-flex' } }, h(Icon, { src: IC.clock, size: 12 })),
       `${lintTitle}进行中… 已用时 ${lintSec}s(检查工具在结束时才输出报告)`) : null,
-    h('div', { style: { fontSize: 11, color: s.faint, margin: '-2px 0 8px' } }, '需包含 build-profile.json5 的项目根;点「扫描」列出子目录项目,或「浏览」直接选择'),
+    h('div', { style: { fontSize: 11, color: s.faint, margin: '-2px 0 8px' } }, '需包含 build-profile.json5 的项目根,点「扫描」列出子目录项目,或「浏览」直接选择'),
   ))
 
-  // Deploy target: read-only for a single device, a dropdown when several are online.
+  // The target and the command that runs against it belong together, and both stay outside the fold
+  // below: the plugin's primary action must not vanish when the operation card is collapsed.
   const devLabel = (serial) => deviceLabel(instances, serial)
-  nodes.push(h(Card, { key: 'devCard', title: '部署目标' },
+  nodes.push(h(Card, { key: 'deployCard', title: '设备部署' },
     h('div', { style: row },
       h('span', { style: label }, '设备'),
       devices.length > 1
@@ -1003,42 +1228,417 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
         })
         : h('div', { style: { ...field, display: 'flex', alignItems: 'center', color: targetDevice ? s.fg : s.faint, cursor: 'default' } },
           targetDevice ? devLabel(targetDevice) : '暂无在线设备')),
-    // The screenshot action sits under the device row, matches the field height, and stays
-    // outlined so it never competes with the primary deploy button.
-    h('div', { style: { marginTop: 8 } },
+    // One row: the button names the command it will run, and the control beside it says what it is for —
+    // 执行操作, opening the four commands. Naming the two differently is what keeps the row from saying
+    // the same words twice.
+    h('div', { key: 'deployRow', style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, flexWrap: 'wrap' } },
+      h('span', { style: label }, '操作'),
       h(Btn, {
-        secondary: true, icon: IC.camera, disabled: busy !== '' || !targetDevice, onClick: takeShot,
-        style: { width: '100%' },
-        title: '用 devecocli 截取设备屏幕,PNG 保存到 <工作区>/screenshots',
-      }, busy === 'shot' ? '截图中…' : '截图当前设备屏幕')),
+        // Solid red for the risky command, blue for the two build ones: the fill is what carries the
+        // warning. One press runs it — the command had to be picked from the menu first, which is the
+        // deliberate step, and what clean deletes a build recreates.
+        primary: deployAction !== 'clean', dangerSolid: deployAction === 'clean', disabled: busy !== '',
+        icon: deployAction === 'clean' ? undefined : IC.deploy,
+        title: deployAction === 'clean'
+          ? '删除该工程的构建产物,不安装、不启动'
+          : `构建耗时取决于改动量,首次约 1–3 分钟${targetDevice ? `,目标 ${targetDevice}` : ''}`,
+        onClick: () => { void runDeploy(deployAction) },
+        style: { flex: '1 1 120px', minWidth: 0, padding: '8px 10px', fontWeight: 600, fontSize: 13 },
+      }, busy !== ''
+        ? (deployAction === 'clean' ? '清理中…' : deployAction === 'build' ? '构建中…' : deployAction === 'skipbuild' ? '部署中…' : '构建部署中…')
+        : (deployAction === 'clean'
+          ? '清理构建'
+          : deployAction === 'build' ? '构建' : deployAction === 'skipbuild' ? '部署' : '构建并部署')),
+      h('div', { style: { flex: '0 0 auto', width: 108 } },
+        h(Dropdown, {
+          value: deployAction, caption: '执行选项',
+          title: `当前命令:${deployCommandLabel(deployAction)}。点开可选择`,
+          options: DEPLOY_COMMANDS,
+          onChange: setDeployAction,
+        })),
+    ),
     (targetDevice
       ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 6 } }, '部署将发送到该设备(启动模拟器后自动更新)')
       : (devices.length
         ? h('div', { style: { fontSize: 11, color: s.faint, marginTop: 6 } }, `检测到 ${devices.length} 台在线设备,已默认选第一台`)
-        : h('div', { style: { fontSize: 11, color: s.faint, marginTop: 6 } }, '暂无在线设备;请先在「模拟器实例」启动模拟器'))),
+        : h('div', { style: { fontSize: 11, color: s.faint, marginTop: 6 } }, '暂无在线设备,请先在「模拟器实例」启动模拟器'))),
   ))
 
-  // Primary deploy button (the screenshot action lives in the deploy-target card)
-  nodes.push(h('div', { key: 'deployBtn', style: { marginTop: 2 } },
-    h(Btn, {
-      primary: true, disabled: busy !== '', onClick: deploy, icon: IC.deploy,
-      style: { width: '100%', padding: '10px 12px', fontWeight: 600, fontSize: 13 },
-    }, busy === 'deploy' ? '构建并部署中…' : '构建并部署到所选设备'),
-    h('div', { style: { fontSize: 11, color: s.faint, margin: '6px 2px 0' } }, 'devecocli run:构建 → 安装 → 启动(首次约 1–3 分钟)'),
+  // What is left acts on the device named above and is reached far less often than the deploy, so it
+  // folds — remembering the choice — the way the log card's filter row does. The header keeps naming the
+  // device, so an expanded card never acts on something the reader cannot see.
+  nodes.push(h(Card, {
+    key: 'devCard',
+    title: '设备操作',
+    action: h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+      // Ellipsised rather than wrapped: in a narrow sidebar a long device label must not push the card's
+      // own title around.
+      h('span', { style: { fontSize: 11, color: s.faint, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 150 } }, targetDevice ? devLabel(targetDevice) : '暂无在线设备'),
+      h(Btn, {
+        ghost: true, onClick: () => setShowDevOps((on) => !on), style: { padding: '2px 8px', fontSize: 12 },
+        title: showDevOps ? '收起控制、传输与截图' : '展开控制、传输与截图',
+      }, showDevOps ? '收起' : '展开')),
+  },
+    showDevOps ? [
+      // The emulator controls act on the device this panel names, exactly as the deploy does — the CLI
+      // takes a serial here as readily as an instance name — so they lead the card: pick one, run it.
+      h('div', { key: 'emuControlRow', style: { ...row, marginBottom: 0 } },
+        h('span', { style: label }, '控制'),
+        h(Dropdown, { value: emuControl, options: EMU_CONTROLS, onChange: setEmuControl }),
+        h(Btn, {
+          secondary: true, disabled: busy !== '' || !targetDevice, onClick: () => { void runEmuControl() },
+          // Same width as the 浏览 button on the row below, so the two stack in one column instead of stepping.
+          style: { flex: '0 0 86px', boxSizing: 'border-box' },
+          title: '执行选中的设备操作,作用于上方设备',
+        }, busy === 'control' ? '执行中' : '执行')),
+      // The two ends first, the direction last: a press here submits the pair above, which is why the
+      // buttons read as the direction of travel rather than as a mode that has to be picked first.
+      h('div', { key: 'fileLocalRow', style: { ...row, marginTop: 8, marginBottom: 0 } },
+        h('span', { style: label }, '本地路径'),
+        h(Dropdown, {
+          editable: true, align: 'left', value: fileLocal,
+          placeholder: '相对工作区或绝对路径',
+          title: '上传时填要上传的文件,下载时填保存目录',
+          options: [
+            // An empty field already means the workspace root for a download, so offering it says out loud
+            // what the field would otherwise do silently. Not removable: it is not a history entry.
+            ...(scopeCwd ? [{ value: scopeCwd, label: scopeCwd, title: scopeCwd }] : []),
+            ...recentLocal.filter((p) => p !== scopeCwd)
+              .map((p) => ({
+                value: p, label: p, title: p,
+                onRemove: () => setRecentLocal((prev) => prev.filter((x) => x !== p)),
+              })),
+          ],
+          onChange: setFileLocal,
+        }),
+        // The shell's chooser picks directories only, so the button says so rather than promising a file.
+        h(Btn, {
+          icon: IC.folder, secondary: true, disabled: busy !== '', onClick: () => { void pickLocalPath() },
+          // Same width as the 执行 button two rows above: the card's row-end buttons form one column.
+          style: { flex: '0 0 86px', boxSizing: 'border-box' },
+          title: '选择一个本地目录,选完可在路径后补上文件名',
+        }, '浏览')),
+      h('div', { key: 'fileRemoteRow', style: { ...row, marginTop: 6, marginBottom: 0 } },
+        h('span', { style: label }, '设备路径'),
+        // The device cannot be listed — devecocli has no such command — so the field carries the device's two
+        // folders plus whatever already worked. Editable, because a sandbox path has no enumerable set:
+        // pasting one is the case that matters most, and a plain menu would take that away.
+        h(Dropdown, {
+          editable: true, align: 'left', value: fileRemote,
+          placeholder: '/storage/media/100/local/files/Docs/Download/文件名',
+          title: '设备上的文件路径,可从下拉选常用目录',
+          options: [
+            ...DEVICE_PATH_PRESETS.map((p) => ({ value: p, label: p, title: p })),
+            ...recentRemote.filter((p) => !DEVICE_PATH_PRESETS.includes(p))
+              .map((p) => ({
+                value: p, label: p, title: p,
+                onRemove: () => setRecentRemote((prev) => prev.filter((x) => x !== p)),
+              })),
+          ],
+          onChange: setFileRemote,
+        })),
+      // Labelled and left-aligned like the other action rows here (代码修复, 执行): the label already
+      // anchors the left end, so the buttons follow it. The 状态 row pushes its buttons right only because
+      // something sits to their left — borrowing that shape here is what made the row look orphaned.
+      h('div', { key: 'fileActionsRow', style: { ...row, marginTop: 8, marginBottom: 0 } },
+        h('span', { style: label }, '传输'),
+        h(Btn, {
+          secondary: true, disabled: busy !== '' || !targetDevice, onClick: () => { void runFileTransfer('send') },
+          title: '把「本地路径」的文件复制到设备上的「设备路径」',
+        }, busy === 'file-send' ? '上传中…' : '上传到设备'),
+        h(Btn, {
+          secondary: true, disabled: busy !== '' || !targetDevice, onClick: () => { void runFileTransfer('recv') },
+          title: '把「设备路径」的文件复制到「本地路径」,本地路径留空则保存到工作区',
+        }, busy === 'file-recv' ? '下载中…' : '下载到本地')),
+      // The screenshot closes the card: it is the thing you reach for once the device is doing what you
+      // came for. Outlined and full width, so it never competes with the primary button above.
+      h('div', { style: { marginTop: 8 } },
+        h(Btn, {
+          secondary: true, icon: IC.camera, disabled: busy !== '' || !targetDevice, onClick: takeShot,
+          style: { width: '100%' },
+          title: '截取当前设备屏幕,图片保存到工作区的 screenshots 目录',
+        }, busy === 'shot' ? '截图中…' : '截图当前设备屏幕')),
+    ] : null,
   ))
+
+  /**
+   * Follow the device log until it is stopped. The panel owns the request: 停止 aborts the fetch, which
+   * closes the connection, which is what lets the other side kill the CLI. Lines land in the same box as
+   * every other run, one line at a time.
+   */
+  const toggleFollow = async () => {
+    if (following) { followCtl.current?.abort(); return }
+    const ctl = new AbortController()
+    followCtl.current = ctl
+    setFollowing(true)
+    pushLog('info', `开始实时监听日志 → ${targetDevice || '运行中的实例'}(点“停止监听”结束)`)
+    try {
+      const res = await fetch(`${API}/log.follow`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        signal: ctl.signal,
+        body: JSON.stringify({
+          device: targetDevice || undefined,
+          level: logLevel || undefined,
+          bundle: logBundle || undefined,
+          keyword: logKeyword.trim() || undefined,
+          from: logFrom.trim() || undefined,
+        }),
+      })
+      if (res.status !== 200) {
+        let msg = `HTTP ${res.status}`
+        try { const j = await res.json(); if (j && j.error && j.error.message) msg = j.error.message } catch { /* not JSON */ }
+        pushLog('err', `监听失败:${msg}`)
+        return
+      }
+      if (!res.body) { pushLog('err', '宿主未返回可读内容'); return }
+      const reader = res.body.getReader()
+      const dec = new TextDecoder()
+      let buf = ''
+      // A chatty device can push hundreds of lines a second (measured ~775/s on an emulator), and one state
+      // update per line locks the render loop — the box would look stuck. Lines are collected here and flushed
+      // on a timer, which keeps the scroll smooth and applies the 200-entry cap in one place.
+      let pending: { kind: string; text: string }[] = []
+      const flush = () => {
+        if (pending.length === 0) return
+        const batch = pending
+        pending = []
+        setLogs((prev) => [...prev, ...batch].slice(-200))
+      }
+      const timer = setInterval(flush, 200)
+      // A follow that matches nothing looks identical to a broken one. If the first seconds bring no line at all,
+      // say so once — the usual cause is a level filter this device never emits.
+      let seen = false
+      const quiet = setTimeout(() => {
+        if (!seen) pushLog('info', '已开始监听,按当前条件暂时没有日志输出')
+      }, 3000)
+      const put = (line) => {
+        if (!line || exitCodeOf(line) !== null) return
+        const clean = cleanCliLine(line)
+        if (clean.trim()) { seen = true; pending.push({ kind: 'raw', text: clean }) }
+      }
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += dec.decode(value, { stream: true })
+          const lines = buf.split('\n')
+          buf = lines.pop() || ''
+          for (const l of lines) put(l.replace(/\r$/, ''))
+        }
+        if (buf.trim()) put(buf)
+        // Show everything that arrived before the closing line.
+        flush()
+      } finally {
+        clearInterval(timer)
+        // The quiet warning must not outlive the stream, or a stopped follow would still get its line.
+        clearTimeout(quiet)
+        // A stop mid-flood still shows what it had: flush is a no-op once the buffer is empty.
+        flush()
+      }
+      pushLog('info', '日志监听已结束')
+    } catch (error) {
+      // An abort is the user stopping the follow, not a failure to report as one.
+      pushLog(ctl.signal.aborted ? 'info' : 'err', ctl.signal.aborted
+        ? '已停止监听'
+        : `监听失败:${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      followCtl.current = null
+      setFollowing(false)
+    }
+  }
+
+  /**
+   * The line that opens every read. The box is append-only — deploys, starts and earlier reads share it — so
+   * each read says which conditions it ran under, which is what lets an older block be told apart at a glance.
+   * The clock comes from the panel's own per-line prefix; printing one here too would show the time twice.
+   */
+  const readBanner = (device: string, tail: number) => {
+    const label = (list: Array<{ value: string; label: string }>, value: string) => list.find((o) => o.value === value)?.label
+    const bits = [`${tail} 行`, label(LOG_TIMES, logFrom) ?? (logFrom || '最早'), label(LOG_LEVELS, logLevel) ?? '全部级别']
+    if (logBundle.trim()) bits.push(`应用 ${logBundle.trim()}`)
+    if (logKeyword.trim()) bits.push(`关键字 ${logKeyword.trim()}`)
+    return `— 读取设备日志到调试框(${bits.join(', ')}) @ ${device} —`
+  }
+
+  /** One log snapshot, printed where every other run lands. */
+  const readLog = async () => {
+    setBusy('log')
+    try {
+      const r = await rpc('log.snapshot', {
+        device: targetDevice || undefined,
+        level: logLevel || undefined,
+        bundle: logBundle || undefined,
+        keyword: logKeyword.trim() || undefined,
+        from: logFrom.trim() || undefined,
+        tail: Number(logLines) || 50,
+      })
+      pushLog(r.code === 0 ? 'ok' : 'err', `${readBanner(r.device, r.tail)}\n${String(r.output ?? '').trim() ? r.output : '(当前条件没有匹配到日志,可先放宽级别或关键字再试)'}`)
+    } catch (error) {
+      pushLog('err', `读取设备日志失败:${error instanceof Error ? error.message : String(error)}`)
+    } finally { setBusy('') }
+  }
+
+  /**
+   * Save what the debug box holds. The panel owns the lines — streamed CLI output already collected — so this
+   * asks where to put them and lets the host write them there. Escape sequences come off first: they carry the
+   * CLI's colours on screen and mean nothing in a text file.
+   */
+  const exportLog = async () => {
+    if (logs.length === 0) { pushLog('err', '调试框暂无日志可导出'); return }
+    const ui = ctx.get('uiWorkspace')
+    if (!ui || typeof ui.pickDirectory !== 'function') { pushLog('err', '系统目录选择不可用,无法选择保存位置'); return }
+    // The picker runs before the busy flag: an open system dialog is not the panel being busy.
+    let dir = ''
+    try {
+      dir = (await ui.pickDirectory()) || ''
+    } catch (error) {
+      pushLog('err', `选择保存文件夹失败:${error.message}`)
+      return
+    }
+    if (!dir) return
+    setBusy('log-export')
+    try {
+      const text = logs.map((l) => ansiRuns(l.text).map((run) => run.text).join('')).join('\n')
+      // The request body is capped, so a very long box exports its tail: the recent part is the useful one.
+      const capped = text.length > LOG_EXPORT_MAX
+      const v = await rpc('log.export', {
+        dir, device: targetDevice || undefined, text: capped ? text.slice(-LOG_EXPORT_MAX) : text,
+      })
+      pushLog('ok', `调试日志已导出:${v.path}(${v.bytes} 字节${capped ? ',已截取最近部分' : ''})`)
+    } catch (error) {
+      pushLog('err', `导出调试日志失败:${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  /**
+   * One log, from the device straight to a file. It takes the same conditions as 读取设备日志到调试框 and skips
+   * entirely — that is the point: the box keeps only the last 200 lines, so a long log written through it
+   * would be a tail. The box gets nothing either, just the line saying where the file landed.
+   */
+  const exportDeviceLog = async () => {
+    const ui = ctx.get('uiWorkspace')
+    if (!ui || typeof ui.pickDirectory !== 'function') { pushLog('err', '系统目录选择不可用,无法选择保存位置'); return }
+    // The picker runs before the busy flag: an open system dialog is not the panel being busy.
+    let dir = ''
+    try {
+      dir = (await ui.pickDirectory()) || ''
+    } catch (error) {
+      pushLog('err', `选择保存文件夹失败:${error.message}`)
+      return
+    }
+    if (!dir) return
+    setBusy('log-export-device')
+    try {
+      const r = await rpc('log.snapshot', {
+        device: targetDevice || undefined,
+        level: logLevel || undefined,
+        bundle: logBundle || undefined,
+        keyword: logKeyword.trim() || undefined,
+        from: logFrom.trim() || undefined,
+        tail: Number(logLines) || 50,
+      })
+      if (r.code !== 0) { pushLog('err', `导出设备日志失败:${r.output}`); return }
+      const text = ansiRuns(r.output).map((run) => run.text).join('')
+      const capped = text.length > LOG_EXPORT_MAX
+      const v = await rpc('log.export', {
+        dir, device: targetDevice || undefined, text: capped ? text.slice(-LOG_EXPORT_MAX) : text,
+      })
+      pushLog('ok', `设备日志已导出:${v.path}(${v.bytes} 字节${capped ? ',已截取最近部分' : ''})`)
+    } catch (error) {
+      pushLog('err', `导出设备日志失败:${error instanceof Error ? error.message : String(error)}`)
+    } finally { setBusy('') }
+  }
 
   // Debug output
   nodes.push(h('div', { key: 'logWrap', style: { ...card, marginTop: 4, padding: 8, marginBottom: 0 } },
-    h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 } },
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, flexWrap: 'wrap' } },
       h('span', { style: { fontSize: 13, fontWeight: 600, color: s.fg } }, '调试输出'),
       h('div', { style: { flex: 1 } }),
-      h(Btn, { ghost: true, onClick: clearLogs, style: { padding: '2px 8px' } }, '清空')),
+      // The header holds the two actions that are about the box itself rather than about the device: save what it
+      // holds, and clear it. The reset stays rightmost, where the one press that cannot be undone belongs.
+      h(Btn, {
+        ghost: true, disabled: busy !== '' || logs.length === 0, onClick: () => { void exportLog() },
+        style: { padding: '2px 8px', fontSize: 12 },
+        title: '把下方调试框当前内容保存为文本文件,点击后选择保存文件夹',
+      }, busy === 'log-export' ? '导出中…' : '导出调试日志'),
+      h(Btn, {
+        ghost: true, disabled: logs.length === 0, onClick: clearLogs, style: { padding: '2px 8px', fontSize: 12 },
+        title: '清空下方日志显示,已导出的文件不受影响',
+      }, '清空')),
+    // The conditions are always on show: the actions that use them now sit inside this block, and a folded
+    // block would leave the card without any way to read a log.
+    h('div', { style: { marginBottom: 6 } },
+      // A labelled form rather than placeholders: a value has to keep saying what it is once the hint is
+      // gone, the same fix the transfer paths got.
+      h('div', { style: { fontSize: 11, color: s.muted, marginBottom: 4 } }, '筛选条件'),
+      h('div', { style: { ...row, marginBottom: 6 } },
+        h('span', { style: label }, '应用'),
+        h('input', {
+          style: field, value: logBundle, placeholder: '如 com.example.app',
+          title: '只保留该应用的日志,填应用的包名',
+          onChange: (e) => setLogBundle(e.target.value), spellCheck: false,
+        })),
+      h('div', { style: { ...row, marginBottom: 6 } },
+        h('span', { style: label }, '关键字'),
+        h('input', {
+          style: field, value: logKeyword, placeholder: '包含该词',
+          title: '只保留包含该关键字的日志行',
+          onChange: (e) => setLogKeyword(e.target.value), spellCheck: false,
+        }),
+        // The level closes this row: it narrows the same lines the keyword does, so the two read as one
+        // filter. A list rather than a switch, so the next level this CLI grows is one more option.
+        h('div', { style: { flex: '0 0 auto', width: 96 } },
+          h(Dropdown, {
+            value: logLevel, placeholder: '全部级别',
+            options: LOG_LEVELS,
+            onChange: setLogLevel,
+          })),
+        // The live toggle closes this row, right of the level: 实时监听 and 停止监听 are the same length, so the
+        // row cannot shift when it flips, and the row of data actions below keeps its two even halves.
+        h(Btn, {
+          primary: true, disabled: busy !== '', onClick: () => { void toggleFollow() }, style: { flex: '0 0 auto' },
+          title: following ? '停止监听,并结束设备侧的日志流' : '实时监听设备日志:按上面的条件,最长 30 分钟,再点一次停止',
+        }, following ? '停止监听' : '实时监听')),
+      // Each parameter sits on the row of the action it decides, labelled on the left like the two above: the
+      // count belongs to the one-shot read, the start belongs to the follow (where it reads as "backfill from
+      // here"). Both rows keep the button at full width, so 实时监听 turning into 停止监听 cannot shift it.
+      h('div', { style: { ...row, marginBottom: 6 } },
+        h('span', { style: label }, '读取行数'),
+        // 112 wide like the start dropdown below, and border-box for it: the two parameters then end on the same
+        // vertical line, which is what lines their buttons up too.
+        h('input', {
+          style: { ...field, boxSizing: 'border-box', width: 112, flex: '0 0 auto', textAlign: 'center' }, value: logLines,
+          placeholder: '50', title: '一次读取最后多少行',
+          onChange: (e) => setLogLines(e.target.value), spellCheck: false,
+        }),
+        // The start sits on this row because these are the actions it narrows: it decides how far back a read
+        // reaches. The follow takes it as its backfill point, which its own tooltip says.
+        h('span', { style: { fontSize: 11, color: s.muted } }, '起始时间'),
+        h('div', { style: { flex: '0 0 auto', width: 112 }, title: '读取与导出取这段时间内的日志,实时监听先补这段时间的历史再持续输出' },
+          h(Dropdown, {
+            value: logFrom, placeholder: logFrom || '最早',
+            options: LOG_TIMES,
+            onChange: setLogFrom,
+          })),
+        h(Btn, {
+          primary: true, disabled: busy !== '' || following, onClick: () => { void readLog() }, style: { flex: 1 },
+          title: '按上面的条件取最后 N 行,只读一次,不会持续输出',
+        }, busy === 'log' ? '读取中…' : '读取设备日志到调试框'),
+        h(Btn, {
+          primary: true, disabled: busy !== '' || following, onClick: () => { void exportDeviceLog() },
+          style: { flex: 1 },
+          title: '取回的日志只写成文件,不写入下方调试框',
+        }, busy === 'log-export-device' ? '导出中…' : '导出设备日志到文件')),
+    ),
     h('pre', {
       key: 'logbox', ref: logBox, style: {
         ...field, maxHeight: 220, overflow: 'auto', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all', fontFamily: 'ui-monospace, Consolas, "Courier New", monospace', fontSize: 11,
       },
     }, logs.length === 0
-      ? '(构建/部署信息将显示在这里)'
+      ? '(构建、部署与设备日志将在此显示)'
       // Each entry renders as styled runs, so a CLI's own colour survives into the log.
       : logs.map((l, i) => h('div', { key: i, style: logLine(l.kind) },
         ansiRuns(l.text).map((run, at) => h('span', {
@@ -1085,6 +1685,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
         secondary: true,
         style: { padding: '4px 10px', color: copied ? s.ok : s.fg, border: `1px solid ${copied ? s.ok : s.border}` },
         onClick: () => copyText(shot.path),
+        title: '复制截图文件的完整路径',
       }, copied ? '已复制 ✓' : '复制路径')),
     shot.dataUrl ? h('div', { style: { fontSize: 10, color: s.faint, marginTop: 6 } }, '滚轮缩放 · 按住拖动平移 · 双击重置') : null,
   ))

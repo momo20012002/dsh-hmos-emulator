@@ -304,6 +304,89 @@ describe.skipIf(!CAN_SPAWN)('panel-only routes', () => {
     delete process.env.DSH_FAKE_DEVICES
   })
 
+  it('runs one emulator control, with the argv the model tool builds', async () => {
+    // Rotate, power and volume are the tool's own three argument-free verbs: one argv each pins that
+    // the panel's route and tools/emu.ts keep building the same request.
+    const argvLog = join(dir, 'emu-control-argv.log')
+    process.env.DSH_FAKE_ARGV_LOG = argvLog
+    expect(await call('emu.control', { target: 'Pura 90', action: 'rotate', direction: 'left' }))
+      .toMatchObject({ code: 0, action: 'rotate', target: 'Pura 90' })
+    expect(await call('emu.control', { target: 'Pura 90', action: 'power' })).toMatchObject({ code: 0, action: 'power' })
+    expect(readFileSync(argvLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))).toEqual([
+      ['emulator', 'rotate', '--target', 'Pura 90', 'left'],
+      ['emulator', 'power', '--target', 'Pura 90'],
+    ])
+    // A direction the CLI does not take for that verb is answered here, before a spawn, in the wording
+    // the panel shows — not by the CLI's own option error after a round trip.
+    const wrong = await post('emu.control', { target: 'Pura 90', action: 'volume', direction: 'left' })
+    expect(wrong.status).toBe(400)
+    expect(JSON.parse(wrong.body).error.message).toContain('音量只支持')
+    expect((await post('emu.control', { target: 'Pura 90', action: 'battery' })).status).toBe(400)
+    expect((await post('emu.control', { action: 'power' })).status).toBe(400)
+    delete process.env.DSH_FAKE_ARGV_LOG
+  })
+
+  it('moves one file each way, with the argv the model tool builds', async () => {
+    // One command read in two directions: the local end stays last for send and leads for recv. This
+    // line is what keeps the panel's route and tools/device.ts from drifting apart.
+    const argvLog = join(dir, 'device-file-argv.log')
+    process.env.DSH_FAKE_ARGV_LOG = argvLog
+    const local = join(dir, 'upload.txt')
+    writeFileSync(local, 'hello')
+    const sent = await call('device.file', { direction: 'send', device: 'emulator-5554', local, remote: '/data/local/tmp/x.txt' })
+    expect(sent).toMatchObject({ direction: 'send', local, remote: '/data/local/tmp/x.txt' })
+    const into = join(dir, 'pulled', 'x.txt')
+    expect((await call('device.file', { direction: 'recv', device: 'emulator-5554', local: into, remote: '/data/local/tmp/x.txt' })).local).toBe(into)
+    // A download makes its own directory: the caller names the file, not the path to it.
+    expect(existsSync(dirname(into))).toBe(true)
+    expect(readFileSync(argvLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))).toEqual([
+      ['device', 'file', 'send', '--device', 'emulator-5554', local, '/data/local/tmp/x.txt'],
+      ['device', 'file', 'recv', '--device', 'emulator-5554', '/data/local/tmp/x.txt', into],
+    ])
+    // A relative local path is read against the workspace the panel names, not against the host's cwd.
+    const relative = await call('device.file', { direction: 'send', device: 'emulator-5554', local: 'upload.txt', remote: '/data/local/tmp/x.txt', root: dir })
+    expect(relative.local).toBe(local)
+    // Every refusal the route can give without a device round trip, and without spawning anything.
+    expect((await post('device.file', { direction: 'send', device: 'emulator-5554', local: join(dir, 'missing.txt'), remote: '/data/x' })).status).toBe(400)
+    expect((await post('device.file', { direction: 'sideways', device: 'emulator-5554', local, remote: '/data/x' })).status).toBe(400)
+    expect((await post('device.file', { direction: 'recv', device: 'emulator-5554', local: into, remote: '' })).status).toBe(400)
+    expect((await post('device.file', { direction: 'send', local, remote: '/data/x' })).status).toBe(400)
+    // A directory is not a file to upload. The panel's own chooser picks directories, so this is the mistake
+    // that actually happens — saying so beats a device round trip that fails inside the CLI.
+    const asDir = await post('device.file', { direction: 'send', device: 'emulator-5554', local: dir, remote: '/data/x' })
+    expect(asDir.status).toBe(400)
+    expect(JSON.parse(asDir.body).error.message).toContain('文件夹')
+    // A save path that cannot be created is the caller's mistake too, and must not surface as a 500: `blocked`
+    // is a file, so nothing can be created inside it.
+    const blocked = join(dir, 'blocked')
+    writeFileSync(blocked, 'x')
+    const noParent = await post('device.file', { direction: 'recv', device: 'emulator-5554', local: join(blocked, 'y.txt'), remote: '/data/x' })
+    expect(noParent.status).toBe(400)
+    expect(JSON.parse(noParent.body).error.code).toBe('fs-error')
+    // A relative path with no workspace to read it against is a refusal, not a guess at the host's cwd.
+    // The message is what pins that: a missing file also answers 400, so the status alone cannot tell
+    // the two refusals apart.
+    const noRoot = await post('device.file', { direction: 'send', device: 'emulator-5554', local: 'upload.txt', remote: '/data/x' })
+    expect(noRoot.status).toBe(400)
+    expect(JSON.parse(noRoot.body).error.message).toContain('工作区根目录')
+    delete process.env.DSH_FAKE_ARGV_LOG
+  })
+
+  it('writes the panel log into the folder the panel chose', async () => {
+    // The panel holds the lines — they arrived as streamed CLI output — so this route is only the writer:
+    // the folder arrives with the request, and the name carries the device and the moment.
+    const saved = await call('log.export', { dir, device: 'emulator-5554', text: 'line one\nline two\n' })
+    expect(dirname(saved.path)).toBe(dir)
+    expect(saved.path.endsWith('.log')).toBe(true)
+    expect(saved.path).toContain('emulator-5554')
+    expect(saved.bytes).toBe(18)
+    expect(readFileSync(saved.path, 'utf8')).toBe('line one\nline two\n')
+    // Nothing to save, and nowhere to save it, are both refused before anything is written.
+    expect((await post('log.export', { dir, text: '   ' })).status).toBe(400)
+    expect((await post('log.export', { text: 'x' })).status).toBe(400)
+    expect((await post('log.export', { dir: join(dir, 'not-there'), text: 'x' })).status).toBe(400)
+  })
+
   it('finds project roots under a directory, and never descends into one', async () => {
     mkdirSync(join(dir, 'app-a'), { recursive: true })
     writeFileSync(join(dir, 'app-a', 'build-profile.json5'), '{}')
@@ -333,14 +416,80 @@ describe.skipIf(!CAN_SPAWN)('panel-only routes', () => {
       body: JSON.stringify({ projectPath: join(dir, 'app'), device: 'emulator-5554' }),
     })
     expect(res.status).toBe(200)
-    expect(res.body).toContain('[dsh-hmos-emulator] 部署 emulator-5554')
+    expect(res.body).toContain('[dsh-hmos-emulator] 构建并部署到 emulator-5554')
     expect(res.body).toContain('[HMOS_EXIT]=0')
     // An offline device is refused before a build that takes minutes.
     process.env.DSH_FAKE_DEVICES = '[]'
     const offline = await post('deploy', { projectPath: join(dir, 'app'), device: 'emulator-5554' })
     expect(offline.status).toBe(400)
     expect(JSON.parse(offline.body).error.code).toBe('device-offline')
+    // `clean` shares the route but touches no device, so the same offline state must not stop it.
+    const cleaned = await request({
+      name: 'deploy',
+      headers: { host: base, ...JSON_HEADERS },
+      body: JSON.stringify({ projectPath: join(dir, 'app'), device: 'emulator-5554', mode: 'clean' }),
+    })
+    expect(cleaned.status).toBe(200)
+    expect(cleaned.body).toContain('[dsh-hmos-emulator] 清理构建')
+    expect(cleaned.body).toContain('[HMOS_EXIT]=0')
+    // A module this project does not have is refused, and several modules are handed over in order.
+    writeFileSync(join(dir, 'app', 'build-profile.json5'), '{"modules":[{"name":"entry"},{"name":"common"}]}')
+    const bad = await post('deploy', { projectPath: join(dir, 'app'), device: 'emulator-5554', modules: ['nope'] })
+    expect(bad.status).toBe(400)
+    const built = await request({
+      name: 'deploy',
+      headers: { host: base, ...JSON_HEADERS },
+      body: JSON.stringify({ projectPath: join(dir, 'app'), device: 'emulator-5554', modules: ['entry', 'common'], buildOnly: true }),
+    })
+    expect(built.status).toBe(200)
+    expect(built.body).toContain('[dsh-hmos-emulator] 构建(模块 entry)')
     delete process.env.DSH_FAKE_DEVICES
+  })
+
+  it('runs a deploy without building when the panel asks for that', async () => {
+    // The fourth action maps to `run --skip-build` — the same argv the model tool builds for skipBuild.
+    mkdirSync(join(dir, 'skip'), { recursive: true })
+    writeFileSync(join(dir, 'skip', 'build-profile.json5'), '{}')
+    const argvLog = join(dir, 'skip-argv.log')
+    process.env.DSH_FAKE_ARGV_LOG = argvLog
+    process.env.DSH_FAKE_DEVICES = '["emulator-5554"]'
+    const res = await request({
+      name: 'deploy',
+      headers: { host: base, ...JSON_HEADERS },
+      body: JSON.stringify({ projectPath: join(dir, 'skip'), device: 'emulator-5554', mode: 'skipbuild' }),
+    })
+    expect(res.status).toBe(200)
+    expect(res.body).toContain('[dsh-hmos-emulator] 部署(不构建)到 emulator-5554')
+    expect(res.body).toContain('未重新构建')
+    const argvLines = readFileSync(argvLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    expect(argvLines[argvLines.length - 1]).toEqual(['run', '--device', 'emulator-5554', '--skip-build'])
+    delete process.env.DSH_FAKE_ARGV_LOG
+    delete process.env.DSH_FAKE_DEVICES
+  })
+
+  it('answers a log snapshot with the same flags the model tool uses', async () => {
+    // One argv pins the contract: if the panel's flags drift from tools/log.ts, this line moves too.
+    const argvLog = join(dir, 'log-argv.log')
+    process.env.DSH_FAKE_ARGV_LOG = argvLog
+    process.env.DSH_FAKE_INSTANCES = '[{"name":"Pura 90","status":"running","serial":"127.0.0.1:5555"}]'
+    process.env.DSH_FAKE_LOG = 'D 05:00:00.000   123  A00000  [tag] hello'
+    const r = await post('log.snapshot', { level: 'W', bundle: 'io.github.x.y', tail: 7, keyword: 'hello', from: '5m' })
+    expect(r.status).toBe(200)
+    expect(JSON.parse(r.body).value.output).toContain('hello')
+    // The device lookup is its own CLI call, so the snapshot is the last argv on record.
+    const argvLines = readFileSync(argvLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    expect(argvLines[argvLines.length - 1]).toEqual([
+      'log', '--device', '127.0.0.1:5555', '--tail', '7', '--level', 'W', '--bundle-name', 'io.github.x.y',
+      '--keyword', 'hello', '--from', '5m',
+    ])
+    // No running instance and no explicit device: say why rather than return an empty log.
+    process.env.DSH_FAKE_INSTANCES = '[]'
+    const none = await post('log.snapshot', {})
+    expect(none.status).toBe(400)
+    expect(JSON.parse(none.body).error.code).toBe('device-offline')
+    delete process.env.DSH_FAKE_ARGV_LOG
+    delete process.env.DSH_FAKE_INSTANCES
+    delete process.env.DSH_FAKE_LOG
   })
 
   it('queues the check result only after a check, and upgrades devecocli on the installed channel', async () => {

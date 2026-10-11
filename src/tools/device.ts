@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync } from 'node:fs'
-import { dirname, isAbsolute, resolve } from 'node:path'
+import { dirname } from 'node:path'
 import { firstRunningSerial, resolveDevecoCli, runCli, throwIfAborted } from '../toolchain.js'
+import { localPathFor } from '../local-path.js'
 import { sessionWorkspace } from '../workspace.js'
 import { tailText } from '../text.js'
 import { TOOL_OUT_SCHEMA, toolRender } from '../shots.js'
@@ -21,27 +22,6 @@ import type { ToolDeps } from './deps.js'
 
 /** Trimmed string, or empty. */
 const asText = (value: unknown): string => (typeof value === 'string' && value.trim() ? value.trim() : '')
-
-/**
- * Whether a local path is absolute — without reading a device path as one.
- *
- * On Windows `path.isAbsolute('/data/app/db')` is true, so a device path pasted into `local` would
- * count as absolute and, worse, `resolve` would still read its leading slash against the current
- * drive's root. Only a drive letter or a UNC prefix counts as absolute there; everything else stays
- * workspace-relative, with any leading separators trimmed so `/data/x` cannot escape the workspace by
- * accident.
- */
-function absoluteLocal(asked: string): boolean {
-  if (process.platform !== 'win32') return isAbsolute(asked)
-  return /^[A-Za-z]:[\\/]/.test(asked) || asked.startsWith('\\\\')
-}
-
-/** The local half of a transfer: an absolute path as given, anything else under the workspace. */
-function localPathFor(asked: string, root: string): string {
-  if (absoluteLocal(asked)) return asked
-  // A leading separator is not a request for a drive root on Windows: it is how a device path looks.
-  return resolve(root, asked.replace(/^[\\/]+/, ''))
-}
 
 /** One device verb plus a file transfer or a database query; the device defaults to the running one. */
 export function makeHmosDevice(_deps: ToolDeps) {

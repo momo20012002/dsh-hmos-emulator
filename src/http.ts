@@ -8,11 +8,11 @@ import { hostService } from './services.js'
 export const API_PREFIX = '/dsh-hmos-emulator/api'
 /** Allowed API methods (keeps this from becoming an arbitrary command executor). */
 export const METHODS = new Set([
-  'toolchain', 'emu.list', 'emu.start', 'emu.stop',
-  'devices', 'scan', 'project.info', 'check.lint', 'lint.notify', 'deploy', 'device.ready', 'deveco.install', 'deveco.plan', 'deveco.update', 'screenshot',
+  'toolchain', 'emu.list', 'emu.start', 'emu.stop', 'emu.control',
+  'devices', 'scan', 'project.info', 'check.lint', 'lint.notify', 'deploy', 'log.snapshot', 'log.follow', 'log.export', 'device.ready', 'device.file', 'deveco.install', 'deveco.plan', 'deveco.update', 'screenshot',
 ])
 /** Methods whose handler owns the response (streaming); they skip the JSON envelope. */
-export const STREAMING_METHODS = new Set(['deploy'])
+export const STREAMING_METHODS = new Set(['deploy', 'log.follow'])
 /** Body cap for one request: the panel only ever sends a small JSON payload. */
 export const MAX_BODY_BYTES = 1_000_000
 
