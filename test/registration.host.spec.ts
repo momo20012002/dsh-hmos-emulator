@@ -14,7 +14,7 @@ import { apply } from '../lib/index.js'
 import { hostService } from '../src/services.js'
 import { createHostContext, mountPlugin } from './harness.js'
 
-const TOOL_NAMES = ['emu', 'emu_ui', 'hmos_deploy', 'hmos_log', 'hmos_docs', 'hmos_lint']
+const TOOL_NAMES = ['emu', 'emu_ui', 'hmos_deploy', 'hmos_device', 'hmos_log', 'hmos_docs', 'hmos_lint']
 
 describe('service access', () => {
   it('hands back the published service, and undefined for one the host does not publish', () => {

@@ -71,9 +71,10 @@ dsh plugin --profile web remove dsh-hmos-emulator
 
 | 工具 | 职责 |
 |---|---|
-| `emu` | 模拟器实例的查看 / 启动 / 停止 |
+| `emu` | 模拟器实例的查看 / 启动 / 停止，以及设备控制（旋转、电源、音量、电量、定位、摇一摇） |
 | `emu_ui` | 屏幕结构读取、交互与截图 |
-| `hmos_deploy` | 构建 → 安装 → 启动 |
+| `hmos_deploy` | 构建 → 安装 → 启动；可只构建指定模块，或清理构建产物 |
+| `hmos_device` | 设备详情、文件传入 / 取出、在设备上查数据库 |
 | `hmos_lint` | 代码检查 |
 | `hmos_log` | 设备日志 |
 | `hmos_docs` | 官方鸿蒙文档检索 |

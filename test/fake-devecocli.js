@@ -15,8 +15,12 @@
  *   DSH_FAKE_INSTANCES       stdout for `emulator list --format json`
  *   DSH_FAKE_IMAGES          stdout for `emulator image list --format json`
  *   DSH_FAKE_DEVICES         stdout for `device list --format json`
+ *   DSH_FAKE_DEVICE_VIEW/_CODE   stdout and exit code for `device view --format json`
+ *   DSH_FAKE_DEVICE_OUT/_CODE    stdout and exit code for `device file …` and `device sqlite3 …`
  *   DSH_FAKE_START/_CODE     stdout and exit code for `emulator start`
  *   DSH_FAKE_STOP/_CODE      stdout and exit code for `emulator stop`
+ *   DSH_FAKE_EMU/_CODE       stdout and exit code for the emulator control verbs (rotate, power,
+ *                            volume, battery, geolocation, shake)
  *   DSH_FAKE_UPDATE/_CODE    stdout and exit code for `update`
  *   DSH_FAKE_PNG             bytes written for `ui screenshot`
  *   DSH_FAKE_BUILD           stdout for `build` (with DSH_FAKE_BUILD_CODE as its exit code)
@@ -51,8 +55,26 @@ if (group === 'emulator' && (verb === 'start' || verb === 'stop')) {
   process.exit(Number(process.env[verb === 'start' ? 'DSH_FAKE_START_CODE' : 'DSH_FAKE_STOP_CODE'] || '0'))
 }
 
+// Emulator controls (rotate/power/volume/battery/geolocation/shake): one verb, one injected state, so
+// the argv the tool built is the assertion. DSH_FAKE_EMU / _CODE simulate the version gate refusing.
+if (group === 'emulator' && ['rotate', 'power', 'volume', 'battery', 'geolocation', 'shake'].includes(verb)) {
+  if (process.env.DSH_FAKE_EMU) process.stdout.write(process.env.DSH_FAKE_EMU)
+  process.exit(Number(process.env.DSH_FAKE_EMU_CODE || '0'))
+}
+
 // Device enumeration: the same JSON shape the real CLI prints for `device list --format json`.
 if (group === 'device' && verb === 'list') out(process.env.DSH_FAKE_DEVICES || '[]')
+
+// Device detail (`device view --format json`) and the two device verbs whose value is the argv they
+// were given: a transfer and a database query. Canned stdout, chosen exit code.
+if (group === 'device' && verb === 'view') {
+  if (process.env.DSH_FAKE_DEVICE_VIEW) process.stdout.write(process.env.DSH_FAKE_DEVICE_VIEW)
+  process.exit(Number(process.env.DSH_FAKE_DEVICE_VIEW_CODE || '0'))
+}
+if (group === 'device' && (verb === 'file' || verb === 'sqlite3')) {
+  if (process.env.DSH_FAKE_DEVICE_OUT) process.stdout.write(process.env.DSH_FAKE_DEVICE_OUT)
+  process.exit(Number(process.env.DSH_FAKE_DEVICE_CODE || '0'))
+}
 
 // `update` reinstalls the CLI; here it only reports what the caller asked to see.
 if (group === 'update') {

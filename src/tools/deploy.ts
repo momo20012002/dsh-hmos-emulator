@@ -13,13 +13,14 @@ export function makeHmosDeploy(deps: ToolDeps) {
   const { api, ctx } = deps
   return {
       name: 'hmos_deploy',
-      description: 'Build and deploy a project via devecocli (run: build -> install -> launch; buildOnly: build only). Returns phase, duration, ArkTS errors with file/line, hap path and an output tail.',
+      description: 'Build and deploy a project via devecocli: deploy builds -> installs -> launches, clean runs hvigor clean. buildOnly builds without a device; modules narrows a build. Returns phase, duration, ArkTS errors with file/line, hap path and a tail.',
       parameters: {
         type: 'object',
         properties: {
+          action: { type: 'string', enum: ['deploy', 'clean'], description: 'deploy (default) | clean (hvigor clean; no device needed)' },
           projectPath: PROJECT_ROOT,
           device: { type: 'string', description: 'serial (default: first running emulator)' },
-          module: { type: 'string', description: 'module (default: entry)' },
+          modules: { type: 'array', items: { type: 'string' }, description: 'modules to build (default: the entry). A full deploy takes one; use buildOnly for several.' },
           buildOnly: { type: 'boolean', description: 'build only: no device, no install/launch' },
           skipBuild: { type: 'boolean', description: 'run --skip-build: install + launch existing artifacts' },
           read: { type: 'boolean', description: 'attach the failure screenshot when the deploy fails, not just its path' },
@@ -39,6 +40,27 @@ export function makeHmosDeploy(deps: ToolDeps) {
         if (!existsSync(join(projectPath, PROJECT_MARK))) {
           return { ok: false, error: `未找到 ${PROJECT_MARK}:已按 ${projectPath} 查找(传目录时请给工程根,相对路径按会话工作区解析)。` }
         }
+        // `clean` answers the one build failure whose fix is not in the code: stale outputs. It needs
+        // no device and no module, so it returns before either is resolved.
+        const action = typeof args?.action === 'string' && args.action.trim() ? args.action.trim() : 'deploy'
+        if (action !== 'deploy' && action !== 'clean') {
+          // A misspelt action must not fall through to a real build and install.
+          return { ok: false, error: `unknown action ${action}; expected deploy or clean` }
+        }
+        if (action === 'clean') {
+          const started = Date.now()
+          const r = await runCli([process.execPath, cli, 'build', 'clean'], { cwd: projectPath, timeoutMs: 10 * 60 * 1000, signal: exec?.signal })
+          const text = stripAnsi(r.output)
+          return {
+            ok: r.code === 0,
+            code: r.code,
+            timedOut: r.timedOut === true,
+            phase: 'clean',
+            durationMs: Date.now() - started,
+            tail: tailText(text, r.code === 0 ? 4 : 12),
+            error: r.code === 0 ? '' : tailText(text, 8),
+          }
+        }
         const buildOnly = args?.buildOnly === true
         const skipBuild = args?.skipBuild === true
         const device = buildOnly
@@ -46,18 +68,38 @@ export function makeHmosDeploy(deps: ToolDeps) {
           : (typeof args?.device === 'string' && args.device.trim() ? args.device.trim() : '') || await firstRunningSerial(cli)
         if (!buildOnly && !device) return { ok: false, error: 'no running emulator; start one with emu {action:"start", name:"<instance>"}' }
         const modules = readModules(projectPath)
-        const asked = typeof args?.module === 'string' ? args.module.trim() : ''
+        // `modules` is the declared parameter; the older single `module` still arrives from prompts and
+        // scripts written before it, and the parameter root is open, so accept it rather than ignore a
+        // request that used to work.
+        const listed = Array.isArray(args?.modules) ? args.modules.map((m) => String(m).trim()).filter(Boolean) : []
+        const legacy = typeof args?.module === 'string' ? args.module.trim() : ''
+        const askedList = listed.length ? listed : (legacy ? [legacy] : [])
+        const asked = askedList.join('、')
         // The marker file is checked to exist above, so an empty list means the names could not be
         // READ (an extreme JSON5 literal `stripJson5` does not cover). Rejecting an explicit
         // module with "模块 X 不属于该工程(可选:无)" was a misleading answer to a readable request:
         // pass it through to hvigor instead, and say the list was unreadable.
         const modulesUnreadable = modules.length === 0
-        if (asked && !modulesUnreadable && !modules.includes(asked)) {
-          return { ok: false, error: `模块“${asked}”不属于该工程(可选:${modules.join('、')})` }
+        const unknown = modulesUnreadable ? [] : askedList.filter((m) => !modules.includes(m))
+        if (unknown.length) {
+          return { ok: false, error: `模块“${unknown.join('、')}”不属于该工程(可选:${modules.join('、')})` }
         }
-        const chosen = asked || (modules.includes('entry') ? 'entry' : modules[0])
+        // One module drives the run path and the HTTP deploy path; a build-only call may take several.
+        const chosenList = askedList.length ? askedList : (modules.includes('entry') ? ['entry'] : modules.slice(0, 1))
+        const chosen = chosenList[0] ?? ''
         const unreadNote = modulesUnreadable
-          ? `未能从 build-profile.json5 读出模块名(stripJson5 只覆盖常见 JSON5 写法),本次${asked ? `按你指定的 module=“${asked}”` : '不传 --module'};要精确定位请显式传 module。`
+          ? `未能从 build-profile.json5 读出模块名(stripJson5 只覆盖常见 JSON5 写法),本次${asked ? `按你指定的 modules=“${asked}”` : '不传 --modules'};要精确定位请显式传 modules。`
+          : ''
+        // Two module names were given two ways: `modules` wins, and the older one is said to be
+        // ignored rather than dropped in silence.
+        const legacyNote = listed.length && legacy ? `本次以 modules=${listed.join('、')} 为准,忽略 module=“${legacy}”。` : ''
+        const narrowedNote = chosenList.length > 1 && !skipBuild
+          ? (buildOnly
+            ? ''
+            : `本次 deploy 只构建第一个模块(${chosen});要一次构建多个模块请用 buildOnly=true。`)
+          : ''
+        const givenNote = chosenList.length > 1 && skipBuild
+          ? `安装与启动只涉及第一个模块(${chosen})。`
           : ''
         const started = Date.now()
         let output = ''
@@ -69,7 +111,7 @@ export function makeHmosDeploy(deps: ToolDeps) {
             // The official stage switches, as listed in `build --help` / `run --help`. There is no
             // "install without launching", so that combination is deliberately not offered.
             const argv = buildOnly
-              ? [process.execPath, cli, 'build', ...(chosen ? ['--modules', chosen] : [])]
+              ? [process.execPath, cli, 'build', ...(chosenList.length ? ['--modules', ...chosenList] : [])]
               : [process.execPath, cli, 'run', '--device', device, ...(chosen ? ['--module', chosen] : []), '--skip-build']
             const r = await runCli(argv, { cwd: projectPath, timeoutMs: 20 * 60 * 1000, signal: exec?.signal })
             output = r.output
@@ -99,6 +141,7 @@ export function makeHmosDeploy(deps: ToolDeps) {
           timedOut,
           device: device || null,
           module: chosen || null,
+          modules: chosenList,
           phase: buildOnly ? 'build' : deployPhase(output),
           durationMs: Date.now() - started,
           errors: errors.map((e) => ({ ...e, file: relativeTo(projectPath, e.file) })),
@@ -106,7 +149,10 @@ export function makeHmosDeploy(deps: ToolDeps) {
           warnCount,
         }
         const hap = chosen ? hapPathOf(projectPath, chosen) : null
-        if (hap) result.hapPath = hap
+        // Only a build that succeeded produced the artifact this call names. A failure leaves the
+        // previous build's hap in the standard output directory, so reporting that path would read as
+        // "this call produced that file".
+        if (ok && hap) result.hapPath = hap
         if (!ok && note) result.note = note
         // A failed build can end at the entry-list check, whose message hides the page's own
         // diagnostics; say so next to it rather than letting it read as the real error.
@@ -115,9 +161,15 @@ export function makeHmosDeploy(deps: ToolDeps) {
           if (masked) result.note = result.note ? `${result.note} ${masked}` : masked
         }
         // A readable-looking project whose module list could not be parsed is worth saying out loud,
-        // on success too: the caller cannot otherwise tell why `--module` was or was not passed.
+        // on success too: the caller cannot otherwise tell why `--modules` was or was not passed.
         if (unreadNote) result.note = result.note ? `${result.note} ${unreadNote}` : unreadNote
+        if (legacyNote) result.note = result.note ? `${result.note} ${legacyNote}` : legacyNote
+        if (narrowedNote) result.note = result.note ? `${result.note} ${narrowedNote}` : narrowedNote
+        if (givenNote) result.note = result.note ? `${result.note} ${givenNote}` : givenNote
         result.tail = tailText(output, ok ? 6 : 30)
+        // Both failure paths of this tool carry `error`, so a caller that reads only that field sees
+        // the same thing whether the build failed or `clean` did.
+        if (!ok) result.error = tailText(output, 8)
         // A failed install/launch leaves the device showing whatever the app did — the one thing the
         // build log cannot tell. A build-only failure has nothing to look at.
         if (!ok && !buildOnly && device) {

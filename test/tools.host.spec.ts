@@ -681,3 +681,283 @@ describe.skipIf(!CAN_SPAWN)('projectPath resolution', () => {
   })
 })
 
+// The emulator controls are one verb each, and the only thing the caller can check without a device
+// is the argv: which verb, which target, which injected value. Every case asserts that, because the
+// failure mode worth catching is not "the CLI is broken" but "we asked it for the wrong thing".
+describe.skipIf(!CAN_SPAWN)('emu controls', () => {
+  const argvLines = () => readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  const lastArgv = () => argvLines()[argvLines().length - 1]
+  const emu = () => mountAll().find((def) => def.name === 'emu')
+
+  afterEach(() => {
+    delete process.env.DSH_FAKE_EMU
+    delete process.env.DSH_FAKE_EMU_CODE
+  })
+
+  it('rotates a running instance with the direction it was given', async () => {
+    const result = await emu().execute({ action: 'rotate', name: 'Pixel', direction: 'left' }, exec)
+    expect(result.ok).toBe(true)
+    expect(lastArgv()).toEqual(['emulator', 'rotate', '--target', 'Pixel', 'left'])
+  })
+
+  it('refuses a control without the value that gives it meaning, before spawning anything', async () => {
+    const noDirection = await emu().execute({ action: 'volume', name: 'Pixel' }, exec)
+    expect(noDirection.ok).toBe(false)
+    expect(noDirection.error).toContain('direction is required')
+    // Each verb accepts its own two choices, not the union: `volume left` is a CLI error otherwise.
+    const crossed = await emu().execute({ action: 'volume', name: 'Pixel', direction: 'left' }, exec)
+    expect(crossed.ok).toBe(false)
+    expect(crossed.error).toContain('up|down')
+    const emptyBattery = await emu().execute({ action: 'battery', name: 'Pixel' }, exec)
+    expect(emptyBattery.ok).toBe(false)
+    expect(emptyBattery.error).toContain('level')
+    const emptyGeo = await emu().execute({ action: 'geolocation', name: 'Pixel' }, exec)
+    expect(emptyGeo.ok).toBe(false)
+    expect(emptyGeo.error).toContain('longitude')
+    // Nothing was asked of the CLI: the log file was never created.
+    expect(existsSync(process.env.DSH_FAKE_ARGV_LOG)).toBe(false)
+  })
+
+  it('maps a partial geolocation onto the flags the CLI names, heading included', async () => {
+    const result = await emu().execute({ action: 'geolocation', name: 'Pixel', latitude: 31.23, longitude: 121.47, heading: 90 }, exec)
+    expect(result.ok).toBe(true)
+    expect(lastArgv()).toEqual([
+      'emulator', 'geolocation', '--target', 'Pixel',
+      '--longitude', '121.47', '--latitude', '31.23', '--direction', '90',
+    ])
+  })
+
+  it('rejects a number it cannot read instead of injecting half a position', async () => {
+    // `latitude: 'abc'` used to look like "latitude not given", so the call injected only longitude
+    // and reported success: a wrong position with a green result.
+    const result = await emu().execute({ action: 'geolocation', name: 'Pixel', longitude: 121.4, latitude: 'abc' }, exec)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('latitude')
+    expect(existsSync(process.env.DSH_FAKE_ARGV_LOG)).toBe(false)
+  })
+
+  it('presses power without needing a value', async () => {
+    const result = await emu().execute({ action: 'power', name: 'Pixel' }, exec)
+    expect(result.ok).toBe(true)
+    expect(lastArgv()).toEqual(['emulator', 'power', '--target', 'Pixel'])
+  })
+
+  it('answers an unknown action before asking for a name', async () => {
+    const result = await emu().execute({ action: 'rotatee' }, exec)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('unknown action')
+  })
+
+  it('passes the version gate through in the CLI words rather than inventing one', async () => {
+    process.env.DSH_FAKE_EMU = 'Emulator scene control commands require Emulator 7.0 or later.'
+    process.env.DSH_FAKE_EMU_CODE = '1'
+    const result = await emu().execute({ action: 'shake', name: 'Pixel' }, exec)
+    expect(result.ok).toBe(false)
+    expect(result.code).toBe(1)
+    expect(result.error).toContain('Emulator 7.0 or later')
+  })
+})
+
+// `build clean` and a narrowed `--modules` are the two build options whose value is entirely in the
+// argv: clean must not touch a device, and a narrowed build must name every module it was given.
+describe.skipIf(!CAN_SPAWN)('deploy clean and module selection', () => {
+  const argvLines = () => readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  const lastArgv = () => argvLines()[argvLines().length - 1]
+  const project = (name, modules = 'entry') => {
+    mkdirSync(join(dir, name), { recursive: true })
+    writeFileSync(join(dir, name, 'build-profile.json5'), `{ "modules": [${modules.split(',').map((m) => `{ "name": "${m}" }`).join(', ')}] }`)
+    return name
+  }
+
+  it('cleans build outputs without needing a running device', async () => {
+    // No DSH_FAKE_DEVICES is set in this file, so a device check would fail — clean has to skip it.
+    const result = await mountAll().find((def) => def.name === 'hmos_deploy')
+      .execute({ projectPath: project('clean-proj'), action: 'clean' }, exec)
+    expect(result.ok).toBe(true)
+    expect(result.phase).toBe('clean')
+    expect(lastArgv()).toEqual(['build', 'clean'])
+  })
+
+  it('builds every module it was given, in the order given', async () => {
+    const result = await mountAll().find((def) => def.name === 'hmos_deploy')
+      .execute({ projectPath: project('multi', 'entry,feature'), modules: ['feature', 'entry'], buildOnly: true }, exec)
+    expect(result.ok).toBe(true)
+    expect(result.modules).toEqual(['feature', 'entry'])
+    const build = argvLines().find((a) => a[0] === 'build')
+    expect(build).toEqual(['build', '--modules', 'feature', 'entry'])
+  })
+
+  it('still accepts the single module name older prompts send', async () => {
+    const result = await mountAll().find((def) => def.name === 'hmos_deploy')
+      .execute({ projectPath: project('legacy'), module: 'entry', buildOnly: true }, exec)
+    expect(result.ok).toBe(true)
+    expect(result.modules).toEqual(['entry'])
+  })
+
+  it('says which module a full deploy narrowed a multi-module request to', async () => {
+    // The full deploy path goes through the host API, which checks the device is online first — so
+    // this case needs one, unlike `clean`.
+    process.env.DSH_FAKE_DEVICES = '["127.0.0.1:5555"]'
+    try {
+      const result = await mountAll().find((def) => def.name === 'hmos_deploy')
+        .execute({ projectPath: project('narrow', 'entry,feature'), modules: ['entry', 'feature'], device: '127.0.0.1:5555' }, exec)
+      expect(result.modules).toEqual(['entry', 'feature'])
+      expect(result.note).toContain('只构建第一个模块')
+    } finally {
+      delete process.env.DSH_FAKE_DEVICES
+    }
+  })
+
+  it('does not name the hap a failed build left behind', async () => {
+    // A failure leaves the previous build's hap in the standard output directory, so a path would read
+    // as "this call produced that file". The stale file is planted here, or the case proves nothing.
+    project('nohap')
+    const stale = join(dir, 'nohap', 'entry', 'build', 'default', 'outputs', 'default')
+    mkdirSync(stale, { recursive: true })
+    writeFileSync(join(stale, 'entry-default-unsigned.hap'), 'stale-hap')
+    process.env.DSH_FAKE_BUILD = 'COMPILE RESULT:FAIL\n> hvigor ERROR: BUILD FAILED'
+    process.env.DSH_FAKE_BUILD_CODE = '1'
+    const result = await mountAll().find((def) => def.name === 'hmos_deploy')
+      .execute({ projectPath: 'nohap', modules: ['entry'], buildOnly: true }, exec)
+    delete process.env.DSH_FAKE_BUILD
+    delete process.env.DSH_FAKE_BUILD_CODE
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('BUILD FAILED')
+    expect(result.hapPath).toBeUndefined()
+  })
+
+  it('rejects an action it does not have instead of deploying anyway', async () => {
+    // A misspelt action used to fall through to the deploy branch, which builds and installs for
+    // real: an unknown word must not have a side effect.
+    const result = await mountAll().find((def) => def.name === 'hmos_deploy')
+      .execute({ projectPath: project('typo'), action: 'cleen', buildOnly: true }, exec)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('unknown action')
+    expect(existsSync(process.env.DSH_FAKE_ARGV_LOG)).toBe(false)
+  })
+
+  it('rejects a module the project really lacks, naming the ones it has', async () => {
+    const result = await mountAll().find((def) => def.name === 'hmos_deploy')
+      .execute({ projectPath: project('bad'), modules: ['entry', 'nope'], buildOnly: true }, exec)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('nope')
+    expect(result.error).toContain('entry')
+  })
+})
+
+// The device verbs take no project: a device, and for a transfer the two ends of it. The local end
+// resolves against the session workspace for the same reason `projectPath` does — that is the
+// directory the caller can see — and a download makes its own directory while an upload refuses a
+// path that is not there.
+describe.skipIf(!CAN_SPAWN)('hmos_device', () => {
+  const argvLines = () => readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  const lastArgv = () => argvLines()[argvLines().length - 1]
+  const device = () => mountAll().find((def) => def.name === 'hmos_device')
+  const DEVICES = '["127.0.0.1:5555"]'
+
+  beforeEach(() => { process.env.DSH_FAKE_DEVICES = DEVICES })
+  afterEach(() => {
+    delete process.env.DSH_FAKE_DEVICES
+    delete process.env.DSH_FAKE_DEVICE_VIEW
+    delete process.env.DSH_FAKE_DEVICE_VIEW_CODE
+    delete process.env.DSH_FAKE_DEVICE_OUT
+    delete process.env.DSH_FAKE_DEVICE_CODE
+  })
+
+  it('answers the device detail as JSON, from the device it was told to use', async () => {
+    process.env.DSH_FAKE_DEVICE_VIEW = JSON.stringify({ name: 'Pixel', serial: '127.0.0.1:5555', kind: 'emulator', deviceType: 'phone', osVersion: 'HarmonyOS 6.0.1' })
+    const result = await device().execute({ action: 'view' }, exec)
+    expect(result.ok).toBe(true)
+    expect(result.info).toMatchObject({ serial: '127.0.0.1:5555', kind: 'emulator' })
+    expect(lastArgv()).toEqual(['device', 'view', '-t', '127.0.0.1:5555', '--format', 'json'])
+  })
+
+  it('keeps a prose answer from view instead of reporting an empty success', async () => {
+    // A view that did not print JSON is still an answer; an empty body would read as "nothing to say".
+    process.env.DSH_FAKE_DEVICE_VIEW = 'No connected device found.'
+    const result = await device().execute({ action: 'view' }, exec)
+    expect(result.info).toBeUndefined()
+    expect(result.output).toContain('No connected device found')
+  })
+
+  it('refuses an upload whose local file is not there, before asking the device', async () => {
+    const result = await device().execute({ action: 'send', remote: '/data/local/tmp/x.db', local: 'missing.db' }, exec)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('local file not found')
+    // The device lookup itself is a CLI call, so the assertion is that no transfer was asked for.
+    expect(argvLines().some((a) => a[0] === 'device' && a[1] === 'file')).toBe(false)
+  })
+
+  it('sends a workspace-relative file as an absolute path, and receives into a directory it makes', async () => {
+    writeFileSync(join(dir, 'app.db'), 'bytes')
+    const sent = await device().execute({ action: 'send', remote: '/data/local/tmp/app.db', local: 'app.db' }, exec)
+    expect(sent.ok).toBe(true)
+    expect(lastArgv()).toEqual(['device', 'file', 'send', '--device', '127.0.0.1:5555', join(dir, 'app.db'), '/data/local/tmp/app.db'])
+
+    // `nested/` does not exist yet: a download is allowed to be the thing that creates it.
+    const got = await device().execute({ action: 'recv', remote: '/data/local/tmp/app.db', local: 'nested/app.db' }, exec)
+    expect(got.ok).toBe(true)
+    expect(got.local).toBe(join(dir, 'nested', 'app.db'))
+    expect(existsSync(join(dir, 'nested'))).toBe(true)
+    expect(lastArgv()).toEqual(['device', 'file', 'recv', '--device', '127.0.0.1:5555', '/data/local/tmp/app.db', join(dir, 'nested', 'app.db')])
+  })
+
+  it('runs a query as the words a shell would hand over, defaulting to a table list', async () => {
+    process.env.DSH_FAKE_DEVICE_OUT = 'users\norders\n'
+    const listed = await device().execute({ action: 'sqlite3', remote: '/data/app/db/base.db' }, exec)
+    expect(listed.ok).toBe(true)
+    expect(listed.output).toContain('users')
+    expect(lastArgv()).toEqual(['device', 'sqlite3', '--device', '127.0.0.1:5555', '/data/app/db/base.db', '.tables'])
+
+    const queried = await device().execute({ action: 'sqlite3', remote: '/data/app/db/base.db', sql: 'select count(*) from users' }, exec)
+    expect(queried.ok).toBe(true)
+    expect(lastArgv()).toEqual(['device', 'sqlite3', '--device', '127.0.0.1:5555', '/data/app/db/base.db', 'select', 'count(*)', 'from', 'users'])
+  })
+
+  it('keeps a device-shaped local path inside the workspace instead of the drive root', async () => {
+    // On Windows a leading slash is absolute and `resolve` reads it against the current drive's root:
+    // `recv` would write to `C:\data\x.db`. On POSIX the same string really is absolute, so the
+    // assertion splits rather than pretending the two platforms agree.
+    const got = await device().execute({ action: 'recv', remote: '/data/local/tmp/x.db', local: '/data/x.db' }, exec)
+    expect(got.ok).toBe(true)
+    expect(got.local).toBe(process.platform === 'win32' ? join(dir, 'data', 'x.db') : '/data/x.db')
+  })
+
+  it('reports a failed transfer with the fields a caller reads', async () => {
+    process.env.DSH_FAKE_DEVICE_OUT = 'adb: device offline'
+    process.env.DSH_FAKE_DEVICE_CODE = '1'
+    const result = await device().execute({ action: 'sqlite3', remote: '/data/app/db/base.db', sql: '.tables' }, exec)
+    expect(result.ok).toBe(false)
+    expect(result.code).toBe(1)
+    expect(result.timedOut).toBe(false)
+    expect(result.error).toContain('device offline')
+  })
+
+  it('answers an unknown action before probing for a device', async () => {
+    // No instance is running here, so a check that ran second would report "no running emulator" to a
+    // caller whose mistake was the action — and would spend a spawn doing it.
+    process.env.DSH_FAKE_INSTANCES = '[]'
+    try {
+      const result = await device().execute({ action: 'shell' }, exec)
+      expect(result.ok).toBe(false)
+      expect(result.error).toContain('unknown action')
+      expect(existsSync(process.env.DSH_FAKE_ARGV_LOG)).toBe(false)
+    } finally {
+      process.env.DSH_FAKE_INSTANCES = INSTANCES
+    }
+  })
+
+  it('says there is no device instead of letting the CLI report one', async () => {
+    // The running-serial lookup reads `emulator list`, so an empty instance list is what "no device"
+    // means here — the device list is a different question.
+    process.env.DSH_FAKE_INSTANCES = '[]'
+    try {
+      const result = await device().execute({ action: 'view' }, exec)
+      expect(result.ok).toBe(false)
+      expect(result.error).toContain('no running emulator')
+    } finally {
+      process.env.DSH_FAKE_INSTANCES = INSTANCES
+    }
+  })
+})
+
