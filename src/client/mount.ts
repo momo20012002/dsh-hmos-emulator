@@ -409,7 +409,7 @@ function resolveMode(requested: MountMode, ready: { nativeReady: boolean; better
  */
 function reasonFor(requested: MountMode, effective: MountMode | 'none'): string {
   if (effective === requested) return ''
-  if (effective === 'none') return '右侧栏尚未就绪,面板将在就绪后自动显示。'
+  if (effective === 'none') return '侧边栏尚未就绪,面板将在就绪后自动显示。'
   return requested === 'better'
     ? '未检测到 dsh-better-sidebar,面板继续显示在内置右侧栏。'
     : '内置右侧栏不可用,面板已切换到 dsh-better-sidebar。'

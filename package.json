@@ -1,7 +1,7 @@
 {
   "name": "dsh-hmos-emulator",
   "version": "0.1.5",
-  "description": "DSH 右侧栏标签页插件：启动鸿蒙模拟器，将选定的 HarmonyOS 工程构建、安装并部署到目标设备。",
+  "description": "DSH 侧边栏标签页插件：启动鸿蒙模拟器，将选定的 HarmonyOS 工程构建、安装并部署到目标设备。",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",
@@ -64,7 +64,7 @@
   "dshhub": {
     "schemaVersion": 1,
     "displayName": "dsh-hmos-emulator",
-    "summary": "DSH 右侧栏标签页：启动鸿蒙模拟器，将选定的 HarmonyOS 工程构建、安装并部署到目标设备。",
+    "summary": "DSH 侧边栏标签页：启动鸿蒙模拟器，将选定的 HarmonyOS 工程构建、安装并部署到目标设备。",
     "categories": [
       "鸿蒙",
       "Web UI",

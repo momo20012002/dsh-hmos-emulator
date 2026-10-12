@@ -144,7 +144,7 @@ function betterBuild(ctx: Ctx): string {
  */
 export function mountDetail(mount: { effective: string }): string {
   if (mount.effective === 'none') return '当前没有可用的挂载位置,面板暂不显示。'
-  return '切换后,若未自动打开,请在右侧栏的「新标签页」中重新打开。'
+  return '切换后,若未自动打开,请在侧边栏的「新标签页」中重新打开。'
 }
 
 /**
