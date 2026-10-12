@@ -106,8 +106,21 @@ export function Segmented({ value, options, onChange }: {
  * hang out of it.
  */
 export function Popover({ onClose, children }: { onClose?: () => void; children?: any }) {
-  return h('div', null,
-    onClose ? h('div', { style: { position: 'fixed', inset: 0, zIndex: 20 }, onClick: onClose }) : null,
+  const boxRef = useRef(null)
+  // Closing on an outside press instead of with a scrim, for the reason Dropdown spells out below: this
+  // panel's root carries a backdrop-filter, so it is the containing block for position:fixed children and
+  // a "full-screen" scrim would cover only the panel — a press beside it would leave the popover open.
+  useEffect(() => {
+    if (!onClose) return undefined
+    const onDown = (e) => {
+      const box = boxRef.current
+      if (box && !box.contains(e.target)) onClose()
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [onClose])
+  // The wrapper stays unpositioned on purpose: the panel below anchors to the caller's own relative box.
+  return h('div', { ref: boxRef },
     h('div', {
       style: {
         position: 'absolute', right: 0, top: '100%', marginTop: -6, width: 'min(322px, 100%)', zIndex: 21,

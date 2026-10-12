@@ -7,6 +7,11 @@ import { DEVICE_SERIAL } from './schema.js'
 import type { ToolDeps } from './deps.js'
 /** Device logs. */
 
+/** A boolean parameter as prompts and scripts send it: a real boolean, or its word. */
+function asBool(value: unknown): boolean {
+  return value === true || value === 'true'
+}
+
 export function makeHmosLog(deps: ToolDeps) {
   const { api, ctx } = deps
   return {
@@ -35,7 +40,7 @@ export function makeHmosLog(deps: ToolDeps) {
         if (!device) return { ok: false, error: 'no running emulator; start one with emu {action:"start", name:"<instance>"}' }
         const tail = Number.isFinite(args?.tail) ? Math.max(1, Math.min(500, args.tail)) : 50
         const argv = ['log', '--device', device, '--tail', String(tail)]
-        if (args?.crash) argv.push('--crash')
+        if (asBool(args?.crash)) argv.push('--crash')
         if (typeof args?.level === 'string' && args.level) argv.push('--level', String(args.level))
         if (typeof args?.bundle === 'string' && args.bundle.trim()) argv.push('--bundle-name', args.bundle.trim())
         if (typeof args?.keyword === 'string' && args.keyword.trim()) argv.push('--keyword', args.keyword.trim())
@@ -48,10 +53,10 @@ export function makeHmosLog(deps: ToolDeps) {
         // Parsed lines are the point of this tool, but a run that parses to nothing (a wrapped or
         // unexpected format) must not look like "no logs", so hand back the raw tail instead.
         if (lines.length === 0) result.rawTail = text.length > 2000 ? text.slice(-2000) : text
-        else if (args?.raw) result.rawTail = text.length > 8000 ? text.slice(-8000) : text
+        else if (asBool(args?.raw)) result.rawTail = text.length > 8000 ? text.slice(-8000) : text
         // A crash log names the failure; the screenshot shows what the app was doing when it happened.
-        if (args?.crash && lines.length > 0) {
-          Object.assign(result, await shotFields(api, device, sessionWorkspace(exec), 'crash', ctx, args?.read === true))
+        if (asBool(args?.crash) && lines.length > 0) {
+          Object.assign(result, await shotFields(api, device, sessionWorkspace(exec), 'crash', ctx, asBool(args?.read)))
         }
         return result
       },

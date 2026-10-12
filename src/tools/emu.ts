@@ -1,4 +1,5 @@
-import { ensureImageReady, parseJsonArray, resolveDevecoCli, runCli, throwIfAborted, waitDeviceReady } from '../toolchain.js'
+import { ensureImageReady, firstRunningSerial, parseJsonArray, resolveDevecoCli, runCli, throwIfAborted, waitDeviceReady } from '../toolchain.js'
+import { stripAnsi } from '../parsers/devecocli.js'
 import { tailText } from '../text.js'
 import { TOOL_OUT_SCHEMA, toolRender } from '../shots.js'
 import type { ToolDeps } from './deps.js'
@@ -14,7 +15,7 @@ import type { ToolDeps } from './deps.js'
  */
 
 /** The actions that drive a running instance rather than start or stop one. */
-const CONTROL_ACTIONS = ['rotate', 'power', 'volume', 'battery', 'geolocation', 'shake']
+const CONTROL_ACTIONS = ['rotate', 'power', 'volume', 'battery', 'geolocation', 'shake', 'fold', 'scene']
 
 /** Trimmed string, or empty. */
 const asText = (value: unknown): string => (typeof value === 'string' && value.trim() ? value.trim() : '')
@@ -42,7 +43,7 @@ function suppliedButNotNumber(value: unknown): boolean {
 export function makeEmu(_deps: ToolDeps) {
   return {
       name: 'emu',
-      description: 'Emulator instances: list, start, stop — plus controls for a running one (rotate, power, volume, battery, geolocation, shake).',
+      description: 'Emulator instances: list, start, stop — plus controls for a running one (rotate, power, volume, battery, geolocation, shake, fold, scene).',
       parameters: {
         type: 'object',
         properties: {
@@ -59,6 +60,8 @@ export function makeEmu(_deps: ToolDeps) {
           latitude: { type: 'number', description: 'geolocation: latitude' },
           altitude: { type: 'number', description: 'geolocation: metres' },
           heading: { type: 'number', description: 'geolocation: degrees' },
+          state: { type: 'string', description: 'fold: folded shape — open|half-open|close, vertical-open (2-in-1), single|double|triple (triple fold)' },
+          type: { type: 'string', description: 'scene: outdoorRunning|outdoorCycling|drivingNavigation' },
         },
         required: ['action'],
       },
@@ -76,11 +79,13 @@ export function makeEmu(_deps: ToolDeps) {
         if (action === 'list') {
           const r = await runCli([process.execPath, cli, 'emulator', 'list', '--format', 'json'], { timeoutMs: 30000, signal: exec?.signal })
           const instances = parseJsonArray(r.output).map((it) => ({ name: it.name, status: it.status, serial: it.serial ?? null, osVersion: it.osVersion }))
-          return { ok: r.code === 0, instances, error: r.code === 0 ? '' : tailText(r.output, 5) }
+          return { ok: r.code === 0, instances, error: r.code === 0 ? '' : tailText(stripAnsi(r.output), 5) }
         }
-        const name = asText(args?.name)
+        // Controls and stop take an instance name or its serial, and both honour the same default the
+        // other tools use; only `start` genuinely needs a name, since a serial cannot launch one.
+        const name = asText(args?.name) || (action === 'start' ? '' : await firstRunningSerial(cli))
         if (CONTROL_ACTIONS.includes(action)) {
-          if (!name) return { ok: false, action, error: `name is required for ${action} (the instance name, or its serial)` }
+          if (!name) return { ok: false, action, error: `no running emulator to ${action}; pass name, or start one with emu {action:"start", name:"<instance>"}` }
           const argv = [process.execPath, cli, 'emulator', action, '--target', name]
           if (action === 'rotate' || action === 'volume') {
             const direction = asText(args?.direction)
@@ -96,6 +101,11 @@ export function makeEmu(_deps: ToolDeps) {
             const level = asNumber(args?.level)
             const status = asText(args?.status)
             if (level === undefined && !status) return { ok: false, action, error: 'battery needs level (0-100), status (charging|discharging), or both' }
+            // Validated here the way `direction` is above: the CLI refuses both of these anyway, after a
+            // spawn and in its own words, and a range the caller can be told about costs no round trip.
+            if (level !== undefined && (level < 0 || level > 100)) return { ok: false, action, error: `level must be within 0-100, got ${level}` }
+            const allowedStatus = ['charging', 'discharging']
+            if (status && !allowedStatus.includes(status)) return { ok: false, action, error: `status takes ${allowedStatus.join('|')}, not ${status}` }
             if (level !== undefined) argv.push('--level', String(level))
             if (status) argv.push('--status', status)
           }
@@ -119,20 +129,35 @@ export function makeEmu(_deps: ToolDeps) {
             }
             for (const [flag, value] of parts) if (value !== undefined) argv.push(flag, String(value))
           }
+          if (action === 'fold' || action === 'scene') {
+            // A foldable's accepted shapes depend on its model, so a bad value is answered by the CLI's own
+            // mapping — printed with the request — rather than by a list kept here that could go stale. The
+            // three motion scenes are fixed and named in the parameter.
+            const value = asText(action === 'fold' ? args?.state : args?.type)
+            if (!value) return { ok: false, action, error: `${action} needs ${action === 'fold' ? 'state: the folded shape (e.g. open, half-open, close)' : 'type: outdoorRunning, outdoorCycling or drivingNavigation'}` }
+            argv.push(value)
+          }
           const r = await runCli(argv, { timeoutMs: 60000, signal: exec?.signal })
-          return { ok: r.code === 0, action, target: name, code: r.code, error: r.code === 0 ? '' : tailText(r.output, 5) }
+          return { ok: r.code === 0, action, target: name, code: r.code, error: r.code === 0 ? '' : tailText(stripAnsi(r.output), 5) }
         }
-        if (!name) return { ok: false, error: 'name is required for start/stop' }
+        if (!name) return { ok: false, error: 'name is required to start an instance' }
         if (action === 'start') {
           try { await ensureImageReady(cli, name, exec?.signal) } catch (error) { return { ok: false, stage: 'image', error: error instanceof Error ? error.message : String(error), code: error?.code } }
           const r = await runCli([process.execPath, cli, 'emulator', 'start', name], { timeoutMs: 240000, signal: exec?.signal })
-          if (r.code !== 0) return { ok: false, stage: 'start', code: r.code, error: tailText(r.output, 8) }
+          if (r.code !== 0) return { ok: false, stage: 'start', code: r.code, error: tailText(stripAnsi(r.output), 8) }
           const { ready, serial, aborted } = await waitDeviceReady(cli, name, { signal: exec?.signal })
           return { ok: !aborted, aborted, ready, serial, error: aborted ? 'tool call aborted' : '' }
         }
         if (action === 'stop') {
+          // `emulator stop <unknown>` exits 0 without touching anything, so the exit code alone reports a
+          // stop that never happened. Ask the list whether that name or serial exists at all first.
+          const listed = await runCli([process.execPath, cli, 'emulator', 'list', '--format', 'json'], { timeoutMs: 30000, signal: exec?.signal })
+          const known = parseJsonArray(listed.output).some((it) => it.name === name || it.serial === name)
+          if (listed.code === 0 && !known) {
+            return { ok: false, action, target: name, code: 1, error: `未找到模拟器实例“${name}”:emulator list 里没有这个名字或串号。` }
+          }
           const r = await runCli([process.execPath, cli, 'emulator', 'stop', name], { timeoutMs: 60000, signal: exec?.signal })
-          return { ok: r.code === 0, code: r.code, error: r.code === 0 ? '' : tailText(r.output, 5) }
+          return { ok: r.code === 0, code: r.code, error: r.code === 0 ? '' : tailText(stripAnsi(r.output), 5) }
         }
         return { ok: false, error: `unknown action ${action}` }
       },

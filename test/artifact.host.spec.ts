@@ -15,7 +15,7 @@ function mountTools() {
 describe('tool surface', () => {
   it('registers hmos_lint next to the existing tools', () => {
     const names = mountTools().map((d) => d.name)
-    expect(names).toEqual(['emu', 'emu_ui', 'hmos_deploy', 'hmos_device', 'hmos_log', 'hmos_docs', 'hmos_lint'])
+    expect(names).toEqual(['emu', 'emu_ui', 'hmos_deploy', 'hmos_device', 'hmos_log', 'hmos_docs', 'hmos_lint', 'hmos_setup'])
   })
 
 })
@@ -55,19 +55,35 @@ describe('emu_ui batch surface', () => {
     // 200x cached input on the same route (deepseek-flash: 0.02 vs 4 yuan per million), and one
     // retry spends far more than the whole 900 characters cost across thousands of requests. Merged
     // is the cheaper arrangement at any realistic volume; the schema is resident, the round is not.
+    // Raised to 12 800 for capabilities reached through a tool a caller already holds, plus one new tool:
+    // `emu` gained fold/scene (a foldable's physical shape, whose accepted values differ by model, and the
+    // three motion scenes a navigation or fitness app reads), `hmos_lint` grew from a linter into the
+    // project-check tool (kind=lint | arkts | compat), `emu_ui` gained windows — the list its own `window`
+    // parameter used to assume — and `hmos_setup` carries the jobs that come up about once per project
+    // rather than once per round (scaffold an app, sign it, create or delete an instance). The first three
+    // are new verbs inside tools already in hand, so none of them costs the extra round a separate tool
+    // would; `hmos_setup` is separate precisely because those jobs are rare, and a capability the model
+    // cannot see is one it cannot ask for. Its description opens with the rule that gates it — call only
+    // when the user asks — which is not a saving but a safeguard: those verbs write to disk, so an
+    // unasked scaffold or instance costs a cleanup round, not just a call. Raised again to 13 300 for the
+    // three build flags the CLI has and nothing here reached — `--build-mode release` (the difference
+    // between a debug artifact and a shipped one), `--ability` (which ability a launch starts) and
+    // `--uninstall` (the fix for an install that refuses to replace) — plus the linter's own `--fix`.
+    // Measured: total 13 203, emu 1 317, hmos_lint 1 297, emu_ui 4 866, hmos_setup 1 538, deploy 1 570.
     const total = mountTools()
       .reduce((sum, def) => sum + JSON.stringify({ name: def.name, description: def.description, parameters: def.parameters }).length, 0)
-    expect(total).toBeLessThan(10200)
+    expect(total).toBeLessThan(13300)
   })
 
   it('keeps every tool inside its own share of the budget', () => {
     // One composite tool carries the whole action surface, so it gets the only large share; every
     // other tool is a single-purpose wrapper and must stay small. Caps sit just above the measured
-    // cost (emu_ui 4 765, hmos_log 913, hmos_deploy 1 117, hmos_docs 771, hmos_lint 607, emu 1 049,
-    // hmos_device 904 — the middle three rose with the control group, the build options and the
-    // device verbs, as the budget test above explains), so a message that grows them has to be a
-    // deliberate edit here.
-    const caps = { emu_ui: 4900, hmos_log: 1000, hmos_deploy: 1200, hmos_device: 1000, hmos_docs: 1000, hmos_lint: 1000, emu: 1100 }
+    // cost (emu_ui 4 866, hmos_log 913, hmos_deploy 1 570, hmos_docs 771, hmos_lint 1 297, emu 1 317,
+    // hmos_device 904, hmos_setup 1 538 — the middle three rose with the control group, the build options
+    // and the device verbs, hmos_lint with the other two checks, emu_ui/emu with windows and fold/scene,
+    // and hmos_setup with the once-per-project jobs, as the budget test above explains), so a message
+    // that grows them has to be a deliberate edit here.
+    const caps = { emu_ui: 4900, hmos_log: 1000, hmos_deploy: 1650, hmos_device: 1000, hmos_docs: 1000, hmos_lint: 1400, emu: 1350, hmos_setup: 1650 }
     const over = mountTools()
       .map((def) => ({ name: def.name, cost: JSON.stringify({ name: def.name, description: def.description, parameters: def.parameters }).length }))
       .filter((tool) => tool.cost >= caps[tool.name])
@@ -109,7 +125,7 @@ describe('tool registration resilience', () => {
       apply(ctx, {})
       const afterFirstMount = registered.map((d) => d.name)
       apply(ctx, {})
-      expect(afterFirstMount).toEqual(['emu', 'emu_ui', 'hmos_deploy', 'hmos_device', 'hmos_docs', 'hmos_lint'])
+      expect(afterFirstMount).toEqual(['emu', 'emu_ui', 'hmos_deploy', 'hmos_device', 'hmos_docs', 'hmos_lint', 'hmos_setup'])
       expect(registered.map((d) => d.name)).toEqual(afterFirstMount)
     } finally {
       logged.mockRestore()

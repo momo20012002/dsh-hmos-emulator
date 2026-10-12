@@ -1,4 +1,4 @@
-import { isAbsolute, resolve } from 'node:path'
+import { isAbsolute, normalize, resolve } from 'node:path'
 
 /**
  * The local half of a device transfer, in one place.
@@ -26,7 +26,10 @@ export function absoluteLocal(asked: string): boolean {
 
 /** The local half of a transfer: an absolute path as given, anything else under the workspace. */
 export function localPathFor(asked: string, root: string): string {
-  if (absoluteLocal(asked)) return asked
+  // devecocli joins the local half of `device file send|recv` with its own cwd, so a forward-slash drive
+  // path (`E:/x`) is read as relative and lands under `<cwd>\E:/x`. Native separators are what it
+  // expects, so normalize absolute paths before handing them over; a relative path is ours to resolve.
+  if (absoluteLocal(asked)) return normalize(asked)
   // A leading separator is not a request for a drive root on Windows: it is how a device path looks.
   return resolve(root, asked.replace(/^[\\/]+/, ''))
 }

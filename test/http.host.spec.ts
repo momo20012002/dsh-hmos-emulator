@@ -446,6 +446,57 @@ describe.skipIf(!CAN_SPAWN)('panel-only routes', () => {
     delete process.env.DSH_FAKE_DEVICES
   })
 
+  it('builds without a device, and hands build the flag it really has', async () => {
+    // Build-only and clean never reach a device, so neither may be blocked by "pick a device" — and the
+    // build verb takes `--modules` (`--module` is the run verb's, which is what this route used to send).
+    mkdirSync(join(dir, 'b'), { recursive: true })
+    writeFileSync(join(dir, 'b', 'build-profile.json5'), '{"modules":[{"name":"entry"}]}')
+    const argvLog = join(dir, 'build-argv.log')
+    process.env.DSH_FAKE_ARGV_LOG = argvLog
+    const built = await request({
+      name: 'deploy',
+      headers: { host: base, ...JSON_HEADERS },
+      body: JSON.stringify({ projectPath: join(dir, 'b'), buildOnly: true }),
+    })
+    expect(built.status).toBe(200)
+    expect(built.body).toContain('构建(模块 entry)')
+    const cleaned = await request({
+      name: 'deploy',
+      headers: { host: base, ...JSON_HEADERS },
+      body: JSON.stringify({ projectPath: join(dir, 'b'), mode: 'clean' }),
+    })
+    expect(cleaned.status).toBe(200)
+    expect(cleaned.body).toContain('清理构建')
+    // A boolean spelled as a word is what prompts and scripts send: it must not turn build into a deploy.
+    const spelled = await request({
+      name: 'deploy',
+      headers: { host: base, ...JSON_HEADERS },
+      body: JSON.stringify({ projectPath: join(dir, 'b'), buildOnly: 'true' }),
+    })
+    expect(spelled.status).toBe(200)
+    expect(spelled.body).toContain('构建(模块 entry)')
+    const argvs = readFileSync(argvLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    expect(argvs[0]).toEqual(['build', '--modules', 'entry'])
+    expect(argvs[1]).toEqual(['build', 'clean'])
+    expect(argvs[2]).toEqual(['build', '--modules', 'entry'])
+    delete process.env.DSH_FAKE_ARGV_LOG
+  })
+
+  it('streams a log follow and closes when the CLI is done', async () => {
+    // The follow route owns its response the way the deploy route does. A CLI that prints and exits must
+    // close it instead of leaving the panel waiting for a stream that will never end.
+    process.env.DSH_FAKE_LOG = '01-01 00:00:00.000  1  1 I A/B: hello\n'
+    const res = await request({
+      name: 'log.follow',
+      headers: { host: base, ...JSON_HEADERS },
+      body: JSON.stringify({ device: 'emulator-5554' }),
+    })
+    expect(res.status).toBe(200)
+    expect(res.body).toContain('实时监听 emulator-5554')
+    expect(res.body).toContain('A/B: hello')
+    delete process.env.DSH_FAKE_LOG
+  })
+
   it('runs a deploy without building when the panel asks for that', async () => {
     // The fourth action maps to `run --skip-build` — the same argv the model tool builds for skipBuild.
     mkdirSync(join(dir, 'skip'), { recursive: true })
@@ -490,6 +541,46 @@ describe.skipIf(!CAN_SPAWN)('panel-only routes', () => {
     delete process.env.DSH_FAKE_ARGV_LOG
     delete process.env.DSH_FAKE_INSTANCES
     delete process.env.DSH_FAKE_LOG
+  })
+
+  it('reads the latest lines for the current-time choice, with no window at all', async () => {
+    // 当前时间 (`1s`) means the latest lines: a snapshot is asked for because something is on screen, and a
+    // one-second window would come back empty whenever that second was quiet.
+    const argvLog = join(dir, 'log-now-argv.log')
+    process.env.DSH_FAKE_ARGV_LOG = argvLog
+    process.env.DSH_FAKE_INSTANCES = '[{"name":"Pura 90","status":"running","serial":"127.0.0.1:5555"}]'
+    process.env.DSH_FAKE_LOG = '10-13 00:00:01.000     1     1 I A/B: one\n10-13 00:00:02.000     1     1 I A/B: two'
+    try {
+      const r = await post('log.snapshot', { tail: 2, from: '1s' })
+      expect(r.status).toBe(200)
+      expect(JSON.parse(r.body).value.output).toContain('A/B: two')
+      const argvLines = readFileSync(argvLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+      expect(argvLines[argvLines.length - 1]).toEqual(['log', '--device', '127.0.0.1:5555', '--tail', '2'])
+    } finally {
+      delete process.env.DSH_FAKE_ARGV_LOG
+      delete process.env.DSH_FAKE_INSTANCES
+      delete process.env.DSH_FAKE_LOG
+    }
+  })
+
+  it('treats an empty start as the current time, which is what the panel falls back to', async () => {
+    // A choice stored before 当前时间 existed is empty, and the row now always sends a real value, so this
+    // keeps the route total if one ever arrives without it.
+    const argvLog = join(dir, 'log-empty-argv.log')
+    process.env.DSH_FAKE_ARGV_LOG = argvLog
+    process.env.DSH_FAKE_INSTANCES = '[{"name":"Pura 90","status":"running","serial":"127.0.0.1:5555"}]'
+    process.env.DSH_FAKE_LOG = '10-13 00:00:02.000     1     1 I A/B: two'
+    try {
+      const r = await post('log.snapshot', { tail: 2, from: '' })
+      expect(r.status).toBe(200)
+      expect(JSON.parse(r.body).value.output).toContain('A/B: two')
+      const argvLines = readFileSync(argvLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+      expect(argvLines[argvLines.length - 1]).toEqual(['log', '--device', '127.0.0.1:5555', '--tail', '2'])
+    } finally {
+      delete process.env.DSH_FAKE_ARGV_LOG
+      delete process.env.DSH_FAKE_INSTANCES
+      delete process.env.DSH_FAKE_LOG
+    }
   })
 
   it('queues the check result only after a check, and upgrades devecocli on the installed channel', async () => {

@@ -5,6 +5,7 @@ import { makeHmosDevice } from './device.js'
 import { makeHmosDocs } from './docs.js'
 import { makeHmosLint } from './lint.js'
 import { makeHmosLog } from './log.js'
+import { makeHmosSetup } from './setup.js'
 import type { LayoutLine } from '../parsers/layout.js'
 import type { ToolDeps } from './deps.js'
 /** The model tools: one factory per file, assembled here into the array the plugin registers. */
@@ -24,5 +25,6 @@ export function createToolDefs(api, ctx = null) {
     hmosLog,
     makeHmosDocs(deps),
     makeHmosLint(deps),
+    makeHmosSetup(deps),
   ]
 }

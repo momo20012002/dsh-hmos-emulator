@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { firstRunningSerial, resolveDevecoCli, runCli, throwIfAborted } from '../toolchain.js'
+import { stripAnsi } from '../parsers/devecocli.js'
 import { localPathFor } from '../local-path.js'
 import { sessionWorkspace } from '../workspace.js'
 import { tailText } from '../text.js'
@@ -62,11 +63,11 @@ export function makeHmosDevice(_deps: ToolDeps) {
           try { info = JSON.parse(r.output) } catch { info = undefined }
           // A view that answered in prose is still an answer: keep the text rather than reporting
           // success with an empty body, which the caller cannot tell from "no device fields".
-          const raw = info === undefined && r.code === 0 ? { output: tailText(r.output, 12) } : {}
+          const raw = info === undefined && r.code === 0 ? { output: tailText(stripAnsi(r.output), 12) } : {}
           return {
             ok: r.code === 0, action, device, code: r.code, timedOut: r.timedOut === true,
             ...(info === undefined ? {} : { info }), ...raw,
-            error: r.code === 0 ? '' : tailText(r.output, 5),
+            error: r.code === 0 ? '' : tailText(stripAnsi(r.output), 5),
           }
         }
         if (action === 'send' || action === 'recv') {
@@ -82,13 +83,17 @@ export function makeHmosDevice(_deps: ToolDeps) {
             ? [process.execPath, cli, 'device', 'file', 'send', '--device', device, local, remote]
             : [process.execPath, cli, 'device', 'file', 'recv', '--device', device, remote, local]
           const r = await runCli(argv, { timeoutMs: 5 * 60 * 1000, signal: exec?.signal })
-          return { ok: r.code === 0, action, device, local, remote, code: r.code, timedOut: r.timedOut === true, error: r.code === 0 ? '' : tailText(r.output, 6) }
+          return { ok: r.code === 0, action, device, local, remote, code: r.code, timedOut: r.timedOut === true, error: r.code === 0 ? '' : tailText(stripAnsi(r.output), 6) }
         }
         const database = asText(args?.remote)
         if (!database) return { ok: false, action, code: null, timedOut: false, error: 'sqlite3 needs remote: the database path on the device' }
         const sql = asText(args?.sql) || '.tables'
         const r = await runCli([process.execPath, cli, 'device', 'sqlite3', '--device', device, database, ...sql.split(/\s+/)], { timeoutMs: 60000, signal: exec?.signal })
-        return { ok: r.code === 0, action, device, database, sql, code: r.code, timedOut: r.timedOut === true, output: tailText(r.output, 40), error: r.code === 0 ? '' : tailText(r.output, 6) }
+        const out = stripAnsi(r.output)
+        // The device joins these words into its own shell command, so a syntax error or a database it
+        // cannot open is printed and still exits 0: read the text, not the exit code.
+        const failed = r.code !== 0 || /^(\/bin\/sh:|Error:)/m.test(out)
+        return { ok: !failed, action, device, database, sql, code: r.code, timedOut: r.timedOut === true, output: tailText(out, 40), error: failed ? tailText(out, 6) : '' }
       },
   }
 }

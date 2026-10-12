@@ -12,6 +12,10 @@ import { absoluteLocal, localPathFor } from './local-path.js'
  * The HTTP API behind the panel: toolchain, emulator, device, project, lint and deploy methods,
  * plus the background the model tools read through. Nothing here touches a model tool schema.
  */
+/** A boolean parameter as prompts and scripts send it: a real boolean, or its word. */
+function asBool(value: unknown): boolean {
+  return value === true || value === 'true'
+}
 /** How long a version check may take in total: a probe plus a registry lookup, both under one cap. */
 const PLAN_BUDGET_MS = 25000
 /**
@@ -19,6 +23,8 @@ const PLAN_BUDGET_MS = 25000
  * values (battery, geolocation, sensor) are deliberately absent — a dropdown cannot fill arguments.
  */
 const EMU_CONTROLS = ['rotate', 'power', 'volume']
+/** The panel's 当前时间 value: the smallest start the CLI accepts (`--from 0` is rejected). */
+const NOW_LOG_FROM = '1s'
 // Latest code-check result. It is cached here on every check, and only handed to the model
 // when the user presses "send to AI" (lint.notify) — never automatically. The queued notice also
 // remembers which session asked for it: this module is shared by every session, so without that
@@ -45,7 +51,7 @@ export function createApi() {
   let toolchainCache: { at: number; value: any } | null = null
 
   api.toolchain = async (payload?: any) => {
-    if (payload?.refresh !== true && toolchainCache !== null && Date.now() - toolchainCache.at < TOOLCHAIN_TTL_MS) {
+    if (!asBool(payload?.refresh) && toolchainCache !== null && Date.now() - toolchainCache.at < TOOLCHAIN_TTL_MS) {
       return toolchainCache.value
     }
     // SDK root comes from the environment only: this value is reported to the panel, and hdc is
@@ -372,12 +378,16 @@ export function createApi() {
       throw Object.assign(new Error(`“${project}”不是鸿蒙工程根(缺少 ${PROJECT_MARK})`), { code: 'bad-request' })
     }
     const device = typeof payload?.device === 'string' && payload.device.trim() ? payload.device.trim() : null
-    if (!device) throw Object.assign(new Error('请先“刷新设备”并选择一个模拟器设备'), { code: 'bad-request' })
     // Three panel intents share this route: clean (no device, no module), build only, and the full
     // run. Only the run needs a device, so only the run takes the pre-check and the device argument.
     const mode = payload?.mode === 'clean' ? 'clean'
-      : payload?.mode === 'skipbuild' || payload?.skipBuild === true ? 'skipbuild'
-        : payload?.buildOnly === true ? 'build' : 'run'
+      : payload?.mode === 'skipbuild' || asBool(payload?.skipBuild) ? 'skipbuild'
+        : asBool(payload?.buildOnly) ? 'build' : 'run'
+    // The device is required by the two modes that reach one, and by them alone: the mode is decided
+    // first so that clean and build are never blocked by a device they do not use.
+    if ((mode === 'run' || mode === 'skipbuild') && !device) {
+      throw Object.assign(new Error('请先“刷新设备”并选择一个模拟器设备'), { code: 'bad-request' })
+    }
     // Pre-check that the device is online (cross-platform) before a build that takes minutes. The two
     // modes that reach a device need it; the two that never touch one must not be blocked by it.
     if ((mode === 'run' || mode === 'skipbuild') && cli) {
@@ -408,11 +418,16 @@ export function createApi() {
       throw Object.assign(new Error(`模块“${payload.module}”不属于该工程(可选:${modules.join('、') || '无'})`), { code: 'bad-request' })
     }
     const chosen = asked[0] ?? (payload?.module ? String(payload.module) : modules.includes('entry') ? 'entry' : modules[0])
+    // The panel and the model tools share these three: release is the mode a build ships in, `ability`
+    // picks what the launch starts, and `uninstall` is the fix for an install that refuses to replace.
+    const buildMode = payload?.buildMode === 'release' ? ['--build-mode', 'release'] : []
+    const ability = typeof payload?.ability === 'string' && payload.ability.trim() ? ['--ability', payload.ability.trim()] : []
+    const uninstall = asBool(payload?.uninstall) ? ['--uninstall'] : []
     const cmd = mode === 'clean'
       ? [process.execPath, cli, 'build', 'clean']
       : mode === 'build'
-        ? [process.execPath, cli, 'build', ...(asked.length ? ['--modules', ...asked] : chosen ? ['--module', chosen] : [])]
-        : [process.execPath, cli, 'run', '--device', device, ...(chosen ? ['--module', chosen] : []), ...(mode === 'skipbuild' ? ['--skip-build'] : [])]
+        ? [process.execPath, cli, 'build', ...buildMode, ...(asked.length ? ['--modules', ...asked] : chosen ? ['--modules', chosen] : [])]
+        : [process.execPath, cli, 'run', '--device', device ?? '', ...(chosen ? ['--module', chosen] : []), ...buildMode, ...ability, ...uninstall, ...(mode === 'skipbuild' ? ['--skip-build'] : [])]
     // A log line is a record, so the run says where it deployed; build and clean have no device to name.
     const what = mode === 'clean'
       ? '清理构建'
@@ -468,13 +483,18 @@ export function createApi() {
     const device = typeof payload?.device === 'string' && payload.device.trim() ? payload.device.trim() : await firstRunningSerial(cli)
     if (!device) throw Object.assign(new Error('尚无运行中的模拟器,请先启动一个实例'), { code: 'device-offline' })
     const tail = Number.isFinite(Number(payload?.tail)) ? Math.max(1, Math.min(500, Number(payload.tail))) : 50
+    // 起始时间 picks the window. 当前时间 (the smallest start the CLI accepts, since `--from 0` is rejected)
+    // means the latest lines with no window at all: sending `--from 1s` returns nothing when that second was
+    // quiet, and a snapshot is asked for exactly because something is on screen. Any other value is a real
+    // window, and `--tail` takes the newest N of it.
+    const from = typeof payload?.from === 'string' ? payload.from.trim() : ''
     const argv = ['log', '--device', device, '--tail', String(tail)]
     if (typeof payload?.level === 'string' && payload.level) argv.push('--level', String(payload.level))
     if (typeof payload?.bundle === 'string' && payload.bundle.trim()) argv.push('--bundle-name', payload.bundle.trim())
     if (typeof payload?.keyword === 'string' && payload.keyword.trim()) argv.push('--keyword', payload.keyword.trim())
     // `from` is an offset back from now ("5m", "30s", "120"), not a clock time; the model tool calls it
     // `since` and the CLI flag is `--from`.
-    if (typeof payload?.from === 'string' && payload.from.trim()) argv.push('--from', payload.from.trim())
+    if (from && from !== NOW_LOG_FROM) argv.push('--from', from)
     // No signal: a snapshot is capped at a minute by the CLI's own timeout, and the panel is the only
     // caller, so there is nothing here that a cancelled turn needs to interrupt.
     const r = await runCli([process.execPath, cli, ...argv], { timeoutMs: 60000 })
@@ -644,7 +664,7 @@ export function createApi() {
     //   hmos-shot-…      the panel's shot, i.e. the user's own → never matched by any prune.
     // A caller cannot claim `tool` over HTTP: the route strips the field, so the only way to reach
     // the two pruned prefixes is plugin code that knows it created the file.
-    const auto = payload?.auto === true
+    const auto = asBool(payload?.auto)
     const tool = !auto && payload?.origin === 'tool'
     const label = String(payload?.label ?? 'shot').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24) || 'shot'
     const file = join(dir, auto

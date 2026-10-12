@@ -9,11 +9,19 @@ import { PROJECT_ROOT } from './schema.js'
 import type { ToolDeps } from './deps.js'
 /** Build and install a project on the emulator. */
 
+/** A boolean parameter as prompts and scripts send it: a real boolean, or its word. */
+function asBool(value: unknown): boolean {
+  return value === true || value === 'true'
+}
+
+/** Trimmed string, or empty. */
+const asTextArg = (value: unknown): string => (typeof value === 'string' && value.trim() ? value.trim() : '')
+
 export function makeHmosDeploy(deps: ToolDeps) {
   const { api, ctx } = deps
   return {
       name: 'hmos_deploy',
-      description: 'Build and deploy a project via devecocli: deploy builds -> installs -> launches, clean runs hvigor clean. buildOnly builds without a device; modules narrows a build. Returns phase, duration, ArkTS errors with file/line, hap path and a tail.',
+      description: 'Build and deploy a project via devecocli: deploy builds -> installs -> launches, clean runs hvigor clean. buildOnly builds without a device; modules narrows a build; buildMode picks debug or release; on a deploy, ability names the ability to launch and uninstall removes the installed app first. Returns phase, duration, ArkTS errors with file/line, hap path and a tail.',
       parameters: {
         type: 'object',
         properties: {
@@ -23,6 +31,9 @@ export function makeHmosDeploy(deps: ToolDeps) {
           modules: { type: 'array', items: { type: 'string' }, description: 'modules to build (default: the entry). A full deploy takes one; use buildOnly for several.' },
           buildOnly: { type: 'boolean', description: 'build only: no device, no install/launch' },
           skipBuild: { type: 'boolean', description: 'run --skip-build: install + launch existing artifacts' },
+          buildMode: { type: 'string', enum: ['debug', 'release'], description: '--build-mode (default: debug). release builds what you ship.' },
+          ability: { type: 'string', description: 'deploy: the ability to launch (--ability)' },
+          uninstall: { type: 'boolean', description: 'deploy: uninstall the installed app first (--uninstall)' },
           read: { type: 'boolean', description: 'attach the failure screenshot when the deploy fails, not just its path' },
         },
         required: ['projectPath'],
@@ -47,6 +58,16 @@ export function makeHmosDeploy(deps: ToolDeps) {
           // A misspelt action must not fall through to a real build and install.
           return { ok: false, error: `unknown action ${action}; expected deploy or clean` }
         }
+        // Two intents that cannot both be served. The note says which one ran, so a caller that sent
+        // both learns the other was ignored instead of assuming both happened.
+        const conflictNote = action === 'clean' && asBool(args?.buildOnly) ? '本次按 action=clean 执行,忽略了 buildOnly。' : ''
+        // `--build-mode` is only passed when release was asked for: debug is the CLI's own default, and
+        // spelling it out would change the argv every existing caller already sends.
+        const askedMode = typeof args?.buildMode === 'string' && args.buildMode.trim() ? args.buildMode.trim() : 'debug'
+        if (askedMode !== 'debug' && askedMode !== 'release') {
+          return { ok: false, error: `buildMode takes debug or release, not ${askedMode}` }
+        }
+        const release = askedMode === 'release' ? ['--build-mode', 'release'] : []
         if (action === 'clean') {
           const started = Date.now()
           const r = await runCli([process.execPath, cli, 'build', 'clean'], { cwd: projectPath, timeoutMs: 10 * 60 * 1000, signal: exec?.signal })
@@ -59,10 +80,11 @@ export function makeHmosDeploy(deps: ToolDeps) {
             durationMs: Date.now() - started,
             tail: tailText(text, r.code === 0 ? 4 : 12),
             error: r.code === 0 ? '' : tailText(text, 8),
+            ...(conflictNote ? { note: conflictNote } : {}),
           }
         }
-        const buildOnly = args?.buildOnly === true
-        const skipBuild = args?.skipBuild === true
+        const buildOnly = asBool(args?.buildOnly)
+        const skipBuild = asBool(args?.skipBuild)
         const device = buildOnly
           ? ''
           : (typeof args?.device === 'string' && args.device.trim() ? args.device.trim() : '') || await firstRunningSerial(cli)
@@ -71,7 +93,10 @@ export function makeHmosDeploy(deps: ToolDeps) {
         // `modules` is the declared parameter; the older single `module` still arrives from prompts and
         // scripts written before it, and the parameter root is open, so accept it rather than ignore a
         // request that used to work.
-        const listed = Array.isArray(args?.modules) ? args.modules.map((m) => String(m).trim()).filter(Boolean) : []
+        // A string arrives from prompts that spell the list out; splitting it is what keeps a named
+        // module from being dropped as "not an array" and the build falling back to the entry module.
+        const rawList = Array.isArray(args?.modules) ? args.modules : typeof args?.modules === 'string' ? args.modules.split(/[,、]/) : []
+        const listed = rawList.map((m) => String(m).trim()).filter(Boolean)
         const legacy = typeof args?.module === 'string' ? args.module.trim() : ''
         const askedList = listed.length ? listed : (legacy ? [legacy] : [])
         const asked = askedList.join('、')
@@ -111,8 +136,8 @@ export function makeHmosDeploy(deps: ToolDeps) {
             // The official stage switches, as listed in `build --help` / `run --help`. There is no
             // "install without launching", so that combination is deliberately not offered.
             const argv = buildOnly
-              ? [process.execPath, cli, 'build', ...(chosenList.length ? ['--modules', ...chosenList] : [])]
-              : [process.execPath, cli, 'run', '--device', device, ...(chosen ? ['--module', chosen] : []), '--skip-build']
+              ? [process.execPath, cli, 'build', ...release, ...(chosenList.length ? ['--modules', ...chosenList] : [])]
+              : [process.execPath, cli, 'run', '--device', device, ...(chosen ? ['--module', chosen] : []), ...release, ...(asTextArg(args?.ability) ? ['--ability', asTextArg(args?.ability)] : []), ...(asBool(args?.uninstall) ? ['--uninstall'] : []), '--skip-build']
             const r = await runCli(argv, { cwd: projectPath, timeoutMs: 20 * 60 * 1000, signal: exec?.signal })
             output = r.output
             code = r.code
@@ -120,7 +145,12 @@ export function makeHmosDeploy(deps: ToolDeps) {
           } else {
             // Reuse the HTTP API's non-streaming path: it already validates the project, checks the
             // device is online and picks the entry module.
-            const r = await api.deploy({ projectPath, device, module: chosen }, undefined, { signal: exec?.signal })
+            const r = await api.deploy({
+              projectPath, device, module: chosen,
+              ...(release.length ? { buildMode: 'release' } : {}),
+              ...(asTextArg(args?.ability) ? { ability: asTextArg(args?.ability) } : {}),
+              ...(asBool(args?.uninstall) ? { uninstall: true } : {}),
+            }, undefined, { signal: exec?.signal })
             output = String(r.output || '')
             code = r.code ?? null
             timedOut = r.timedOut === true
@@ -142,6 +172,11 @@ export function makeHmosDeploy(deps: ToolDeps) {
           device: device || null,
           module: chosen || null,
           modules: chosenList,
+          // Echoed because the two branches above are invisible to the caller: a release build and a debug
+          // one used to come back identical, so "did my --build-mode reach the CLI?" had no answer.
+          buildMode: release.length ? 'release' : 'debug',
+          ...(asTextArg(args?.ability) ? { ability: asTextArg(args?.ability) } : {}),
+          ...(asBool(args?.uninstall) ? { uninstall: true } : {}),
           phase: buildOnly ? 'build' : deployPhase(output),
           durationMs: Date.now() - started,
           errors: errors.map((e) => ({ ...e, file: relativeTo(projectPath, e.file) })),
@@ -173,7 +208,7 @@ export function makeHmosDeploy(deps: ToolDeps) {
         // A failed install/launch leaves the device showing whatever the app did — the one thing the
         // build log cannot tell. A build-only failure has nothing to look at.
         if (!ok && !buildOnly && device) {
-          Object.assign(result, await shotFields(api, device, sessionWorkspace(exec), `deploy-${deployPhase(output)}`, ctx, args?.read === true))
+          Object.assign(result, await shotFields(api, device, sessionWorkspace(exec), `deploy-${deployPhase(output)}`, ctx, asBool(args?.read)))
         }
         return result
       },

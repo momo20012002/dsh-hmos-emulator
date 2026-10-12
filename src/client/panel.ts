@@ -87,11 +87,9 @@ const LOG_LEVELS = [
   { value: 'W', label: '警告 W' }, { value: 'E', label: '错误 E' }, { value: 'F', label: '严重 F' },
 ]
 const LOG_TIMES = [
-  // Measured: without --from the CLI returns what the device still holds, from its very first line on. The slot
-  // is therefore a lower bound set to "earliest available" — not "no filter", and not "since boot" as a promise.
-  // Mainstream log UIs leave this option in English (Kibana's Quick select / Relative), so the word has to carry
-  // the meaning on its own: 最早 pairs with the visible label 起始时间 and does not repeat it.
-  { value: '', label: '最早' },
+  // The start of the window the CLI reads from: `--from` is an offset back from now. 当前时间 is the default
+  // and the narrowest choice, so a read shows the latest lines and a follow brings no history with it.
+  { value: '1s', label: '当前时间' },
   { value: '30s', label: '30 秒前' },
   { value: '5m', label: '5 分钟前' },
   { value: '30m', label: '30 分钟前' },
@@ -203,7 +201,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   const [logBundle, setLogBundle] = useState(() => lsGet('logBundle'))
   const [logKeyword, setLogKeyword] = useState(() => lsGet('logKeyword'))
   // An offset back from now ("5m"), which is what the CLI's --from takes — not a clock time.
-  const [logFrom, setLogFrom] = useState(() => lsGet('logFrom'))
+  const [logFrom, setLogFrom] = useState(() => lsGet('logFrom') || LOG_TIMES[0].value)
   const [logLines, setLogLines] = useState(() => lsGet('logLines') || '50')
   // Following ends only when someone ends it, so the panel holds the request that owns it.
   const followCtl = useRef(null)
@@ -358,7 +356,9 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
 
   useEffect(() => {
     const box = logBox.current
-    if (box) box.scrollTop = box.scrollHeight
+    // Only follow when the view is already at the bottom. A flush can add hundreds of lines, and a
+    // follow peaks around 775 lines a second, so sticking unconditionally would make history unreadable.
+    if (box && box.scrollHeight - box.scrollTop - box.clientHeight < 40) box.scrollTop = box.scrollHeight
   }, [logs])
 
   /**
@@ -788,7 +788,8 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
    */
   const runDeploy = async (mode: 'run' | 'skipbuild' | 'build' | 'clean') => {
     if (!project.trim()) { pushLog('err', '请先在“应用项目”选择项目'); return }
-    if (mode !== 'clean' && !targetDevice) { pushLog('err', '请先在“设备操作”选择在线设备'); return }
+    // Clean touches no device and build only compiles, so only the two that reach a device need one.
+    if ((mode === 'run' || mode === 'skipbuild') && !targetDevice) { pushLog('err', '请先在“设备操作”选择在线设备'); return }
     setBusy(mode === 'clean' ? 'clean' : 'deploy')
     pushLog('info', mode === 'clean'
       ? `开始清理构建 → ${project}`
@@ -1455,7 +1456,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
    */
   const readBanner = (device: string, tail: number) => {
     const label = (list: Array<{ value: string; label: string }>, value: string) => list.find((o) => o.value === value)?.label
-    const bits = [`${tail} 行`, label(LOG_TIMES, logFrom) ?? (logFrom || '最早'), label(LOG_LEVELS, logLevel) ?? '全部级别']
+    const bits = [`${tail} 行`, label(LOG_TIMES, logFrom) ?? logFrom, label(LOG_LEVELS, logLevel) ?? '全部级别']
     if (logBundle.trim()) bits.push(`应用 ${logBundle.trim()}`)
     if (logKeyword.trim()) bits.push(`关键字 ${logKeyword.trim()}`)
     return `— 读取设备日志到调试框(${bits.join(', ')}) @ ${device} —`
@@ -1619,7 +1620,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
         h('span', { style: { fontSize: 11, color: s.muted } }, '起始时间'),
         h('div', { style: { flex: '0 0 auto', width: 112 }, title: '读取与导出取这段时间内的日志,实时监听先补这段时间的历史再持续输出' },
           h(Dropdown, {
-            value: logFrom, placeholder: logFrom || '最早',
+            value: logFrom, placeholder: logFrom || LOG_TIMES[0].label,
             options: LOG_TIMES,
             onChange: setLogFrom,
           })),

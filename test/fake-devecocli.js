@@ -33,6 +33,30 @@ const argv = process.argv.slice(2)
 const [group, verb] = argv
 const out = (text) => { process.stdout.write(text); process.exit(0) }
 
+// A verb only answers the flags the plugin is known to build. Without this the fake answers any argv
+// at all, which is how a route sending `build --module` and a boolean read as `=== true` stayed green.
+// Verbs left out of the table stay permissive: the guard covers the ones with real substance.
+const FLAGS = {
+  build: ['--modules', 'clean', '--build-mode'],
+  run: ['--device', '--module', '--skip-build', '--build-mode', '--ability', '--uninstall'],
+  log: ['--device', '--tail', '--crash', '--level', '--bundle-name', '--keyword', '--from', '--follow'],
+  device: ['list', 'view', 'file', 'sqlite3', 'send', 'recv', '--device', '-t', '--format'],
+  emulator: [
+    'list', 'start', 'stop', 'create', 'delete', 'image', 'rotate', 'power', 'volume', 'battery', 'geolocation', 'shake', 'fold', 'scene',
+    '--target', '--format', '--all', '--level', '--status', '--longitude', '--latitude', '--altitude', '--direction',
+    '--device-type', '--os-version', '--force',
+    'left', 'right', 'up', 'down', 'charging', 'discharging',
+  ],
+}
+const known = FLAGS[group]
+if (known) {
+  const stray = argv.filter((arg) => arg.startsWith('-') && !known.includes(arg))
+  if (stray.length) {
+    process.stderr.write(`error: unknown option '${stray[0]}'\n`)
+    process.exit(1)
+  }
+}
+
 // Record the exact argv the plugin built, so a test can assert what was *asked for* — a depth, a
 // flag — rather than inferring it from the answer.
 if (process.env.DSH_FAKE_ARGV_LOG) {
@@ -80,6 +104,17 @@ if (group === 'device' && (verb === 'file' || verb === 'sqlite3')) {
 if (group === 'update') {
   if (process.env.DSH_FAKE_UPDATE) process.stdout.write(process.env.DSH_FAKE_UPDATE)
   process.exit(Number(process.env.DSH_FAKE_UPDATE_CODE || '0'))
+}
+
+// `ui window list` answers the ids every window-scoped action takes, as the JSON the real CLI prints.
+if (group === 'ui' && verb === 'window') out(process.env.DSH_FAKE_WINDOWS || '[]')
+
+// `check arkts` / `check compat` answer canned text with a chosen exit code. `compat versions` is what a
+// compat call without versions is answered with, so a caller learns the strings the CLI would accept.
+if (group === 'check' && verb === 'compat' && argv[2] === 'versions') out(process.env.DSH_FAKE_COMPAT_VERSIONS || '5.0.0(12)\n6.1.1(24)\n')
+if (group === 'check') {
+  if (process.env.DSH_FAKE_CHECK) process.stdout.write(process.env.DSH_FAKE_CHECK)
+  process.exit(Number(process.env.DSH_FAKE_CHECK_CODE || '0'))
 }
 
 if (group === 'ui' && verb === 'layout') {

@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { capLines, diffLines, tailText } from '../text.js'
+import { stripAnsi } from '../parsers/devecocli.js'
 import { cropPng, decodePng, diffPng, encodePng } from '../png.js'
 import { abortedError, firstRunningSerial, resolveDevecoCli, runCli, throwIfAborted } from '../toolchain.js'
 import { LayoutLine, ancestorLabels, candidateList, cleanLayout, labelMatches, layoutJson, matchLayout, pageTitle, parseLayoutLine, pointOf, rawKeys, renderLayout, renderLines, selectLayoutLines } from '../parsers/layout.js'
@@ -9,6 +10,11 @@ import { DEVICE_SERIAL } from './schema.js'
 import type { ToolDeps } from './deps.js'
 /** Screen driving: layout queries, taps, gestures, waits, batched steps and screenshots. */
 
+/** A boolean parameter as prompts and scripts send it: a real boolean, or its word. */
+function asBool(value: unknown): boolean {
+  return value === true || value === 'true'
+}
+
 export function makeEmuUi(deps: ToolDeps) {
   const { api, ctx, lastLayout, lastRender, lastDump, lastShot, hmosLog } = deps
   return {
@@ -17,7 +23,8 @@ export function makeEmuUi(deps: ToolDeps) {
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['layout', 'observe', 'click', 'text', 'swipe', 'screenshot', 'waitFor', 'waitForChange', 'waitForIdle', 'longPress', 'doubleTap', 'drag', 'fling', 'dircfling', 'steps'], description: 'UI action' },
+          action: { type: 'string', enum: ['layout', 'observe', 'windows', 'click', 'text', 'swipe', 'screenshot', 'waitFor', 'waitForChange', 'waitForIdle', 'longPress', 'doubleTap', 'drag', 'fling', 'dircfling', 'steps'], description: 'UI action' },
+          all: { type: 'boolean', description: 'windows: include system windows too' },
           steps: { type: 'array', items: { type: 'object' }, description: 'steps: [{action,...}] in order (see onFail)' },
           onFail: { type: 'string', enum: ['stop', 'continue'], description: 'steps: stop (default, returns stoppedAt) | continue (runs all, returns failedAt)' },
           changedOnly: { type: 'boolean', description: 'layout/thenLayout: only changed lines vs the previous render' },
@@ -90,6 +97,19 @@ export function makeEmuUi(deps: ToolDeps) {
           if (r.aborted) throw abortedError()
           return r
         }
+        if (args?.action === 'windows') {
+          // The window ids every other action takes were only knowable from the device, so a caller had
+          // to guess one. This is that list: `all` reaches the system windows a picker or dialog lives in.
+          const r = await run(['ui', 'window', 'list', '--device', device, '--format', 'json', ...(asBool(args?.all) ? ['--all'] : [])], 30000)
+          let windows: unknown
+          try { windows = JSON.parse(r.output) } catch { windows = undefined }
+          return {
+            ok: r.code === 0, action: 'windows', device,
+            windows: windows === undefined ? [] : windows,
+            tail: tailText(stripAnsi(r.output), 20),
+            ...(r.code === 0 ? {} : { error: tailText(stripAnsi(r.output), 6) }),
+          }
+        }
         const depth = Number.isFinite(args?.depth) ? Math.max(0, Math.floor(args.depth)) : 0
         /**
          * The depth one call should dump at. A `steps` entry carries its own arguments ("same
@@ -110,7 +130,7 @@ export function makeEmuUi(deps: ToolDeps) {
          */
         const windowScope = (step?: Record<string, unknown>) => ({
           win: Number.isFinite(step?.window) ? Number(step?.window) : (Number.isFinite(args?.window) ? Number(args.window) : undefined),
-          every: typeof step?.allWindows === 'boolean' ? step.allWindows : args?.allWindows === true,
+          every: typeof step?.allWindows === 'boolean' ? step.allWindows : asBool(args?.allWindows),
         })
 
         /**
@@ -207,7 +227,7 @@ export function makeEmuUi(deps: ToolDeps) {
           }
           if (action === 'layout') {
             const at = depthOf(a)
-            const dump = await dumpLayout(a?.full === true, at, a)
+            const dump = await dumpLayout(asBool(a?.full), at, a)
             if (!dump.ok) return { ok: false, device, error: dump.error }
             const rows = selectLayoutLines(dump.lines, a?.filter)
             const page = pageTitle(dump.lines)
@@ -220,11 +240,11 @@ export function makeEmuUi(deps: ToolDeps) {
             const note = overrode
               ? `allWindows 已按 depth:0 执行:depth=${at} 时 devecocli 只回窗口根、子树全空(容易被读成"这屏什么都没有");看到的这棵树是全部窗口的完整内容。`
               : textless
-                ? `这次 dump 只有容器、没有任何文字:depth=${at} 只到第 ${at} 层${a?.full === true ? '(full 模式还会多出 window/root 两层)' : ''};要看内容请用 depth:0 或不传 depth。`
+                ? `这次 dump 只有容器、没有任何文字:depth=${at} 只到第 ${at} 层${asBool(a?.full) ? '(full 模式还会多出 window/root 两层)' : ''};要看内容请用 depth:0 或不传 depth。`
                 : undefined
             return a?.asJson
               ? { ok: true, device, total: dump.lines.length, page: page || null, ...(note ? { note } : {}), nodes: layoutJson(rows, dump.lines) }
-              : { ok: true, device, total: dump.lines.length, page: page || null, ...(note ? { note } : {}), tree: renderFor(rows, a?.changedOnly === true) }
+              : { ok: true, device, total: dump.lines.length, page: page || null, ...(note ? { note } : {}), tree: renderFor(rows, asBool(a?.changedOnly)) }
           }
           if (action === 'click' || action === 'longPress' || action === 'doubleTap') {
             // All three are "point at a node and press it": only the devecocli verb differs.
@@ -257,7 +277,7 @@ export function makeEmuUi(deps: ToolDeps) {
               if (!matches.length) {
                 // A label that resolves to nothing is usually an overlay or a half-drawn page, which
                 // is exactly the case where a picture answers what the tree cannot.
-                const shot = await shotFields(api, device, shotRoot, 'click', ctx, a?.read === true)
+                const shot = await shotFields(api, device, shotRoot, 'click', ctx, asBool(a?.read))
                 return { ok: false, device, error: `no layout node matching "${a.label}"`, page: pageTitle(dump.lines) || null, ...shot }
               }
               const want = Number.isFinite(a?.labelIndex) ? Math.max(0, Math.floor(a.labelIndex)) : 0
@@ -315,7 +335,7 @@ export function makeEmuUi(deps: ToolDeps) {
               }
               const after = await dumpLayout(false, depthOf(a))
               result.tree = after.ok
-                ? renderFor(selectLayoutLines(after.lines, a?.filter), a?.changedOnly === true)
+                ? renderFor(selectLayoutLines(after.lines, a?.filter), asBool(a?.changedOnly))
                 : after.error
             }
             return result
@@ -340,7 +360,7 @@ export function makeEmuUi(deps: ToolDeps) {
           if (action === 'screenshot') {
             const asked = typeof a?.root === 'string' && a.root.trim() ? a.root.trim() : shotRoot
             const wanted = typeof a?.baseline === 'string' ? a.baseline.trim() : ''
-            const read = a?.read === true
+            const read = asBool(a?.read)
             // devecocli cannot crop, so a region capture is cut here. Doing it before the
             // attachment is what makes the preview ~1:1 — the whole point of the option.
             const clipWanted = a?.clip && typeof a.clip === 'object' ? a.clip : null
@@ -471,7 +491,7 @@ export function makeEmuUi(deps: ToolDeps) {
             const poll = Number.isFinite(a?.pollMs) ? Math.max(50, Math.min(2000, a.pollMs)) : 200
             // `absent` waits for the match to be GONE — the only way to observe a drawer, dialog,
             // keyboard or toast closing, which `waitForChange`/`waitForIdle` can only approximate.
-            const absent = a?.absent === true
+            const absent = asBool(a?.absent)
             const started = Date.now()
             let last: LayoutLine[] = []
             for (;;) {
@@ -502,7 +522,7 @@ export function makeEmuUi(deps: ToolDeps) {
             // A timeout hands back the tree it last saw (and a picture of it), so a miss is diagnosable
             // without another call. For `absent` the miss is the opposite one: the match is still there.
             const page = pageTitle(last)
-            const shot = await shotFields(api, device, shotRoot, action, ctx, a?.read === true)
+            const shot = await shotFields(api, device, shotRoot, action, ctx, asBool(a?.read))
             const late = absent
               ? matchLayout(last, { text: typeof a?.text === 'string' ? a.text : '', textRegex: a?.textRegex, clickableOnly: a?.clickableOnly })
               : []
@@ -538,7 +558,7 @@ export function makeEmuUi(deps: ToolDeps) {
               await new Promise((resolveWait) => setTimeout(resolveWait, poll))
             }
             const page = pageTitle(last)
-            const shot = await shotFields(api, device, shotRoot, action, ctx, a?.read === true)
+            const shot = await shotFields(api, device, shotRoot, action, ctx, asBool(a?.read))
             return { ok: false, device, polls, elapsedMs: Date.now() - started, page: page || null, ...shot, tree: renderLayout(last.map((line, index) => ({ index, line }))) }
           }
           if (action === 'waitForIdle') {
@@ -572,7 +592,7 @@ export function makeEmuUi(deps: ToolDeps) {
               await new Promise((resolveWait) => setTimeout(resolveWait, poll))
             }
             const idlePage = pageTitle(last)
-            const idleShot = await shotFields(api, device, shotRoot, action, ctx, a?.read === true)
+            const idleShot = await shotFields(api, device, shotRoot, action, ctx, asBool(a?.read))
             return { ok: false, device, polls, elapsedMs: Date.now() - started, page: idlePage || null, ...idleShot, tree: renderLayout(last.map((line, index) => ({ index, line }))) }
           }
           if (action === 'observe') {

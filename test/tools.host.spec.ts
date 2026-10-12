@@ -679,6 +679,140 @@ describe.skipIf(!CAN_SPAWN)('projectPath resolution', () => {
     const result = await lint.execute({ projectPath: 'proj' }, exec)
     expect(result.error ?? '').not.toContain('未找到')
   })
+
+  it('runs the other two project checks through the same tool', async () => {
+    // kind=arkts / kind=compat are the checks `check` also offers on the same subject, so they ride this
+    // tool rather than becoming tools of their own: a caller already holds this one.
+    mkdirSync(join(dir, 'proj'), { recursive: true })
+    writeFileSync(join(dir, 'proj', 'build-profile.json5'), '{ "modules": [{ "name": "entry" }] }')
+    const argvLog = join(dir, 'check-argv.log')
+    process.env.DSH_FAKE_ARGV_LOG = argvLog
+    const lint = mountAll().find((def) => def.name === 'hmos_lint')
+    const arkts = await lint.execute({ projectPath: 'proj', kind: 'arkts', fix: true }, exec)
+    expect(arkts.ok).toBe(true)
+    expect(arkts.kind).toBe('arkts')
+    expect(readFileSync(argvLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))).toEqual([
+      ['check', 'arkts', '--project', join(dir, 'proj'), '--fix'],
+    ])
+    // `--fix` is the linter's own repair pass too — the same one the panel's "代码修复" button runs.
+    const fixed = await lint.execute({ projectPath: 'proj', fix: true }, exec)
+    expect(fixed.ok).toBe(true)
+    const fixedLines = readFileSync(argvLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    // The fixture is not a git project, so `scope: changed` escalates to a full check — hence no
+    // `--incremental`. That escalation is the documented answer to "incremental would inspect nothing".
+    expect(fixedLines[fixedLines.length - 1]).toEqual(['check', 'lint', join(dir, 'proj'), '--fix'])
+    // An unknown kind is refused instead of quietly becoming a lint run — with `fix:true` that would have
+    // rewritten the project's files before anyone could tell. No spawn at all is the proof.
+    const typo = await lint.execute({ projectPath: 'proj', kind: 'nonsense', fix: true }, exec)
+    expect(typo.ok).toBe(false)
+    expect(typo.error).toContain('lint, arkts or compat')
+    expect(readFileSync(argvLog, 'utf8').trim().split('\n')).toHaveLength(fixedLines.length)
+    // The lint branch names itself too, so a caller can tell which check answered. `scope` has the same
+    // shape: an unknown value is refused rather than quietly becoming `changed`.
+    expect((await lint.execute({ projectPath: 'proj' }, exec)).kind).toBe('lint')
+    expect((await lint.execute({ projectPath: 'proj', scope: 'nonsense' }, exec)).error).toContain('changed or all')
+    // A compat call without the two versions answers with the list the CLI accepts, not a complaint.
+    const missing = await lint.execute({ projectPath: 'proj', kind: 'compat' }, exec)
+    expect(missing.ok).toBe(false)
+    expect(missing.error).toContain('sourceVersion')
+    expect(missing.versions).toContain('6.1.1(24)')
+    const compat = await lint.execute({ projectPath: 'proj', kind: 'compat', sourceVersion: '5.0.0(12)', targetVersion: '6.1.1(24)' }, exec)
+    expect(compat.ok).toBe(true)
+    expect(compat.targetVersion).toBe('6.1.1(24)')
+    delete process.env.DSH_FAKE_ARGV_LOG
+  })
+})
+
+// The once-per-project jobs: scaffolding, signing and the two instance verbs. They are rare enough to
+// live in a tool of their own, so the argv each one builds is the thing worth pinning down.
+describe.skipIf(!CAN_SPAWN)('hmos_setup', () => {
+  const setup = () => mountAll().find((def) => def.name === 'hmos_setup')
+  const argvLines = () => readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+
+  it('scaffolds an app, signs a project, and creates an instance', async () => {
+    const argvLog = join(dir, 'setup-argv.log')
+    process.env.DSH_FAKE_ARGV_LOG = argvLog
+    try {
+      const scaffolded = await setup().execute({ action: 'app', appName: 'Demo', apiLevel: 21 }, exec)
+      expect(scaffolded.ok).toBe(true)
+      expect(argvLines()[0]).toEqual(['create', '--app-name', 'Demo', '--api-level', '21'])
+      // `signature generate` has no --project: it signs the project it is standing in.
+      mkdirSync(join(dir, 'signme'), { recursive: true })
+      writeFileSync(join(dir, 'signme', 'build-profile.json5'), '{}')
+      const signed = await setup().execute({ action: 'sign', projectPath: 'signme', force: true }, exec)
+      expect(signed.ok).toBe(true)
+      expect(argvLines()[1]).toEqual(['signature', 'generate', '--force'])
+      const created = await setup().execute({ action: 'create-instance', name: 'Pura X View', deviceType: 'foldable', osVersion: 'HarmonyOS 6.0.1(21)' }, exec)
+      expect(created.ok).toBe(true)
+      expect(argvLines()[2]).toEqual([
+        'emulator', 'create', 'Pura X View', '--device-type', 'foldable', '--os-version', 'HarmonyOS 6.0.1(21)',
+      ])
+      // The account check is read-only on purpose: `login` needs a browser, so it stays the user's errand.
+      const who = await setup().execute({ action: 'auth' }, exec)
+      expect(who.ok).toBe(true)
+      expect(argvLines()[3]).toEqual(['auth', 'status'])
+    } finally {
+      delete process.env.DSH_FAKE_ARGV_LOG
+    }
+  })
+
+  it('asks for a release build, a named ability and a fresh install when told to', async () => {
+    // Three flags the CLI has: they are the difference between a debug artifact and a shipped one, and
+    // between launching the entry ability and a named one.
+    mkdirSync(join(dir, 'rel'), { recursive: true })
+    writeFileSync(join(dir, 'rel', 'build-profile.json5'), '{"modules":[{"name":"entry"}]}')
+    const argvLog = join(dir, 'rel-argv.log')
+    process.env.DSH_FAKE_ARGV_LOG = argvLog
+    try {
+      const deploy = mountAll().find((def) => def.name === 'hmos_deploy')
+      const built = await deploy.execute({ projectPath: 'rel', buildOnly: true, buildMode: 'release' }, exec)
+      expect(built.ok).toBe(true)
+      const ran = await deploy.execute({ projectPath: 'rel', device: 'emulator-5554', skipBuild: true, ability: 'EntryAbility', uninstall: true }, exec)
+      expect(ran.ok).toBe(true)
+      const lines = readFileSync(argvLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+      // The flags are echoed back: without that a release build and a debug one look identical.
+      expect(built.buildMode).toBe('release')
+      expect(ran.buildMode).toBe('debug')
+      expect(ran.ability).toBe('EntryAbility')
+      expect(ran.uninstall).toBe(true)
+      expect(lines[0]).toEqual(['build', '--build-mode', 'release', '--modules', 'entry'])
+      expect(lines[1]).toEqual([
+        'run', '--device', 'emulator-5554', '--module', 'entry', '--ability', 'EntryAbility', '--uninstall', '--skip-build',
+      ])
+      // A mode the CLI does not have is refused here rather than after a build.
+      expect((await deploy.execute({ projectPath: 'rel', buildOnly: true, buildMode: 'fast' }, exec)).error)
+        .toContain('debug or release')
+    } finally {
+      delete process.env.DSH_FAKE_ARGV_LOG
+    }
+  })
+
+  it('answers a missing name or app name before spawning anything', async () => {
+    const noApp = await setup().execute({ action: 'app' }, exec)
+    expect(noApp.ok).toBe(false)
+    expect(noApp.error).toContain('appName')
+    const noName = await setup().execute({ action: 'delete-instance' }, exec)
+    expect(noName.ok).toBe(false)
+    expect(noName.error).toContain('name')
+    expect((await setup().execute({ action: 'nonsense' }, exec)).error).toContain('unknown action')
+  })
+})
+
+// The window list is what every window-scoped action needs before it can name a window.
+describe.skipIf(!CAN_SPAWN)('emu_ui windows', () => {
+  it('lists the device windows, so a window id never has to be guessed', async () => {
+    process.env.DSH_FAKE_WINDOWS = '[{"id":1,"name":"EntryAbility"},{"id":2,"name":"GlobalSearch"}]'
+    try {
+      const ui = mountAll().find((def) => def.name === 'emu_ui')
+      const result = await ui.execute({ action: 'windows', device: 'emulator-5554' }, exec)
+      expect(result.ok).toBe(true)
+      expect(result.action).toBe('windows')
+      expect(result.windows).toHaveLength(2)
+      expect(result.windows[1].name).toBe('GlobalSearch')
+    } finally {
+      delete process.env.DSH_FAKE_WINDOWS
+    }
+  })
 })
 
 // The emulator controls are one verb each, and the only thing the caller can check without a device
@@ -698,6 +832,21 @@ describe.skipIf(!CAN_SPAWN)('emu controls', () => {
     const result = await emu().execute({ action: 'rotate', name: 'Pixel', direction: 'left' }, exec)
     expect(result.ok).toBe(true)
     expect(lastArgv()).toEqual(['emulator', 'rotate', '--target', 'Pixel', 'left'])
+  })
+
+  it('sets a folded shape and a motion scene as the verbs name them', async () => {
+    // Both take a value, so the value is the last argv entry. `fold`'s accepted shapes depend on the
+    // device model — the CLI prints its own mapping on a bad one — while `scene`'s three are fixed.
+    const folded = await emu().execute({ action: 'fold', name: 'Pixel', state: 'half-open' }, exec)
+    expect(folded.ok).toBe(true)
+    expect(lastArgv()).toEqual(['emulator', 'fold', '--target', 'Pixel', 'half-open'])
+    const moving = await emu().execute({ action: 'scene', name: 'Pixel', type: 'drivingNavigation' }, exec)
+    expect(moving.ok).toBe(true)
+    expect(lastArgv()).toEqual(['emulator', 'scene', '--target', 'Pixel', 'drivingNavigation'])
+    // The value is the action's whole meaning, so a missing one is answered here, before a spawn.
+    const empty = await emu().execute({ action: 'fold', name: 'Pixel' }, exec)
+    expect(empty.ok).toBe(false)
+    expect(empty.error).toContain('state')
   })
 
   it('refuses a control without the value that gives it meaning, before spawning anything', async () => {
@@ -725,6 +874,37 @@ describe.skipIf(!CAN_SPAWN)('emu controls', () => {
       'emulator', 'geolocation', '--target', 'Pixel',
       '--longitude', '121.47', '--latitude', '31.23', '--direction', '90',
     ])
+  })
+
+  it('targets the running instance when a control is given no name', async () => {
+    // `name` is optional in the schema and both sibling tools already default to the running instance.
+    const result = await emu().execute({ action: 'rotate', direction: 'left' }, exec)
+    expect(result.ok).toBe(true)
+    expect(lastArgv()[0]).toBe('emulator')
+    expect(lastArgv().slice(0, 4)).toEqual(['emulator', 'rotate', '--target', lastArgv()[3]])
+    expect(lastArgv()[4]).toBe('left')
+  })
+
+  it('fails a stop whose instance does not exist instead of reporting success', async () => {
+    // `emulator stop <unknown>` exits 0 without touching anything: the list is what decides.
+    const saved = process.env.DSH_FAKE_INSTANCES
+    process.env.DSH_FAKE_INSTANCES = '[]'
+    try {
+      const result = await emu().execute({ action: 'stop', name: 'NoSuchInst' }, exec)
+      expect(result.ok).toBe(false)
+      expect(result.error).toContain('NoSuchInst')
+    } finally {
+      process.env.DSH_FAKE_INSTANCES = saved
+    }
+  })
+
+  it('strips colour frames from what a failing control reports', async () => {
+    process.env.DSH_FAKE_EMU = '\u001b[31m--level must be in [0, 100].\u001b[39m'
+    process.env.DSH_FAKE_EMU_CODE = '1'
+    const result = await emu().execute({ action: 'battery', name: 'Pixel', level: 50 }, exec)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('--level must be in [0, 100].')
+    expect(result.error).not.toContain('\u001b')
   })
 
   it('rejects a number it cannot read instead of injecting half a position', async () => {
@@ -912,6 +1092,34 @@ describe.skipIf(!CAN_SPAWN)('hmos_device', () => {
     const queried = await device().execute({ action: 'sqlite3', remote: '/data/app/db/base.db', sql: 'select count(*) from users' }, exec)
     expect(queried.ok).toBe(true)
     expect(lastArgv()).toEqual(['device', 'sqlite3', '--device', '127.0.0.1:5555', '/data/app/db/base.db', 'select', 'count(*)', 'from', 'users'])
+  })
+
+  it('normalizes a forward-slash drive path before the CLI joins it with its own cwd', async () => {
+    // devecocli reads `E:/x` as relative and lands under `<cwd>\E:/x`; native separators are expected.
+    if (process.platform !== 'win32') return
+    const real = join(process.cwd(), 'package.json')
+    const sent = await device().execute({ action: 'send', local: real.replace(/\\/g, '/'), remote: '/data/local/tmp/package.json' }, exec)
+    expect(sent.ok).toBe(true)
+    expect(lastArgv()).toEqual(['device', 'file', 'send', '--device', '127.0.0.1:5555', real, '/data/local/tmp/package.json'])
+  })
+
+  it('fails a database the device could not run, and strips colour from a failed transfer', async () => {
+    // The transport exits 0 while the device-side shell rejects the words it was handed.
+    process.env.DSH_FAKE_DEVICE_OUT = '/bin/sh: syntax error: unexpected ('
+    const shell = await device().execute({ action: 'sqlite3', remote: '/data/app/db/base.db', sql: 'select count(*) from users' }, exec)
+    expect(shell.ok).toBe(false)
+    expect(shell.error).toContain('/bin/sh:')
+    process.env.DSH_FAKE_DEVICE_OUT = 'Error: unable to open database "/data/app/db/base.db"'
+    const missing = await device().execute({ action: 'sqlite3', remote: '/data/app/db/base.db' }, exec)
+    expect(missing.ok).toBe(false)
+    expect(missing.error).toContain('unable to open database')
+    process.env.DSH_FAKE_DEVICE_OUT = '\u001b[31mno such file\u001b[39m'
+    process.env.DSH_FAKE_DEVICE_CODE = '1'
+    const failed = await device().execute({ action: 'recv', remote: '/data/local/tmp/x', local: 'x' }, exec)
+    expect(failed.ok).toBe(false)
+    expect(failed.error).not.toContain('\u001b')
+    delete process.env.DSH_FAKE_DEVICE_OUT
+    delete process.env.DSH_FAKE_DEVICE_CODE
   })
 
   it('keeps a device-shaped local path inside the workspace instead of the drive root', async () => {
