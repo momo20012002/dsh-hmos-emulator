@@ -10,13 +10,16 @@ export interface BuildError { file: string; line: number; column: number; code: 
  *   1 ERROR: 10505001 ArkTS Compiler Error
  *   Error Message: Expression expected. At File: C:/…/PanelBody.ets:185:34
  *   COMPILE RESULT:FAIL {ERROR:2 WARN:27}
- * The rollup variant spells its tail "At file:" lower-case on the next line, hence the tolerant
- * tail; the severity counts come from the COMPILE RESULT line when it is present.
+ * The rollup variant spells its tail "At file:" lower-case on the next line, and writes its header as
+ * `> hvigor ERROR: 00305015 Rollup Error` — the count sits after `ERROR:` rather than before it — hence
+ * the tolerant tail and the optional leading count.
  */
 export function parseBuildErrors(text: string): { errors: BuildError[]; errorCount: number; warnCount: number } {
   const src = String(text || '')
   const errors: BuildError[] = []
-  const re = /\d+\s+ERROR:\s*(\d+)?\s*[^\n]*\nError Message:\s*([\s\S]*?)\s*At [Ff]ile:\s*([^\n]*?):(\d+)(?::(\d+))?/g
+  // Both `Error Message:` and `At file:` are still required, which is what keeps an unrelated line that
+  // merely contains `ERROR:` from being read as one.
+  const re = /(?:^|\n)[^\n]*?\bERROR:\s*(\d+)?\s*[^\n]*\nError Message:\s*([\s\S]*?)\s*At [Ff]ile:\s*([^\n]*?):(\d+)(?::(\d+))?/g
   let m
   while ((m = re.exec(src)) !== null) {
     errors.push({

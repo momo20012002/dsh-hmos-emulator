@@ -40,7 +40,10 @@ export async function untrackedCodeFiles(project: string): Promise<string[] | nu
  * never pays two status runs.
  */
 export async function codeStatusFiles(project: string): Promise<{ changed: string[]; untracked: string[] } | null> {
-  const status = await runCli(['git', '-c', 'core.quotepath=false', 'status', '--porcelain', '--', '.'], { cwd: project, timeoutMs: 15000 })
+  // `-uall` lists the files inside an untracked directory. The default collapses a wholly new folder into a
+  // single trailing-slash entry, which the extension filter below drops — so the list that exists to say what
+  // was NOT looked at came back empty for exactly the case it is for.
+  const status = await runCli(['git', '-c', 'core.quotepath=false', 'status', '--porcelain', '-uall', '--', '.'], { cwd: project, timeoutMs: 15000 })
   if (status.code !== 0) return null
   const top = await runCli(['git', 'rev-parse', '--show-toplevel'], { cwd: project, timeoutMs: 15000 })
   const root = top.code === 0 ? top.output.split(/\r?\n/)[0].trim().replace(/\\/g, '/').replace(/\/+$/, '') : ''

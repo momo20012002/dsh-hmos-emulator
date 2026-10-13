@@ -19,6 +19,7 @@ import {
   cliFromWrapper,
   cliInstallSpec,
   cliUpdateChannel,
+  cropPng,
   decodePng,
   diffLines,
   diffPng,
@@ -114,18 +115,22 @@ describe('parseLintTable', () => {
 })
 
 describe('parseBuildErrors', () => {
-  it('extracts file/line/column/message from the ArkTS error block', () => {
+  it('extracts file/line/column/message from both error block shapes', () => {
     const { errors, errorCount, warnCount } = parseBuildErrors(BUILD_FAILURE)
-    expect(errors).toHaveLength(1)
-    expect(errors[0]).toMatchObject({
+    // Both blocks carry a location, so both are parsed: the rollup header has its count after `ERROR:`
+    // and its tail lower-case on the next line.
+    expect(errors).toHaveLength(2)
+    expect(errors[0]).toMatchObject({ line: 185, column: 0, code: '00305015' })
+    expect(errors[0].file).toMatch(/PanelBody\.ets$/)
+    expect(errors[0].message).toMatch(/^Unexpected token/)
+    expect(errors[1]).toMatchObject({
       line: 185,
       column: 34,
       code: '10505001',
       message: 'Expression expected.',
     })
-    expect(errors[0].file).toMatch(/PanelBody\.ets$/)
-    // The severity totals come from COMPILE RESULT, which is authoritative: the rollup block
-    // spells its tail differently and is not one of the numbered ArkTS blocks.
+    expect(errors[1].file).toMatch(/PanelBody\.ets$/)
+    // The severity totals still come from COMPILE RESULT, which is authoritative.
     expect(errorCount).toBe(2)
     expect(warnCount).toBe(27)
   })
@@ -526,6 +531,18 @@ describe('changedCodeFiles', () => {
     expect(await untrackedCodeFiles(project)).toEqual([])
     rmSync(root, { recursive: true, force: true })
   }, GIT_TEST_TIMEOUT)
+
+  // The default `git status --porcelain` collapses a wholly untracked directory into one trailing-slash
+  // entry, which the code-file filter then drops — so a folder of new sources, the very case this list
+  // exists for, read as nothing at all.
+  it.skipIf(!GIT)('lists the code files inside an untracked directory', async () => {
+    const { root, project } = scratchRepo()
+    mkdirSync(join(project, 'entry', 'pages', 'new'), { recursive: true })
+    writeFileSync(join(project, 'entry', 'pages', 'new', 'Added.ets'), 'const d = 4\n')
+    writeFileSync(join(project, 'entry', 'pages', 'new', 'notes.md'), 'notes\n')
+    expect(await untrackedCodeFiles(project)).toEqual(['entry/pages/new/Added.ets'])
+    rmSync(root, { recursive: true, force: true })
+  }, GIT_TEST_TIMEOUT)
 })
 
 describe('sessionWorkspace', () => {
@@ -687,6 +704,26 @@ const RGB_ROWS = [
   [10, 20, 30, 40, 50, 60, 70, 80, 90],
   [11, 21, 31, 41, 51, 61, 71, 81, 91],
 ]
+
+describe('cropPng', () => {
+  it('intersects all four edges, so a partly off-screen request does not slide', () => {
+    const image = decodePng(png(5, 3, [[
+      0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4,
+    ]]))
+    // Both edges narrow to what is really on screen: 3 visible columns, not 5 taken from the far side.
+    const left = cropPng(image, { x: -3, y: 0, w: 5, h: 1 })
+    expect(left.rect).toEqual({ x: 0, y: 0, w: 2, h: 1 })
+    expect(left.clamped).toBe(true)
+    // And the opposite edge agrees with it.
+    const right = cropPng(image, { x: 4, y: 0, w: 5, h: 1 })
+    expect(right.rect).toEqual({ x: 4, y: 0, w: 1, h: 1 })
+    expect(right.clamped).toBe(true)
+    // A rectangle already inside comes back untouched and unclamped.
+    const inside = cropPng(image, { x: 1, y: 0, w: 2, h: 1 })
+    expect(inside.rect).toEqual({ x: 1, y: 0, w: 2, h: 1 })
+    expect(inside.clamped).toBe(false)
+  })
+})
 
 describe('decodePng', () => {
   it('undoes every filter type and returns the pixels that went in', () => {

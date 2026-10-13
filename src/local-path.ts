@@ -31,5 +31,8 @@ export function localPathFor(asked: string, root: string): string {
   // expects, so normalize absolute paths before handing them over; a relative path is ours to resolve.
   if (absoluteLocal(asked)) return normalize(asked)
   // A leading separator is not a request for a drive root on Windows: it is how a device path looks.
-  return resolve(root, asked.replace(/^[\\/]+/, ''))
+  // A drive-relative path (`C:db.sqlite`) is not absolute by `absoluteLocal`, yet `resolve` would still
+  // honour its drive and discard the root — so the drive is dropped too and the rest stays
+  // workspace-relative, which is what this helper promises. `C:\x` and `C:/x` take the branch above.
+  return resolve(root, asked.replace(/^[A-Za-z]:(?![\\/])/, '').replace(/^[\\/]+/, ''))
 }

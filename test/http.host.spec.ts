@@ -370,6 +370,12 @@ describe.skipIf(!CAN_SPAWN)('panel-only routes', () => {
     // A relative local path is read against the workspace the panel names, not against the host's cwd.
     const relative = await call('device.file', { direction: 'send', device: 'emulator-5554', local: 'upload.txt', remote: '/data/local/tmp/x.txt', root: dir })
     expect(relative.local).toBe(local)
+    // A drive-relative path (`D:upload.txt`) is not absolute by `absoluteLocal`, and `resolve` would honour
+    // its drive — leaving the root the panel named for a path the CLI then reads or writes outside the
+    // workspace. The drive has to differ from the root's: `resolve('C:\tmp', 'C:upload.txt')` stays inside.
+    const otherDrive = dir.slice(0, 2).toLowerCase() === 'c:' ? 'D:' : 'C:'
+    const driveRelative = await call('device.file', { direction: 'send', device: 'emulator-5554', local: `${otherDrive}upload.txt`, remote: '/data/local/tmp/x.txt', root: dir })
+    expect(driveRelative.local.startsWith(dir)).toBe(true)
     // Every refusal the route can give without a device round trip, and without spawning anything.
     expect((await post('device.file', { direction: 'send', device: 'emulator-5554', local: join(dir, 'missing.txt'), remote: '/data/x' })).status).toBe(400)
     expect((await post('device.file', { direction: 'sideways', device: 'emulator-5554', local, remote: '/data/x' })).status).toBe(400)

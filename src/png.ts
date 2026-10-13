@@ -137,10 +137,17 @@ export function encodePng(image: DecodedPng): Buffer {
  */
 export function cropPng(image: DecodedPng, rect: { x: number; y: number; w: number; h: number }): { image: DecodedPng; rect: { x: number; y: number; w: number; h: number }; clamped: boolean } {
   const asked = { x: Math.floor(rect.x), y: Math.floor(rect.y), w: Math.floor(rect.w), h: Math.floor(rect.h) }
-  const x = Math.max(0, Math.min(image.width - 1, asked.x))
-  const y = Math.max(0, Math.min(image.height - 1, asked.y))
-  const w = Math.max(1, Math.min(image.width - x, asked.w))
-  const h = Math.max(1, Math.min(image.height - y, asked.h))
+  // All four edges intersect the image. Clamping the origin on its own would slide the rectangle and pick
+  // up pixels from the far side — `{x: -3, w: 5}` would answer 5 columns where only 3 are on screen — and
+  // report the same `clamped` as a harmless narrowing.
+  const left = Math.max(0, Math.min(image.width, asked.x))
+  const top = Math.max(0, Math.min(image.height, asked.y))
+  const right = Math.max(left, Math.min(image.width, asked.x + asked.w))
+  const bottom = Math.max(top, Math.min(image.height, asked.y + asked.h))
+  const x = left
+  const y = top
+  const w = Math.max(1, right - left)
+  const h = Math.max(1, bottom - top)
   const clamped = x !== asked.x || y !== asked.y || w !== asked.w || h !== asked.h
   const stride = image.width * image.channels
   const rowBytes = w * image.channels
