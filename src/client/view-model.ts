@@ -66,3 +66,20 @@ export function mountSwitchTitle(target: string, version: string): string {
   const name = target === 'better' ? 'better-sidebar' : '内置右侧栏'
   return target === 'better' && version !== '' ? `切换到 ${name} ${version}` : `切换到 ${name}`
 }
+
+/**
+ * The account state the devecocli row shows, or null when there is nothing to say.
+ *
+ * The row names what the sign-in is *for* — signing materials, which `signature generate` cannot write without
+ * an account — and it names **both** states: a label that only appears when something is wrong reads as an
+ * error, while "签名账号已登录" says the line is a state. What to do about the missing one rides the tooltip
+ * (`AUTH_HINT_TITLE`). A null state means the question could not be asked at all (no CLI), which says nothing
+ * about the account.
+ * @param signedIn - the toolchain report's `signedIn`: true, false, or null when it could not be read.
+ * @returns the label, or null when the row should stay as it is.
+ */
+export function authHint(signedIn: unknown): string | null {
+  if (signedIn === true) return '已登录'
+  if (signedIn === false) return '未登录'
+  return null
+}

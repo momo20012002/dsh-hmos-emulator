@@ -506,6 +506,23 @@ describe.skipIf(!CAN_SPAWN)('deploy module list', () => {
     expect(result.error).toContain('不属于该工程')
     expect(result.error).toContain('entry')
   })
+
+  it('reads a module list whose trailing comma is followed by a comment', async () => {
+    // Real project files carry both. The trailing-comma lookahead runs before comments are stripped, so it
+    // has to skip them too — otherwise the whole configuration reads as unparsable and the list comes back
+    // empty, which the panel shows as a project with no modules.
+    mkdirSync(join(dir, 'proj3'), { recursive: true })
+    writeFileSync(join(dir, 'proj3', 'build-profile.json5'), '{ "modules": [ { "name": "entry" }, /* added later */ ] }')
+    const deploy = mountAll().find((def) => def.name === 'hmos_deploy')
+    const accepted = await deploy.execute({ projectPath: 'proj3', buildOnly: true, module: 'entry' }, exec)
+    expect(accepted.ok).toBe(true)
+    expect(accepted.note ?? '').not.toContain('未能从 build-profile.json5 读出模块名')
+    // The decisive half: a name the project does not have is refused, which is only possible if the list was
+    // actually read.
+    const rejected = await deploy.execute({ projectPath: 'proj3', buildOnly: true, module: 'nope' }, exec)
+    expect(rejected.ok).toBe(false)
+    expect(rejected.error).toContain('不属于该工程')
+  })
 })
 
 // A failed build reaches the caller twice — the parsed errors and the tail — and hvigor writes
@@ -680,6 +697,24 @@ describe.skipIf(!CAN_SPAWN)('projectPath resolution', () => {
     expect(result.error ?? '').not.toContain('未找到')
   })
 
+  it('does not call a check clean when the run produced no verdict', async () => {
+    // This CLI uses a nonzero exit code to report findings as well, so `ok` cannot be read off the exit code
+    // alone: a run that exited without parsing anything is stated as a failure, with its own message.
+    mkdirSync(join(dir, 'proj'), { recursive: true })
+    writeFileSync(join(dir, 'proj', 'build-profile.json5'), '{ "modules": [{ "name": "entry" }] }')
+    process.env.DSH_FAKE_CHECK = 'linter: cannot start\n'
+    process.env.DSH_FAKE_CHECK_CODE = '2'
+    try {
+      const lint = mountAll().find((def) => def.name === 'hmos_lint')
+      const failed = await lint.execute({ projectPath: 'proj' }, exec)
+      expect(failed.ok).toBe(false)
+      expect(failed.error).toContain('代码检查未能完成')
+    } finally {
+      delete process.env.DSH_FAKE_CHECK
+      delete process.env.DSH_FAKE_CHECK_CODE
+    }
+  })
+
   it('runs the other two project checks through the same tool', async () => {
     // kind=arkts / kind=compat are the checks `check` also offers on the same subject, so they ride this
     // tool rather than becoming tools of their own: a caller already holds this one.
@@ -725,6 +760,76 @@ describe.skipIf(!CAN_SPAWN)('projectPath resolution', () => {
 
 // The once-per-project jobs: scaffolding, signing and the two instance verbs. They are rare enough to
 // live in a tool of their own, so the argv each one builds is the thing worth pinning down.
+describe.skipIf(!CAN_SPAWN)('hmos_log', () => {
+  const logTool = () => mountAll().find((def) => def.name === 'hmos_log')
+
+  /**
+   * Set fakes for one case and put the previous values back afterwards. The harness seeds some of these for
+   * the whole file (DSH_FAKE_INSTANCES among them), so deleting them would starve every case that follows.
+   */
+  const withFakes = async (vars: Record<string, string | undefined>, run: () => Promise<void>) => {
+    const saved = Object.keys(vars).map((key) => [key, process.env[key]] as const)
+    for (const [key, value] of Object.entries(vars)) if (value === undefined) delete process.env[key]; else process.env[key] = value
+    try { await run() } finally {
+      for (const [key, value] of saved) if (value === undefined) delete process.env[key]; else process.env[key] = value
+    }
+  }
+
+  it('reads from the start of the buffer when asked for the earliest lines', async () => {
+    // `--tail` means the newest N of whatever window it is given, so the start of the buffer is only
+    // reachable by asking for no window at all and keeping the head of the answer. The filler is what proves
+    // the tail was not what came back.
+    const filler = Array.from({ length: 4000 }, (_, i) => `10-13 00:00:0${i % 10}.000     1     1 I A/B: filler line ${i} ................`)
+    await withFakes({
+      DSH_FAKE_ARGV_LOG: join(dir, 'log-early-argv.log'),
+      DSH_FAKE_INSTANCES: '[{"name":"Pura 90","status":"running","serial":"127.0.0.1:5555"}]',
+      DSH_FAKE_LOG: [
+        '10-12 23:11:57.392     0     0 I I00000/HiLog: ========Zeroth log of type: init',
+        ...filler,
+      ].join('\n'),
+    }, async () => {
+      const r = await logTool().execute({ since: 'earliest', tail: 2 }, exec)
+      expect(r.ok).toBe(true)
+      expect(r.fromStart).toBe(true)
+      expect(r.lines).toHaveLength(2)
+      expect(String(r.lines[0].message)).toContain('Zeroth log of type: init')
+      expect(String(r.lines[1].message)).toContain('filler line 0')
+      expect(JSON.stringify(r.lines)).not.toContain('filler line 3999')
+      // No `--tail` and no `--from`: the CLI is asked for the buffer itself.
+      const argvLines = readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+      expect(argvLines[argvLines.length - 1]).toEqual(['log', '--device', '127.0.0.1:5555'])
+    })
+  })
+
+  it('keeps the newest lines of a window, as it did before', async () => {
+    // The ordinary read is unchanged: a window, `--tail`, and the newest N of that window.
+    await withFakes({
+      DSH_FAKE_ARGV_LOG: join(dir, 'log-window-argv.log'),
+      DSH_FAKE_INSTANCES: '[{"name":"Pura 90","status":"running","serial":"127.0.0.1:5555"}]',
+      DSH_FAKE_LOG: '10-13 00:00:01.000     1     1 I A/B: one\n10-13 00:00:02.000     1     1 I A/B: two',
+    }, async () => {
+      const r = await logTool().execute({ since: '5m', tail: 10 }, exec)
+      expect(r.ok).toBe(true)
+      expect(r.fromStart).toBeUndefined()
+      expect(String(r.lines[r.lines.length - 1].message)).toContain('two')
+      const argvLines = readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+      expect(argvLines[argvLines.length - 1]).toEqual(['log', '--device', '127.0.0.1:5555', '--tail', '10', '--from', '5m'])
+    })
+  })
+  it('strips the CLI colour from what it hands back', async () => {
+    // Measured: the CLI wraps its own banner and error text in ANSI escapes (`No active devices found` comes
+    // back red). This output goes to a model, so the escapes are stripped here the way `emu` strips its own.
+    await withFakes({
+      DSH_FAKE_INSTANCES: '[{"name":"Pura 90","status":"running","serial":"127.0.0.1:5555"}]',
+      DSH_FAKE_LOG: '\u001b[31mred banner\u001b[39m\n10-13 00:00:02.000     1     1 I A/B: two',
+    }, async () => {
+      const r = await logTool().execute({ raw: true, tail: 5 }, exec)
+      expect(r.ok).toBe(true)
+      expect(JSON.stringify(r)).not.toContain('\u001b')
+    })
+  })
+})
+
 describe.skipIf(!CAN_SPAWN)('hmos_setup', () => {
   const setup = () => mountAll().find((def) => def.name === 'hmos_setup')
   const argvLines = () => readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
@@ -747,12 +852,56 @@ describe.skipIf(!CAN_SPAWN)('hmos_setup', () => {
       expect(argvLines()[2]).toEqual([
         'emulator', 'create', 'Pura X View', '--device-type', 'foldable', '--os-version', 'HarmonyOS 6.0.1(21)',
       ])
-      // The account check is read-only on purpose: `login` needs a browser, so it stays the user's errand.
-      const who = await setup().execute({ action: 'auth' }, exec)
-      expect(who.ok).toBe(true)
-      expect(argvLines()[3]).toEqual(['auth', 'status'])
     } finally {
       delete process.env.DSH_FAKE_ARGV_LOG
+    }
+  })
+
+  it('names the missing login when a signature fails without an account', async () => {
+    // Without an account `signature generate` cannot write signing materials, and its own output does not say
+    // so. The failure carries the login state and the command that fixes it, so the caller needs no second
+    // question — and the account is asked about only after the failure, never on the happy path.
+    mkdirSync(join(dir, 'nosign'), { recursive: true })
+    writeFileSync(join(dir, 'nosign', 'build-profile.json5'), '{}')
+    const argvLog = join(dir, 'nosign-argv.log')
+    process.env.DSH_FAKE_ARGV_LOG = argvLog
+    process.env.DSH_FAKE_SIGN = 'Error: no certificate available\n'
+    process.env.DSH_FAKE_SIGN_CODE = '1'
+    // The CLI prints this and still exits 0, which is exactly why the exit code is not the signal.
+    process.env.DSH_FAKE_AUTH = 'Not logged in\n'
+    try {
+      const failed = await setup().execute({ action: 'sign', projectPath: 'nosign' }, exec)
+      expect(failed.ok).toBe(false)
+      expect(failed.signedIn).toBe(false)
+      expect(failed.error).toContain('devecocli auth login')
+      expect(argvLines().map((line) => line.slice(0, 2))).toEqual([['signature', 'generate'], ['auth', 'status']])
+    } finally {
+      delete process.env.DSH_FAKE_ARGV_LOG
+      delete process.env.DSH_FAKE_SIGN
+      delete process.env.DSH_FAKE_SIGN_CODE
+      delete process.env.DSH_FAKE_AUTH
+      delete process.env.DSH_FAKE_AUTH_CODE
+    }
+  })
+
+  it('does not blame the account when the login state could not be read', async () => {
+    // The extra read is what turns a bare "signature failed" into a diagnosis; when that read itself fails the
+    // cause stays open, so neither the account nor its fix may be named.
+    mkdirSync(join(dir, 'nosign2'), { recursive: true })
+    writeFileSync(join(dir, 'nosign2', 'build-profile.json5'), '{}')
+    process.env.DSH_FAKE_SIGN = 'Error: no certificate available\n'
+    process.env.DSH_FAKE_SIGN_CODE = '1'
+    process.env.DSH_FAKE_AUTH_CODE = '1'
+    try {
+      const failed = await setup().execute({ action: 'sign', projectPath: 'nosign2' }, exec)
+      expect(failed.ok).toBe(false)
+      expect(failed.signedIn).toBe(null)
+      expect(failed.error).not.toContain('未登录华为开发者账号')
+      expect(failed.error).toContain('未能确认登录状态')
+    } finally {
+      delete process.env.DSH_FAKE_SIGN
+      delete process.env.DSH_FAKE_SIGN_CODE
+      delete process.env.DSH_FAKE_AUTH_CODE
     }
   })
 
@@ -826,6 +975,24 @@ describe.skipIf(!CAN_SPAWN)('emu controls', () => {
   afterEach(() => {
     delete process.env.DSH_FAKE_EMU
     delete process.env.DSH_FAKE_EMU_CODE
+  })
+
+  it('lists the instances the CLI reports alongside its own notices', async () => {
+    // Measured: the CLI appends a version notice after its JSON (`New version 1.3.5 available` on 1.3.4), and
+    // that trailing line made the whole output unparseable — so this list came back empty on a real machine
+    // while the clean-JSON fixture kept the tests green.
+    const saved = process.env.DSH_FAKE_INSTANCES
+    process.env.DSH_FAKE_INSTANCES = '[\n  {"name":"Pura 90","status":"running","serial":"127.0.0.1:5555","deviceType":"phone","osVersion":"HarmonyOS 6.1.1(24)"}\n]\n\nNew version 1.3.5 available, run `devecocli update` to upgrade\n'
+    try {
+      const result = await emu().execute({ action: 'list' }, exec)
+      expect(result.ok).toBe(true)
+      expect(result.instances).toEqual([
+        { name: 'Pura 90', status: 'running', serial: '127.0.0.1:5555', osVersion: 'HarmonyOS 6.1.1(24)' },
+      ])
+    } finally {
+      if (saved === undefined) delete process.env.DSH_FAKE_INSTANCES
+      else process.env.DSH_FAKE_INSTANCES = saved
+    }
   })
 
   it('rotates a running instance with the direction it was given', async () => {
@@ -1022,6 +1189,14 @@ describe.skipIf(!CAN_SPAWN)('deploy clean and module selection', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toContain('nope')
     expect(result.error).toContain('entry')
+  })
+
+  it('accepts the module@target form as the module it names', async () => {
+    // The CLI documents `module@target` for targeting a build, so the guard judges the module the spec names
+    // while the whole spec is what travels to the CLI.
+    const result = await mountAll().find((def) => def.name === 'hmos_deploy')
+      .execute({ projectPath: project('targeted'), modules: ['entry@phone'], buildOnly: true }, exec)
+    expect(result.error ?? '').not.toContain('不属于该工程')
   })
 })
 

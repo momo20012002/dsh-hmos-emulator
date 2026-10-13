@@ -2,7 +2,7 @@ import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { capLines, diffLines, tailText } from '../text.js'
 import { stripAnsi } from '../parsers/devecocli.js'
 import { cropPng, decodePng, diffPng, encodePng } from '../png.js'
-import { abortedError, firstRunningSerial, resolveDevecoCli, runCli, throwIfAborted } from '../toolchain.js'
+import { abortedError, firstRunningSerial, parseJsonArray, resolveDevecoCli, runCli, throwIfAborted } from '../toolchain.js'
 import { LayoutLine, ancestorLabels, candidateList, cleanLayout, labelMatches, layoutJson, matchLayout, pageTitle, parseLayoutLine, pointOf, rawKeys, renderLayout, renderLines, selectLayoutLines } from '../parsers/layout.js'
 import { relativeTo, sessionWorkspace } from '../workspace.js'
 import { TOOL_OUT_SCHEMA, attachmentRefForImage, shotFields, toolRender } from '../shots.js'
@@ -101,11 +101,12 @@ export function makeEmuUi(deps: ToolDeps) {
           // The window ids every other action takes were only knowable from the device, so a caller had
           // to guess one. This is that list: `all` reaches the system windows a picker or dialog lives in.
           const r = await run(['ui', 'window', 'list', '--device', device, '--format', 'json', ...(asBool(args?.all) ? ['--all'] : [])], 30000)
-          let windows: unknown
-          try { windows = JSON.parse(r.output) } catch { windows = undefined }
+          // Parsed past the CLI's own update notice, which rides along after the JSON: raw JSON.parse would
+          // throw on it and answer "no windows" while the device has them.
+          const windows = parseJsonArray(r.output)
           return {
             ok: r.code === 0, action: 'windows', device,
-            windows: windows === undefined ? [] : windows,
+            windows,
             tail: tailText(stripAnsi(r.output), 20),
             ...(r.code === 0 ? {} : { error: tailText(stripAnsi(r.output), 6) }),
           }
@@ -271,7 +272,7 @@ export function makeEmuUi(deps: ToolDeps) {
               page = pageTitle(stored)
             } else if (typeof a?.label === 'string' && a.label.trim()) {
               // Resolve a label to its center in one call: avoids a layout round-trip before click.
-              const dump = await dumpLayout()
+              const dump = await dumpLayout(false, depthOf(a), a)
               if (!dump.ok) return { ok: false, device, error: dump.error }
               const matches = labelMatches(dump.lines, a.label)
               if (!matches.length) {
@@ -333,7 +334,7 @@ export function makeEmuUi(deps: ToolDeps) {
                 const wait = Number.isFinite(a?.waitMs) ? Math.max(0, Math.min(5000, a.waitMs)) : 600
                 if (wait > 0) await new Promise((resolveWait) => setTimeout(resolveWait, wait))
               }
-              const after = await dumpLayout(false, depthOf(a))
+              const after = await dumpLayout(false, depthOf(a), a)
               result.tree = after.ok
                 ? renderFor(selectLayoutLines(after.lines, a?.filter), asBool(a?.changedOnly))
                 : after.error
@@ -494,8 +495,19 @@ export function makeEmuUi(deps: ToolDeps) {
             const absent = asBool(a?.absent)
             const started = Date.now()
             let last: LayoutLine[] = []
+            // Without a usable query `matchLayout` answers [] — which the absent form would read as "it is
+            // gone" after a single dump, and the present form would poll to the deadline. Both are false, so
+            // the missing or invalid condition is named instead.
+            const queryText = typeof a?.text === 'string' ? a.text : ''
+            const queryRegex = typeof a?.textRegex === 'string' ? a.textRegex : ''
+            if (!queryText && !queryRegex) {
+              return { ok: false, device, error: 'waitFor 需要 text 或 textRegex:没有查询条件时无法判断是否已消失' }
+            }
+            if (queryRegex) {
+              try { new RegExp(queryRegex) } catch { return { ok: false, device, error: `textRegex 不是合法的正则:${queryRegex}` } }
+            }
             for (;;) {
-              const dump = await dumpLayout()
+              const dump = await dumpLayout(false, depthOf(a), a)
               if (!dump.ok) return { ok: false, device, error: dump.error }
               last = dump.lines
               const hits = matchLayout(last, {
@@ -539,14 +551,14 @@ export function makeEmuUi(deps: ToolDeps) {
             // already have happened — which is precisely the miss this action exists to prevent.
             let baseline = lastDump.get(device)
             if (!baseline) {
-              const first = await dumpLayout()
+              const first = await dumpLayout(false, depthOf(a), a)
               if (!first.ok) return { ok: false, device, error: first.error }
               baseline = first.lines.map((l) => l.raw.trim())
             }
             let polls = 0
             let last: LayoutLine[] = lastLayout.get(device) ?? []
             for (;;) {
-              const dump = await dumpLayout()
+              const dump = await dumpLayout(false, depthOf(a), a)
               if (!dump.ok) return { ok: false, device, error: dump.error }
               polls += 1
               last = dump.lines
@@ -571,7 +583,7 @@ export function makeEmuUi(deps: ToolDeps) {
             let polls = 0
             let last: LayoutLine[] = []
             for (;;) {
-              const dump = await dumpLayout()
+              const dump = await dumpLayout(false, depthOf(a), a)
               if (!dump.ok) return { ok: false, device, error: dump.error }
               last = dump.lines
               polls += 1

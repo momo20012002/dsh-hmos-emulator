@@ -3,11 +3,22 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { AUTO_SHOT_PREFIX, TOOL_SHOT_PREFIX, pruneAutoShots, pruneToolShots, readDataUrl } from './shots.js'
 import { countChangedCode, hashTree } from './git.js'
-import { cliChannel, cliInstallSpec, cliUpdateChannel, devecoCliHint, ensureImageReady, firstRunningSerial, npmCommand, npmInvocation, resolveDevecoCli, resolveHdc, runCli, runCliStream, versionFromOutput, waitDeviceReady } from './toolchain.js'
+import { authStatus, cliChannel, cliInstallSpec, cliUpdateChannel, devecoCliHint, ensureImageReady, firstRunningSerial, npmCommand, npmInvocation, resolveDevecoCli, resolveHdc, runCli, runCliStream, versionFromOutput, waitDeviceReady } from './toolchain.js'
 import { headText, tailText } from './text.js'
 import { LINT_LABELS, fixStats, lintOutcome, parseLintSummary } from './parsers/lint.js'
-import { PROJECT_MARK, normalizeDir, readModules, scanProjects } from './workspace.js'
+import { PROJECT_MARK, moduleName, normalizeDir, readModules, scanProjects } from './workspace.js'
 import { absoluteLocal, localPathFor } from './local-path.js'
+/**
+ * Parse a `--format json` answer the CLI wrapped in its own update notice ("New version 1.3.5 available…",
+ * appended after every command). The notice line is dropped, then the JSON is parsed as it stands, so both the
+ * array and the `{ devices: [...] }` shapes survive; anything else throws exactly as `JSON.parse` would.
+ */
+const jsonFrom = (output: string) => {
+  const text = output.replace(/^.*New version .*available.*$/gm, '').trim()
+  const start = text.search(/[[{]/)
+  const end = Math.max(text.lastIndexOf(']'), text.lastIndexOf('}'))
+  return JSON.parse(start >= 0 && end > start ? text.slice(start, end + 1) : text)
+}
 /**
  * The HTTP API behind the panel: toolchain, emulator, device, project, lint and deploy methods,
  * plus the background the model tools read through. Nothing here touches a model tool schema.
@@ -67,6 +78,16 @@ export function createApi() {
       const v = await runCli([process.execPath, cliPath, '--version'], { timeoutMs: 20000 })
       if (v.code === 0) cliVersion = versionFromOutput(v.output) || null
     }
+    // Signing materials can only be generated while an account is signed in, and the CLI's own failure text
+    // does not say so. One read here answers it for the panel, and `hmos_setup`'s sign attaches the same
+    // answer where it matters most. Null when there is no CLI to ask.
+    let signedIn: boolean | null = null
+    if (cliPath) {
+      // A read that fails outright is not a reading: the row then says "状态未知" rather than "未登录", because
+      // a machine whose `auth status` cannot run must not be made to look signed out.
+      const who = await authStatus(cliPath)
+      signedIn = who.known ? who.signedIn : null
+    }
     // Give a platform-appropriate SDK path example instead of hardcoding Windows.
     const sdkExample = process.platform === 'win32'
       ? '如 C:\\Program Files\\Huawei\\DevEco Studio\\sdk'
@@ -79,6 +100,9 @@ export function createApi() {
       devecoCliVersion: cliVersion,
       // The line an upgrade would follow; the panel labels the update action with it.
       devecoCliChannel: cliPath ? cliChannel(cliVersion) : null,
+      // Whether an account is signed in: the panel shows it beside the CLI version, because `sign` cannot
+      // write signing materials without one.
+      signedIn,
       hdcExe: resolveHdc() ?? null,
       sdkHome: sdk || null,
       hint:
@@ -258,7 +282,7 @@ export function createApi() {
       raw = result.output
       if (result.code === 0) {
         try {
-          const arr = JSON.parse(result.output)
+          const arr = jsonFrom(result.output)
           if (Array.isArray(arr)) {
             for (const d of arr) {
               const serial = typeof d === 'string' ? d : (d && (d.serial || d.name))
@@ -395,7 +419,7 @@ export function createApi() {
       let online = false
       if (probe.code === 0) {
         try {
-          const arr = JSON.parse(probe.output)
+          const arr = jsonFrom(probe.output)
           online = Array.isArray(arr) && arr.some((d) => { const s = typeof d === 'string' ? d : (d && (d.serial || d.name)); return s === device })
         } catch { /* parse failed: skip the precheck and let run report it */ }
       }
@@ -410,11 +434,13 @@ export function createApi() {
     // A panel that switched project can still be holding the previous project's module names, so a
     // name this project does not have is refused instead of being handed to the build. An unreadable
     // module list (no marker, or JSON5 the reader does not cover) cannot judge them, so it does not.
-    const unknown = modules.length ? asked.filter((m) => !modules.includes(m)) : []
+    // A name this project does not have is refused instead of being handed to the build; a `module@target`
+    // spec counts as the module it names, which is the form the CLI documents for targeting a build.
+    const unknown = modules.length ? asked.filter((m) => !modules.includes(moduleName(m))) : []
     if (unknown.length) {
       throw Object.assign(new Error(`模块“${unknown.join('、')}”不属于该工程(可选:${modules.join('、')})`), { code: 'bad-request' })
     }
-    if (modules.length && payload?.module !== undefined && payload?.module !== null && !modules.includes(String(payload.module))) {
+    if (modules.length && payload?.module !== undefined && payload?.module !== null && !modules.includes(moduleName(String(payload.module)))) {
       throw Object.assign(new Error(`模块“${payload.module}”不属于该工程(可选:${modules.join('、') || '无'})`), { code: 'bad-request' })
     }
     const chosen = asked[0] ?? (payload?.module ? String(payload.module) : modules.includes('entry') ? 'entry' : modules[0])
@@ -578,7 +604,7 @@ export function createApi() {
     let online = false
     if (probe.code === 0) {
       try {
-        const arr = JSON.parse(probe.output)
+        const arr = jsonFrom(probe.output)
         devices = (Array.isArray(arr) ? arr : [])
           .map((d) => (typeof d === 'string' ? d : (d && (d.serial || d.name))))
           .filter((s) => typeof s === 'string' && /^[\w.:-]+$/.test(s))

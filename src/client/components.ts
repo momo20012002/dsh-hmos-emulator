@@ -48,13 +48,13 @@ export function Icon({ src, size = 16 }: { src: string; size?: number }) {
   })
 }
 /** Button with an optional leading icon. */
-export function Btn({ children, icon, primary, secondary, danger, dangerSolid, ghost, disabled, onClick, style, title }: {
-  children?: any; icon?: string; primary?: boolean; secondary?: boolean; danger?: boolean; dangerSolid?: boolean; ghost?: boolean; disabled?: boolean; onClick?: any; style?: any; title?: string
+export function Btn({ children, icon, primary, secondary, danger, dangerSolid, ghost, disabled, onClick, onMouseDown, onMouseUp, onMouseLeave, style, title }: {
+  children?: any; icon?: string; primary?: boolean; secondary?: boolean; danger?: boolean; dangerSolid?: boolean; ghost?: boolean; disabled?: boolean; onClick?: any; onMouseDown?: any; onMouseUp?: any; onMouseLeave?: any; style?: any; title?: string
 }) {
   const base = primary ? btnPrimary : secondary ? btnSecondary : dangerSolid ? btnDangerSolid : danger ? btnDanger : ghost ? btnGhost : btnSecondary
   return h('button', {
     style: { ...base, ...style, ...(disabled ? { opacity: .5, cursor: 'not-allowed' } : undefined) },
-    disabled, onClick, title,
+    disabled, onClick, onMouseDown, onMouseUp, onMouseLeave, title,
   }, icon ? h(Icon, { src: icon, size: 15 }) : null, children)
 }
 /**

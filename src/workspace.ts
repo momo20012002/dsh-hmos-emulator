@@ -90,9 +90,20 @@ export function stripJson5(text: string): string {
     }
     if (ch === '{') { keyPending = true; out += ch; i += 1; continue }
     if (ch === ',') {
-      // A comma that is followed only by a closing bracket is a trailing comma.
+      // A comma that is followed only by a closing bracket is a trailing comma. Comments count as nothing
+      // here as well: this lookahead runs before they are stripped, and `, /* e */ ]` is a shape real project
+      // files use — reading it as a real comma makes the whole configuration unparsable.
       let j = i + 1
-      while (j < text.length && /\s/.test(text[j])) j += 1
+      for (;;) {
+        while (j < text.length && /\s/.test(text[j])) j += 1
+        if (text[j] === '/' && text[j + 1] === '/') { while (j < text.length && text[j] !== '\n') j += 1; continue }
+        if (text[j] === '/' && text[j + 1] === '*') {
+          const end = text.indexOf('*/', j + 2)
+          j = end === -1 ? text.length : end + 2
+          continue
+        }
+        break
+      }
       if (text[j] === '}' || text[j] === ']') { i += 1; continue }
       keyPending = true
       out += ch
@@ -112,6 +123,9 @@ export function stripJson5(text: string): string {
   }
   return out
 }
+
+/** A `module@target` spec as the CLI writes it: the module name alone, for comparing against the project. */
+export const moduleName = (spec: string): string => String(spec).split('@')[0]
 
 /** Read entry module names from build-profile.json5 modules[].name; [] when unparsable. */
 export function readModules(project: string): string[] {

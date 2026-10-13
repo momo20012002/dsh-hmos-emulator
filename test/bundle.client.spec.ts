@@ -611,4 +611,16 @@ describe('client logger', () => {
       errors.mockRestore()
     }
   })
+
+  it('wires the account command copy controls to the clipboard', () => {
+    // The lesson this pins: a copy button that renders perfectly but was given no onClick fails in total
+    // silence — no error, no log line, no colour change — and nothing that only exercises pure functions can
+    // see it. Asserted against the built bundle, quote-agnostic because the bundler picks the quotes.
+    const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+    expect(source).toMatch(/copyText\([^)]{0,40}devecocli auth login/)
+    expect(source).toMatch(/copyText\([^)]{0,40}devecocli auth logout/)
+    // Each row's press flag is its own, so no two copy controls can light up together.
+    expect(source).toMatch(/onMouseDown:[^,}]{0,60}setLoginCopied/)
+    expect(source).toMatch(/onMouseDown:[^,}]{0,60}setLogoutCopied/)
+  })
 })

@@ -14,5 +14,7 @@ export const IC = {
   camera: svg('0 0 1024 1024', '<path d="M928 256H768l-64-96a64 64 0 0 0-53-28H373a64 64 0 0 0-53 28l-64 96H96a64 64 0 0 0-64 64v512a64 64 0 0 0 64 64h832a64 64 0 0 0 64-64V320a64 64 0 0 0-64-64zM512 800a224 224 0 1 1 0-448 224 224 0 0 1 0 448z m0-352a128 128 0 1 0 0 256 128 128 0 0 0 0-256z"/>'),
   // Gear: one filled path with the centre hole, so the header entry stays quiet next to 刷新.
   settings: svg('0 0 960 960', '<path d="M370 880l-16-128q-13-5-24.5-12T307 725l-119 50L78 585l103-78q-1-7-1-13.5V466q0-6.5 1-13.5L78 375l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5V547q0 6.5-1 13.5l103 78-110 190-119-50q-11 8-23 15t-24 12l-16 128H370Zm112-260q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342 480q0 58 40.5 99t99.5 41Z"/>'),
+  // Two pages, the one behind peeking out: the sheet that is fully drawn is the copy.
+  copy: svg('0 0 24 24', '<path d="M9 2h11a2 2 0 0 1 2 2v13h-2V4H9V2z"/><path d="M6 6h11a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z"/>'),
 }
 

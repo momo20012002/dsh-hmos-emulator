@@ -6,7 +6,7 @@ import { IC } from './icons.js'
 import { LINT_TITLES, ansiRuns, cleanCliLine, exitCodeOf, fmtDur, lintStatusLine, shortPath } from './format.js'
 import { notices, ACTION_PREFIX } from './notice.js'
 import { preferenceStore } from './host-store.js'
-import { deviceLabel, isRenderableComponent, keepScannedProject, mountSwitchTitle, pickDevice, pickModule, statusTone } from './view-model.js'
+import { authHint, deviceLabel, isRenderableComponent, keepScannedProject, mountSwitchTitle, pickDevice, pickModule, statusTone } from './view-model.js'
 export const { createElement: h, useEffect, useRef, useState } = require('react')
 
 /**
@@ -23,6 +23,19 @@ export const logLine = (kind) => ({
   color: kind === 'err' ? s.danger : kind === 'ok' ? s.ok : kind === 'info' ? s.muted : s.fg,
 })
 export const warnBox = { background: 'rgba(229,72,77,.12)', border: `1px solid ${s.danger}`, color: s.danger, borderRadius: 8, padding: 8, fontSize: 12, marginBottom: 10, lineHeight: 1.5 }
+/** The monospace stack the shell's own code surfaces use, plus the shape a command takes here. */
+const MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+/**
+ * A command as its own surface, with the copy control **inside** it: one bordered box holds both, which is what
+ * Carbon's code snippet and Primer's clipboard-copy draw — the icon belongs to the block, not beside it.
+ */
+const codeBlock = { display: 'flex', alignItems: 'center', gap: 4, minWidth: 0, background: s.bg2, border: `1px solid ${s.border}`, borderRadius: 8, padding: '3px 4px 3px 10px' }
+/** The command line itself: monospace, truncating, and selectable in one go. */
+const codeBlockText = { flex: 1, minWidth: 0, fontFamily: MONO, fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', userSelect: 'all' }
+/** The label at the left inside a command block, so the block still spans the column and nothing looks indented. */
+const codeLabel = { flex: '0 0 auto', paddingRight: 4, fontSize: 12, color: s.faint }
+/** A command row shows the press rather than the copy, so its clipboard call needs no feedback flag. */
+const noop = () => {}
 
 // Keep the last screenshot in module scope so it survives a panel remount.
 export let lastShot = null
@@ -196,13 +209,14 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
     const saved = lsGet('deployAction')
     return saved === 'build' || saved === 'clean' ? saved : (lsGet('buildOnly') === '1' ? 'build' : 'run')
   })
-  // Device log snapshot: what to ask for, remembered like the other panel choices.
-  const [logLevel, setLogLevel] = useState(() => lsGet('logLevel'))
-  const [logBundle, setLogBundle] = useState(() => lsGet('logBundle'))
-  const [logKeyword, setLogKeyword] = useState(() => lsGet('logKeyword'))
+  // Device log snapshot: what to ask for, remembered like the other panel choices — and, like the project
+  // itself, remembered per session: a keyword or bundle name from another workspace narrows the wrong thing.
+  const [logLevel, setLogLevel] = useState(() => lsGet(lsSessionKey('logLevel')))
+  const [logBundle, setLogBundle] = useState(() => lsGet(lsSessionKey('logBundle')))
+  const [logKeyword, setLogKeyword] = useState(() => lsGet(lsSessionKey('logKeyword')))
   // An offset back from now ("5m"), which is what the CLI's --from takes — not a clock time.
-  const [logFrom, setLogFrom] = useState(() => lsGet('logFrom') || LOG_TIMES[0].value)
-  const [logLines, setLogLines] = useState(() => lsGet('logLines') || '50')
+  const [logFrom, setLogFrom] = useState(() => lsGet(lsSessionKey('logFrom')) || LOG_TIMES[0].value)
+  const [logLines, setLogLines] = useState(() => lsGet(lsSessionKey('logLines')) || '50')
   // Following ends only when someone ends it, so the panel holds the request that owns it.
   const followCtl = useRef(null)
   // A panel that goes away must not leave the device streaming: unmount ends any live follow.
@@ -219,9 +233,11 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   const [emuControl, setEmuControl] = useState(() => lsGet('emuControl') || EMU_CONTROLS[0].value)
   // The file transfer's two ends, remembered like the other panel choices: pushing the same file twice,
   // or pulling from the same directory again, is the common case. There is no direction state — the two
-  // buttons are the direction, which is what lets each field keep one meaning for good.
-  const [fileLocal, setFileLocal] = useState(() => lsGet('fileLocal'))
-  const [fileRemote, setFileRemote] = useState(() => lsGet('fileRemote'))
+  // buttons are the direction, which is what lets each field keep one meaning for good. Per session, because
+  // a relative local path belongs to the workspace it was typed in: carrying it across would resolve it
+  // against a root the user never chose.
+  const [fileLocal, setFileLocal] = useState(() => lsGet(lsSessionKey('fileLocal')))
+  const [fileRemote, setFileRemote] = useState(() => lsGet(lsSessionKey('fileRemote')))
   // Device paths that worked, newest first. devecocli cannot list the device, so this is what keeps a
   // sandbox path from having to be typed from memory every time.
   const [recentRemote, setRecentRemote] = useState(() => {
@@ -238,7 +254,26 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   // panel short. Collapsed until asked for, and the choice is remembered like the other panel switches.
   const [showDevOps, setShowDevOps] = useState(() => lsGet('showDevOps') === '1')
   const [shot, setShotState] = useState(lastShot)
+  // Its own flag, not the screenshot card's: two copy controls on screen must not light each other up. One per
+  // command row, for the same reason.
   const [copied, setCopied] = useState(false)
+  const [loginCopied, setLoginCopied] = useState(false)
+  const [logoutCopied, setLogoutCopied] = useState(false)
+  // The pending release of each command row's press flag. Held in a ref so a new press can cancel it: an
+  // instant release proved too quick to read, and a stale timer must never clear a fresh hold.
+  const loginHold = useRef(null)
+  const logoutHold = useRef(null)
+  /** The screenshot card's "已复制 ✓" hold: tracked so a second copy restarts it instead of being cut short. */
+  const copyHold = useRef(null)
+  const press = (set, timer) => {
+    if (timer.current) clearTimeout(timer.current)
+    timer.current = null
+    set(true)
+  }
+  const release = (set, timer) => {
+    if (timer.current) clearTimeout(timer.current)
+    timer.current = setTimeout(() => set(false), 200)
+  }
   const [lintReady, setLintReady] = useState(false)
   // Fix buttons stay locked until the matching check has shown what is in scope.
   const [fixReady, setFixReady] = useState({ changed: false, all: false })
@@ -436,19 +471,19 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
     lsSet(lsSessionKey('scanRoot'), scanRoot)
     lsSet('instance', instanceSel)
     lsSet('emuControl', emuControl)
-    lsSet('fileLocal', fileLocal)
-    lsSet('fileRemote', fileRemote)
+    lsSet(lsSessionKey('fileLocal'), fileLocal)
+    lsSet(lsSessionKey('fileRemote'), fileRemote)
     lsSetJson('recentRemote', recentRemote)
     lsSetJson('recentLocal', recentLocal)
     lsSet('showDevOps', showDevOps ? '1' : '0')
     // The entry module is stored where it is decided, not here: this effect runs on a project switch with
     // the previous project's module still in state, which would overwrite the incoming project's memory.
     lsSet('deployAction', deployAction)
-    lsSet('logLevel', logLevel)
-    lsSet('logBundle', logBundle)
-    lsSet('logKeyword', logKeyword)
-    lsSet('logFrom', logFrom)
-    lsSet('logLines', logLines)
+    lsSet(lsSessionKey('logLevel'), logLevel)
+    lsSet(lsSessionKey('logBundle'), logBundle)
+    lsSet(lsSessionKey('logKeyword'), logKeyword)
+    lsSet(lsSessionKey('logFrom'), logFrom)
+    lsSet(lsSessionKey('logLines'), logLines)
   }, [project, scanRoot, instanceSel, emuControl, fileLocal, fileRemote, recentRemote, recentLocal, showDevOps, deployAction, logLevel, logBundle, logKeyword, logFrom, logLines])
   // Fill the scan root from the session working directory as soon as it is known: it is an
   // optional field of the tab's scope, so on a fresh panel it can still be undefined while the
@@ -936,18 +971,43 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
     window.addEventListener('mousemove', move)
     window.addEventListener('mouseup', up)
   }
-  // Copy to clipboard: the button briefly shows a copied state as feedback.
-  const copyText = (text) => {
+  // Copy to clipboard: the control that was pressed briefly shows a copied state as feedback, which is why the
+  // flag is passed in rather than read from a shared one. If the async clipboard API is unavailable — a host
+  // that renders the panel in a frame without the permission, or an old browser — the selection-based path is
+  // tried before giving up: that one needs nothing but the user gesture this click already is.
+  const copyText = (text, set = setCopied) => {
     const done = () => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1800)
+      set(true)
+      if (copyHold.current) clearTimeout(copyHold.current)
+      copyHold.current = setTimeout(() => set(false), 1800)
+    }
+    const legacy = () => {
+      // The temporary field is removed on every path: a throwing select() or execCommand() must not leave one
+      // hidden node behind per attempt.
+      let ta
+      try {
+        ta = document.createElement('textarea')
+        ta.value = text
+        ta.setAttribute('readonly', '')
+        ta.style.position = 'fixed'
+        ta.style.top = '-1000px'
+        document.body.appendChild(ta)
+        ta.select()
+        const ok = document.execCommand('copy')
+        if (ok) done()
+        else pushLog('err', '复制失败(浏览器未授权剪贴板)')
+      } catch {
+        pushLog('err', '复制失败(浏览器不支持剪贴板 API)')
+      } finally {
+        if (ta && ta.parentNode) ta.parentNode.removeChild(ta)
+      }
     }
     try {
       navigator.clipboard.writeText(text)
         .then(done)
-        .catch(() => pushLog('err', '复制失败(浏览器未授权剪贴板)'))
+        .catch(legacy)
     } catch {
-      pushLog('err', '复制失败(浏览器不支持剪贴板 API)')
+      legacy()
     }
   }
 
@@ -1085,6 +1145,42 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
             onChange: (next) => pickCliChannel(next),
           }))) : null,
       mount.reason ? h('div', { style: { fontSize: 12, color: s.faint, marginTop: 4, lineHeight: 1.6 } }, mount.reason) : null,
+      // A third setting: the account that can write signing materials. The state is shown both ways round,
+      // while the button that changes it appears only when there is something to change.
+      tc && tc.devecoCliJs ? h('div', { key: 'cliAuth', style: { borderTop: `1px solid ${s.border}`, marginTop: 8, paddingTop: 8 } },
+        h('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 } },
+          h('span', { style: { flex: 1, fontSize: 14, whiteSpace: 'nowrap' } }, '华为开发者账号'),
+          // Plain text: the state itself, with no action beside it — signing in is a once-per-project errand
+          // that belongs in a terminal, so the lines below name the two commands instead of offering a button.
+          authHint(tc.signedIn) === null
+            ? h('span', { style: { fontSize: 13, color: s.faint } }, '状态未知')
+            : h('span', { style: { fontSize: 13, color: s.faint } }, authHint(tc.signedIn))),
+        // One line leads into the two command blocks below; how they are copied is explained at the rows.
+        h('div', { style: { fontSize: 12, color: s.faint, marginTop: 2, lineHeight: 1.6 } }, '如需自动签名,请先登录账号:'),
+        // One row per command, its label inside the block on the left — the shape a command block with its
+        // package tabs has — so both blocks span the column and read level with the line above. The copy icon
+        // stays a copy icon: grey is the resting state, the accent means the press, and it is let go a moment
+        // after the mouse comes up rather than instantly, which proved too quick to read. `copyText` gets a
+        // no-op setter because these rows show the press, not the copy, and the screenshot card's own flag must
+        // not light up from here.
+        h('div', { style: { ...codeBlock, marginTop: 4 } },
+          h('span', { style: codeLabel }, '登录'),
+          h('code', { style: codeBlockText }, 'devecocli auth login'),
+          h(Btn, {
+            ghost: true, icon: IC.copy, onClick: () => copyText('devecocli auth login', noop),
+            onMouseDown: () => press(setLoginCopied, loginHold), onMouseUp: () => release(setLoginCopied, loginHold), onMouseLeave: () => release(setLoginCopied, loginHold),
+            style: { padding: '4px 6px', ...(loginCopied ? { color: s.accent } : undefined) },
+            title: '复制这条命令,自行在终端执行',
+          })),
+        h('div', { style: { ...codeBlock, marginTop: 3 } },
+          h('span', { style: codeLabel }, '退出'),
+          h('code', { style: codeBlockText }, 'devecocli auth logout'),
+          h(Btn, {
+            ghost: true, icon: IC.copy, onClick: () => copyText('devecocli auth logout', noop),
+            onMouseDown: () => press(setLogoutCopied, logoutHold), onMouseUp: () => release(setLogoutCopied, logoutHold), onMouseLeave: () => release(setLogoutCopied, logoutHold),
+            style: { padding: '4px 6px', ...(logoutCopied ? { color: s.accent } : undefined) },
+            title: '复制这条命令,自行在终端执行',
+          }))) : null,
     ) : null))
 
   // devecocli version row: the installed version, and the check that reports which build the chosen
@@ -1349,7 +1445,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
         }, busy === 'file-send' ? '上传中…' : '上传到设备'),
         h(Btn, {
           secondary: true, disabled: busy !== '' || !targetDevice, onClick: () => { void runFileTransfer('recv') },
-          title: '把「设备路径」的文件复制到「本地路径」,本地路径留空则保存到工作区',
+          title: '把「设备路径」的文件复制到「本地路径」,本地路径留空则保存到工作区根目录',
         }, busy === 'file-recv' ? '下载中…' : '下载到本地')),
       // The screenshot closes the card: it is the thing you reach for once the device is doing what you
       // came for. Outlined and full width, so it never competes with the primary button above.

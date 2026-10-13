@@ -4,7 +4,7 @@
  * clicking through the panel could check them.
  */
 import { describe, it, expect } from 'vitest'
-import { deviceLabel, isRenderableComponent, keepScannedProject, mountSwitchTitle, pickDevice, pickModule, statusTone } from '../src/client/view-model.js'
+import { authHint, deviceLabel, isRenderableComponent, keepScannedProject, mountSwitchTitle, pickDevice, pickModule, statusTone } from '../src/client/view-model.js'
 
 describe('mount confirmation wording', () => {
   it('names the destination once, with the workbench build beside it', () => {
@@ -16,6 +16,17 @@ describe('mount confirmation wording', () => {
     // carries one: the shell has no version of its own to report.
     expect(mountSwitchTitle('better', '')).toBe('切换到 better-sidebar')
     expect(mountSwitchTitle('native', '0.25.0')).toBe('切换到 内置右侧栏')
+  })
+})
+
+describe('signing account state', () => {
+  it('names both states, and nothing at all when the state could not be read', () => {
+    // The settings row shows this on the right, beside the label that names the account. Both readings are
+    // named, because a label that only appears when something is wrong reads as an error; a state that could
+    // not be read (no CLI) is not a reading, so it draws nothing.
+    expect(authHint(false)).toBe('未登录')
+    expect(authHint(true)).toBe('已登录')
+    expect(authHint(null)).toBe(null)
   })
 })
 

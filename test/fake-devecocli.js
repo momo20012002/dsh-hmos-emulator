@@ -25,6 +25,8 @@
  *   DSH_FAKE_PNG             bytes written for `ui screenshot`
  *   DSH_FAKE_BUILD           stdout for `build` (with DSH_FAKE_BUILD_CODE as its exit code)
  *   DSH_FAKE_ARGV_LOG        file each invocation's argv is appended to (one JSON array per line)
+ *   DSH_FAKE_AUTH/_CODE      stdout and exit code for `auth status` (0 = signed in)
+ *   DSH_FAKE_SIGN/_CODE      stdout and exit code for `signature generate`
  */
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
@@ -68,6 +70,20 @@ if (group === 'emulator' && verb === 'list') out(process.env.DSH_FAKE_INSTANCES 
 // `--version` reports which build is installed, so an upgrade's dist-tag can be asserted: the plugin
 // reads this to decide the channel it follows.
 if (argv[0] === '--version') out(process.env.DSH_FAKE_VERSION || '1.3.0-stable')
+
+// `auth status` exits 0 while an account is signed in and non-zero when nobody is, which is the read the
+// panel and a failed `sign` both lean on: DSH_FAKE_AUTH_CODE drives both sides.
+if (group === 'auth' && verb === 'status') {
+  if (process.env.DSH_FAKE_AUTH) process.stdout.write(process.env.DSH_FAKE_AUTH)
+  process.exit(Number(process.env.DSH_FAKE_AUTH_CODE || '0'))
+}
+
+// `signature generate` succeeds by default; the failure it can produce is the one whose cause is not in its
+// own output (no signed-in account), which is what the plugin now answers.
+if (group === 'signature' && verb === 'generate') {
+  if (process.env.DSH_FAKE_SIGN) process.stdout.write(process.env.DSH_FAKE_SIGN)
+  process.exit(Number(process.env.DSH_FAKE_SIGN_CODE || '0'))
+}
 
 // System images back the pre-start check: an instance whose image is missing must not be started.
 if (group === 'emulator' && verb === 'image') out(process.env.DSH_FAKE_IMAGES || '[]')

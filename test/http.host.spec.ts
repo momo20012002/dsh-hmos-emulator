@@ -202,12 +202,36 @@ describe.skipIf(!CAN_SPAWN)('toolchain report cache', () => {
     const afterProbe = probes()
     expect(afterProbe).toBeGreaterThan(0)
     expect(first.devecoCliJs).toBe(FAKE_CLI)
+    // The same report carries the login state the panel shows beside the version, from the same cache.
+    expect(first.signedIn).toBe(true)
     // Two more reads ride the cache: the panel opens often, the answer barely changes.
     expect((await toolchain({})).devecoCliJs).toBe(FAKE_CLI)
     expect((await toolchain({})).devecoCliJs).toBe(FAKE_CLI)
     expect(probes()).toBe(afterProbe)
     await toolchain({ refresh: true })
     expect(probes()).toBe(afterProbe + 1)
+  })
+
+  it("reports a signed-out account from the verb's words, not its exit code", async () => {
+    // Measured on devecocli 1.3.4: `auth status` exits 0 even while it prints `Not logged in`, so the state
+    // has to be read from the text. This is the machine a failed `sign` and the panel hint are both about.
+    process.env.DSH_FAKE_AUTH = 'Not logged in\n'
+    try {
+      expect((await toolchain({ refresh: true })).signedIn).toBe(false)
+    } finally {
+      delete process.env.DSH_FAKE_AUTH
+    }
+  })
+
+  it('reports an account state it could not read as unknown, never as signed out', async () => {
+    // A run that failed outright (non-zero exit, spawn failure, or the timeout) never read the state, so the
+    // row must say "状态未知" and a failed `sign` must not blame the account.
+    process.env.DSH_FAKE_AUTH_CODE = '1'
+    try {
+      expect((await toolchain({ refresh: true })).signedIn).toBe(null)
+    } finally {
+      delete process.env.DSH_FAKE_AUTH_CODE
+    }
   })
 })
 

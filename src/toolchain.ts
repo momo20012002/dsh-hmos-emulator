@@ -1,6 +1,7 @@
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
+import { stripAnsi } from './parsers/devecocli.js'
 /**
  * Locating and running the external CLIs (devecocli, hdc): path probes, wrapper unwrapping,
  * command execution, plus the emulator/device readiness probes built on top of them.
@@ -267,7 +268,7 @@ export function throwIfAborted(signal?: AbortSignal): void {
  *   same way, terminating then escalating to SIGKILL after `graceMs`: a build that ignores the
  *   polite signal would keep holding the device. An already-aborted signal never spawns anything.
  */
-export function runCli(argv: string[], { cwd, timeoutMs = 120000, signal, graceMs = 2000 }: { cwd?: string; timeoutMs?: number; signal?: AbortSignal; graceMs?: number } = {}): Promise<{ code: number | null; timedOut: boolean; aborted: boolean; output: string }> {
+export function runCli(argv: string[], { cwd, timeoutMs = 120000, signal, graceMs = 2000, headChars = 0 }: { cwd?: string; timeoutMs?: number; signal?: AbortSignal; graceMs?: number; headChars?: number } = {}): Promise<{ code: number | null; timedOut: boolean; aborted: boolean; output: string }> {
   if (signal?.aborted) return Promise.resolve({ code: null, timedOut: false, aborted: true, output: CANCELLED })
   return new Promise((resolvePromise) => {
     let child
@@ -283,7 +284,17 @@ export function runCli(argv: string[], { cwd, timeoutMs = 120000, signal, graceM
       return
     }
     let out = ''
+    let kept = 0
     const append = (chunk) => {
+      // The default keeps the TAIL, because the line that explains a failure is at the end of a build log.
+      // A caller that needs the other end sets headChars: reading a device's log buffer from its first line
+      // is that case, and there the lines worth keeping are the first ones.
+      if (headChars > 0) {
+        if (kept >= headChars) return
+        out += String(chunk).slice(0, headChars - kept)
+        kept = out.length
+        return
+      }
       out += chunk
       if (out.length > OUTPUT_TAIL) out = out.slice(out.length - OUTPUT_TAIL)
     }
@@ -323,6 +334,22 @@ export function runCli(argv: string[], { cwd, timeoutMs = 120000, signal, graceM
       resolvePromise({ code, timedOut, aborted, output: tail.length === 0 ? (aborted ? CANCELLED : '(无输出)') : tail })
     })
   })
+}
+
+/**
+ * Whether an account is signed in, for the two places that have to say so: the panel's toolchain report and
+ * a failed `sign`.
+ *
+ * Measured on devecocli 1.3.4: `auth status` exits 0 **whether or not** anyone is signed in — it prints
+ * `Not logged in` and still reports success — so an exit-code test would call every machine signed in. The
+ * answer therefore comes from its words, and a run that failed outright is reported as unknown rather than
+ * as signed out.
+ */
+export async function authStatus(cli: string, signal?: AbortSignal): Promise<{ known: boolean; signedIn: boolean; code: number | null; output: string }> {
+  const r = await runCli([process.execPath, cli, 'auth', 'status'], { timeoutMs: 60000, ...(signal ? { signal } : {}) })
+  const output = stripAnsi(r.output)
+  if (r.code !== 0) return { known: false, signedIn: false, code: r.code, output }
+  return { known: true, signedIn: !/not logged in/i.test(output), code: r.code, output }
 }
 
 /**
@@ -384,10 +411,21 @@ export function runCliStream(argv: string[], { cwd, timeoutMs = 120000, onChunk,
 
 // ── Local filesystem (project picker) ───────────────────────────────────
 
-/** Parse a devecocli --format json array; [] on failure. */
+/**
+ * Parse a devecocli `--format json` array out of the chatter it wraps it in; [] on failure.
+ *
+ * The CLI appends its own notices to most commands (measured on 1.3.4: `New version 1.3.5 available` rides
+ * along after the JSON), which makes the whole output unparseable — the array therefore has to be sliced out
+ * rather than parsed from the ends of the string. `api['emu.list']` has always done this; the helpers built
+ * on this one did not, so a real device's instances parsed to [].
+ */
 export function parseJsonArray(output) {
+  const text = stripAnsi(String(output ?? ''))
+  const start = text.indexOf('[')
+  const end = text.lastIndexOf(']')
+  if (start < 0 || end <= start) return []
   try {
-    const arr = JSON.parse(output)
+    const arr = JSON.parse(text.slice(start, end + 1))
     return Array.isArray(arr) ? arr : []
   } catch {
     return []

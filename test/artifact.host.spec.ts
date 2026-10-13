@@ -65,25 +65,26 @@ describe('emu_ui batch surface', () => {
     // would; `hmos_setup` is separate precisely because those jobs are rare, and a capability the model
     // cannot see is one it cannot ask for. Its description opens with the rule that gates it — call only
     // when the user asks — which is not a saving but a safeguard: those verbs write to disk, so an
-    // unasked scaffold or instance costs a cleanup round, not just a call. Raised again to 13 300 for the
-    // three build flags the CLI has and nothing here reached — `--build-mode release` (the difference
-    // between a debug artifact and a shipped one), `--ability` (which ability a launch starts) and
-    // `--uninstall` (the fix for an install that refuses to replace) — plus the linter's own `--fix`.
-    // Measured: total 13 203, emu 1 317, hmos_lint 1 297, emu_ui 4 866, hmos_setup 1 538, deploy 1 570.
+    // unasked scaffold or instance costs a cleanup round, not just a call. Raised again to 13 450 for
+    // `hmos_log`'s `since:"earliest"`: `--tail` only ever means the newest N, so reading a device's buffer
+    // from its first line was reachable only by guessing a window wide enough and retrying — one sentence
+    // and a two-word parameter replace that guesswork.
+    // Measured: total rose 13 203 → 13 387 with this read (only `hmos_log` grew, 913 → 1 097), while
+    // emu stays 1 317, hmos_lint 1 297, emu_ui 4 866, hmos_setup 1 538 and deploy 1 570.
     const total = mountTools()
       .reduce((sum, def) => sum + JSON.stringify({ name: def.name, description: def.description, parameters: def.parameters }).length, 0)
-    expect(total).toBeLessThan(13300)
+    expect(total).toBeLessThan(13450)
   })
 
   it('keeps every tool inside its own share of the budget', () => {
     // One composite tool carries the whole action surface, so it gets the only large share; every
     // other tool is a single-purpose wrapper and must stay small. Caps sit just above the measured
-    // cost (emu_ui 4 866, hmos_log 913, hmos_deploy 1 570, hmos_docs 771, hmos_lint 1 297, emu 1 317,
+    // cost (emu_ui 4 866, hmos_log 1 097, hmos_deploy 1 570, hmos_docs 771, hmos_lint 1 297, emu 1 317,
     // hmos_device 904, hmos_setup 1 538 — the middle three rose with the control group, the build options
     // and the device verbs, hmos_lint with the other two checks, emu_ui/emu with windows and fold/scene,
-    // and hmos_setup with the once-per-project jobs, as the budget test above explains), so a message
-    // that grows them has to be a deliberate edit here.
-    const caps = { emu_ui: 4900, hmos_log: 1000, hmos_deploy: 1650, hmos_device: 1000, hmos_docs: 1000, hmos_lint: 1400, emu: 1350, hmos_setup: 1650 }
+    // hmos_setup with the once-per-project jobs, and hmos_log with the buffer-start read, as the budget
+    // test above explains), so a message that grows them has to be a deliberate edit here.
+    const caps = { emu_ui: 4900, hmos_log: 1120, hmos_deploy: 1650, hmos_device: 1000, hmos_docs: 1000, hmos_lint: 1400, emu: 1350, hmos_setup: 1650 }
     const over = mountTools()
       .map((def) => ({ name: def.name, cost: JSON.stringify({ name: def.name, description: def.description, parameters: def.parameters }).length }))
       .filter((tool) => tool.cost >= caps[tool.name])

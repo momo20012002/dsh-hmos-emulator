@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { resolveDevecoCli, runCli, throwIfAborted } from '../toolchain.js'
+import { authStatus, resolveDevecoCli, runCli, throwIfAborted } from '../toolchain.js'
 import { projectRootOf } from '../workspace.js'
 import { stripAnsi } from '../parsers/devecocli.js'
 import { tailText } from '../text.js'
@@ -21,7 +21,7 @@ import type { ToolDeps } from './deps.js'
  */
 
 /** The one-off jobs this tool runs. */
-const SETUP_ACTIONS = ['auth', 'app', 'sign', 'create-instance', 'delete-instance']
+const SETUP_ACTIONS = ['app', 'sign', 'create-instance', 'delete-instance']
 
 /** Trimmed string, or empty. */
 const asText = (value: unknown): string => (typeof value === 'string' && value.trim() ? value.trim() : '')
@@ -34,14 +34,14 @@ function asBool(value: unknown): boolean {
 export function makeHmosSetup(_deps: ToolDeps) {
   return {
       name: 'hmos_setup',
-      description: 'Call this only when the user explicitly asks for one of these jobs — never on your own initiative, and never as a guess at what a project seems to need. One-off setup, outside the build loop: app scaffolds a new HarmonyOS project, sign generates signing materials into one, and create-instance / delete-instance manage local emulator instances. System images are not handled here — they are hundreds of megabytes, so ask the user to fetch the one an instance needs.',
+      description: 'Call this only when the user explicitly asks for one of these jobs — never on your own initiative, and never as a guess at what a project seems to need. app: create a project. sign: sign an existing project. create-instance / delete-instance: add or remove an emulator instance. System images are not handled here: they are hundreds of megabytes, so ask the user to fetch one.',
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
             enum: SETUP_ACTIONS,
-            description: 'auth | app | sign | create-instance | delete-instance',
+            description: 'app | sign | create-instance | delete-instance',
           },
           appName: { type: 'string', description: 'app: application name for the new project' },
           projectPath: PROJECT_ROOT,
@@ -66,18 +66,6 @@ export function makeHmosSetup(_deps: ToolDeps) {
         const osVersion = asText(args?.osVersion)
         const name = asText(args?.name)
         const force = asBool(args?.force)
-
-        if (action === 'auth') {
-          // Read-only on purpose: `login` wants a browser and a password, so that stays the user's errand.
-          // Whether anyone is signed in is exactly what a failed `sign` leaves a caller guessing about.
-          const r = await runCli([process.execPath, cli, 'auth', 'status'], { timeoutMs: 60000, signal: exec?.signal })
-          const out = stripAnsi(r.output)
-          return {
-            ok: r.code === 0, action, signedIn: r.code === 0, code: r.code,
-            tail: tailText(out, 12),
-            ...(r.code === 0 ? {} : { error: tailText(out, 6) }),
-          }
-        }
 
         if (action === 'app') {
           const appName = asText(args?.appName)
@@ -107,10 +95,24 @@ export function makeHmosSetup(_deps: ToolDeps) {
           // The CLI has no --project for this verb; it signs whatever project it is standing in.
           const r = await runCli([process.execPath, cli, 'signature', 'generate', ...(force ? ['--force'] : [])], { cwd: project, timeoutMs: 300000, signal: exec?.signal })
           const out = stripAnsi(r.output)
+          if (r.code === 0) {
+            return {
+              ok: true, action, projectPath: project, code: r.code, timedOut: r.timedOut === true,
+              durationMs: Date.now() - started, tail: tailText(out, 8),
+            }
+          }
+          // Signing needs a signed-in account, and the CLI's own words do not say so: one extra read turns
+          // "signature failed" into the sentence the caller is about to guess at.
+          const who = await authStatus(cli, exec?.signal)
           return {
-            ok: r.code === 0, action, projectPath: project, code: r.code, timedOut: r.timedOut === true,
-            durationMs: Date.now() - started, tail: tailText(out, r.code === 0 ? 8 : 30),
-            ...(r.code === 0 ? {} : { error: tailText(out, 8) }),
+            ok: false, action, projectPath: project, code: r.code, timedOut: r.timedOut === true,
+            durationMs: Date.now() - started, tail: tailText(out, 30), signedIn: who.known ? who.signedIn : null,
+            // Only a reading that succeeded may blame the account; a failed read leaves the cause open.
+            error: !who.known
+              ? `未能确认登录状态(auth status 读取失败),签名未完成。CLI 输出:${tailText(out, 6)}`
+              : who.signedIn
+                ? tailText(out, 8)
+                : `未登录华为开发者账号,签名无法完成。请在终端执行 devecocli auth login 后重试。CLI 输出:${tailText(out, 6)}`,
           }
         }
 

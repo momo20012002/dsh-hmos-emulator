@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { deployPhase, pageMissingHint, parseBuildErrors, stripAnsi } from '../parsers/devecocli.js'
 import { firstRunningSerial, resolveDevecoCli, runCli, throwIfAborted } from '../toolchain.js'
-import { PROJECT_MARK, hapPathOf, projectRootOf, readModules, relativeTo, sessionWorkspace } from '../workspace.js'
+import { PROJECT_MARK, hapPathOf, moduleName, projectRootOf, readModules, relativeTo, sessionWorkspace } from '../workspace.js'
 import { tailText } from '../text.js'
 import { TOOL_OUT_SCHEMA, shotFields, toolRender } from '../shots.js'
 import { PROJECT_ROOT } from './schema.js'
@@ -105,7 +105,9 @@ export function makeHmosDeploy(deps: ToolDeps) {
         // module with "模块 X 不属于该工程(可选:无)" was a misleading answer to a readable request:
         // pass it through to hvigor instead, and say the list was unreadable.
         const modulesUnreadable = modules.length === 0
-        const unknown = modulesUnreadable ? [] : askedList.filter((m) => !modules.includes(m))
+        // `module@target` is the form the CLI documents for targeting a build, so the comparison uses the
+        // module it names and the full spec is what travels to the CLI.
+        const unknown = modulesUnreadable ? [] : askedList.filter((m) => !modules.includes(moduleName(m)))
         if (unknown.length) {
           return { ok: false, error: `模块“${unknown.join('、')}”不属于该工程(可选:${modules.join('、')})` }
         }
@@ -183,7 +185,9 @@ export function makeHmosDeploy(deps: ToolDeps) {
           errorCount,
           warnCount,
         }
-        const hap = chosen ? hapPathOf(projectPath, chosen) : null
+        // The spec may carry a target (`entry@default`), which is not a directory: the hap is looked up under
+        // the module it names.
+        const hap = chosen ? hapPathOf(projectPath, moduleName(chosen)) : null
         // Only a build that succeeded produced the artifact this call names. A failure leaves the
         // previous build's hap in the standard output directory, so reporting that path would read as
         // "this call produced that file".

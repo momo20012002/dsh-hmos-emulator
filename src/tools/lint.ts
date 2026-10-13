@@ -128,11 +128,18 @@ export function makeHmosLint(_deps: ToolDeps) {
         const suggestions = bySeverity('Suggestion')
         const outcome = lintOutcome(summary, full ? 'all' : 'changed', checkedFiles ? checkedFiles.length : null)
         const cap = 40
+        // `ok` speaks about findings, and this CLI also uses a nonzero exit code to report them — so the two
+        // cannot be folded together. A run that produced no verdict at all (the timeout, or a nonzero exit with
+        // nothing parsed) is stated separately, instead of being read as a clean check.
+        const noVerdict = r.timedOut === true || (r.code !== 0 && findings.length === 0)
         return {
-          ok: errors.length === 0,
+          ok: errors.length === 0 && !noVerdict,
           kind: 'lint',
           code: r.code,
           timedOut: r.timedOut,
+          ...(noVerdict
+            ? { error: `代码检查未能完成${r.timedOut ? '(超时)' : `(退出码 ${r.code ?? '未知'})`}:${tailText(out, 8)}` }
+            : {}),
           projectPath: project,
           scope: full ? 'all' : 'changed',
           // What `changed` actually covered, so a caller can tell "checked and clean" from "never
