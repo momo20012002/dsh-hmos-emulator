@@ -1,6 +1,6 @@
 {
   "name": "dsh-hmos-emulator",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "DSH 侧边栏插件：启动鸿蒙模拟器，完成 HarmonyOS 应用的构建与部署，并提供日志、截图与代码检查。",
   "type": "module",
   "main": "./lib/index.js",
