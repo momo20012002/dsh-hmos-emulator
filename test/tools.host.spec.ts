@@ -779,7 +779,10 @@ describe.skipIf(!CAN_SPAWN)('hmos_log', () => {
     // `--tail` means the newest N of whatever window it is given, so the start of the buffer is only
     // reachable by asking for no window at all and keeping the head of the answer. The filler is what proves
     // the tail was not what came back.
-    const filler = Array.from({ length: 4000 }, (_, i) => `10-13 00:00:0${i % 10}.000     1     1 I A/B: filler line ${i} ................`)
+    // Enough lines that the head cannot be confused with the tail, and few enough that the fixture stays a
+    // small environment variable: Linux caps one variable at 128 KB, and a larger filler made `spawn` fail
+    // with E2BIG there while passing on Windows.
+    const filler = Array.from({ length: 400 }, (_, i) => `10-13 00:00:0${i % 10}.000     1     1 I A/B: filler line ${i} ................`)
     await withFakes({
       DSH_FAKE_ARGV_LOG: join(dir, 'log-early-argv.log'),
       DSH_FAKE_INSTANCES: '[{"name":"Pura 90","status":"running","serial":"127.0.0.1:5555"}]',
@@ -794,7 +797,7 @@ describe.skipIf(!CAN_SPAWN)('hmos_log', () => {
       expect(r.lines).toHaveLength(2)
       expect(String(r.lines[0].message)).toContain('Zeroth log of type: init')
       expect(String(r.lines[1].message)).toContain('filler line 0')
-      expect(JSON.stringify(r.lines)).not.toContain('filler line 3999')
+      expect(JSON.stringify(r.lines)).not.toContain('filler line 399')
       // No `--tail` and no `--from`: the CLI is asked for the buffer itself.
       const argvLines = readFileSync(process.env.DSH_FAKE_ARGV_LOG, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
       expect(argvLines[argvLines.length - 1]).toEqual(['log', '--device', '127.0.0.1:5555'])

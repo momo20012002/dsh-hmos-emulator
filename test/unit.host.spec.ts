@@ -855,7 +855,10 @@ describe('cliFromWrapper', () => {
     rmSync(npmRoot, { recursive: true, force: true })
   })
 
-  it('reads the launcher\'s own target, which no package layout can describe', () => {
+  // Windows only: the fixture is a `.cmd`/`.ps1` launcher whose text spells the target with backslashes
+  // (`%dp0%\store\@deveco\deveco-cli\cli.js`). On POSIX a backslash is an ordinary file-name character, so
+  // that launcher cannot name anything that exists — that platform uses the `bin/devecocli` symlink instead.
+  it.skipIf(process.platform !== 'win32')('reads the launcher\'s own target, which no package layout can describe', () => {
     // pnpm and friends install the package outside `<binDir>/node_modules`, and the launcher is the
     // only thing that knows where it went — so its target is read before any directory is guessed.
     const binDir = mkdtempSync(join(tmpdir(), 'dsh-cli-shim-'))
