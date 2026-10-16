@@ -282,9 +282,6 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   // for a move and shows what happened, including a refusal that leaves the request unchanged.
   const [mount, setMount] = useState(() => mountStatus())
   const [showMount, setShowMount] = useState(false)
-  // The half the user picked, waiting for the shell's dialog: moving the panel takes its tab away from
-  // this host, so the switch is a two-step action, not a one-click toggle. Empty while nothing waits.
-  const [pendingMount, setPendingMount] = useState('')
   // Which channel the 更新 button installs from. '' follows the installed build; an explicit choice
   // is a set-once preference, so it sits behind the gear next to the mount switch.
   const [channelChoice, setChannelChoice] = useState(() => channelStore.getSnapshot())
@@ -316,12 +313,6 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
    * Carry out the switch the confirmation was asked about: the dialog's 切换 and the banner's action
    * both end here.
    */
-  const confirmMount = () => {
-    const next = pendingMount
-    setPendingMount('')
-    setShowMount(false)
-    if (next !== '') pickMount(next)
-  }
   /**
    * Ask before moving the panel, or answer why the pick cannot be honoured.
    *
@@ -340,7 +331,6 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
       pickMount(next)
       return
     }
-    if (hostDialog() !== null) { setPendingMount(next); return }
     notices.say({
       text: mountSwitchTitle(next, betterBuild(ctx)),
       action: { prefix: ACTION_PREFIX, label: '切换' },
@@ -1067,7 +1057,6 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   // ── Render ──────────────────────────────────────────────────────────
   const nodes = []
   // The shell's dialog, read once per render: only a mount confirmation needs it.
-  const dialog = hostDialog()
   // Header
   nodes.push(h('div', { key: 'headWrap', style: { position: 'relative' } },
     h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 } },
@@ -1114,19 +1103,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
           // one, and its banner asks the same question when it does not — see `askMount`.
           onChange: (next) => { askMount(next) },
         })),
-      // The confirmation, in the shell's own layer: portaled to the body, centered, with the shell's own
-      // scrim and Escape handling. A card nested in this popover would be a box inside a box, and the row
-      // below already says how the panel comes back, so the body carries only what is being accepted.
-      pendingMount === '' || dialog === null ? null : h(dialog.Modal, {
-        key: 'mountConfirm',
-        open: true,
-        title: mountSwitchTitle(pendingMount, betterBuild(ctx)),
-        closeLabel: '关闭',
-        onClose: () => setPendingMount(''),
-        footer: h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
-          h(Btn, { ghost: true, style: { padding: '4px 10px' }, onClick: () => setPendingMount('') }, '取消'),
-          h(Btn, { primary: true, style: { padding: '4px 12px' }, onClick: confirmMount, title: '确认切换挂载方式并重挂面板' }, '切换')),
-      }, h('div', { style: { fontSize: 12, lineHeight: 1.7 } }, mountSwitchNote())),
+
       h('div', { style: { fontSize: 12, color: s.faint, marginTop: 2, lineHeight: 1.6 } }, mountDetail(mount)),
       // A second setting, separated so the two do not read as one block: which channel the panel's
       // 更新 button takes devecocli from. Shown only while the CLI is there to upgrade.

@@ -624,3 +624,17 @@ describe('client logger', () => {
     expect(source).toMatch(/onMouseDown:[^,}]{0,60}setLogoutCopied/)
   })
 })
+
+it('a host without sidebarRight is not ready: the switch is refused instead of opening nothing', () => {
+  // The bug this covers: `probe` used to call a host ready on `slots` + `sidebarRightTabs` alone, while
+  // the open goes through `sidebarRight.openTab`. A page that had the first two and not the third reported
+  // "available", accepted the switch, closed the old tab and opened nothing.
+  const { ctx } = fakeClientCtx({ native: true, better: true })
+  // fakeClientCtx installs the native open face; drop it to model a host that cannot open a tab.
+  const original = ctx.get
+  ctx.get = (name: string) => (name === 'sidebarRight' ? undefined : original.call(ctx, name))
+  const result = switchMount(ctx, 'native')
+  expect(result.ok).toBe(false)
+  expect(result.reason).toContain('内置右侧栏不可用')
+  expect(mountStatus().nativeReady).toBe(false)
+})

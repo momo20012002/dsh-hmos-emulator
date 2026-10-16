@@ -42,6 +42,8 @@ export interface HostServices {
   readonly slots: boolean
   readonly tabs: boolean
   readonly better: boolean
+  /** Whether ctx.sidebarRight.openTab is live: the one service that actually opens a native tab. */
+  readonly nativeOpen: boolean
 }
 
 /** The panel and its glyph, supplied by the entry half. */
@@ -96,7 +98,7 @@ const BETTER_ID = 'hmos:emulator'
 
 let active: ActiveMount | undefined
 let mountView: MountView | undefined
-let status: MountStatus = { requested: 'native', effective: 'none', nativeReady: false, betterReady: false, services: { slots: false, tabs: false, better: false }, reason: '' }
+let status: MountStatus = { requested: 'native', effective: 'none', nativeReady: false, betterReady: false, services: { slots: false, tabs: false, better: false, nativeOpen: false }, reason: '' }
 const listeners = new Set<() => void>()
 /** The service watchers, armed once per mount context; see {@link watchMissingHosts}. */
 let hostWatchers: any[] | undefined
@@ -269,9 +271,12 @@ function probe(ctx: Ctx): { nativeReady: boolean; betterReady: boolean; services
     slots: slots !== undefined,
     tabs: typeof tabs?.register === 'function',
     better: typeof better?.registerTab === 'function',
+    nativeOpen: typeof ctx.get('sidebarRight')?.openTab === 'function',
   }
   return {
-    nativeReady: services.slots && services.tabs,
+    // openTab is on a third service, sidebarRight: without it the tab type registers and no tab ever
+    // opens, which looked exactly like a switch that did nothing. A host that cannot open is not ready.
+    nativeReady: services.slots && services.tabs && services.nativeOpen,
     betterReady: services.better,
     services,
   }
