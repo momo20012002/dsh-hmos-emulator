@@ -39,20 +39,6 @@ export function statusTone(status: unknown): { tone: 'ok' | 'danger'; label: str
 }
 
 /**
- * Whether a value off the shell's shared module table can be rendered as a component.
- *
- * React components are not all functions: `forwardRef` and `memo` return objects carrying a `$$typeof`
- * tag, and the shell's own atoms are wrapped that way — its `Button` is a `forwardRef`, so a
- * `typeof value === 'function'` test rejects a component that renders perfectly well.
- * @param value - the export to test.
- * @returns whether React would accept it as an element type.
- */
-export function isRenderableComponent(value: unknown): boolean {
-  if (typeof value === 'function') return true
-  return typeof value === 'object' && value !== null && '$$typeof' in value
-}
-
-/**
  * What the switch's confirmation says it is switching to.
  *
  * The destination is named once, and the workbench carries the build that answered — the reader can see

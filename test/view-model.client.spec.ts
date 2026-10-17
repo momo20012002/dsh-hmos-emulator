@@ -4,7 +4,7 @@
  * clicking through the panel could check them.
  */
 import { describe, it, expect } from 'vitest'
-import { authHint, deviceLabel, isRenderableComponent, keepScannedProject, mountSwitchTitle, pickDevice, pickModule, statusTone } from '../src/client/view-model.js'
+import { authHint, deviceLabel, keepScannedProject, mountSwitchTitle, pickDevice, pickModule, statusTone } from '../src/client/view-model.js'
 
 describe('mount confirmation wording', () => {
   it('names the destination once, with the workbench build beside it', () => {
@@ -27,23 +27,6 @@ describe('signing account state', () => {
     expect(authHint(false)).toBe('未登录')
     expect(authHint(true)).toBe('已登录')
     expect(authHint(null)).toBe(null)
-  })
-})
-
-describe('host component shapes', () => {
-  it('accepts every shape React renders, not just functions', () => {
-    // The shell's own `Button` is a `forwardRef`, i.e. an object: a function-only test rejects a
-    // component that renders perfectly well, which is how the mount confirmation once fell back to its
-    // inline form on every host while the dialog was in fact available.
-    expect(isRenderableComponent(function Component() { return null })).toBe(true)
-    expect(isRenderableComponent(() => null)).toBe(true)
-    expect(isRenderableComponent({ $$typeof: Symbol.for('react.forward_ref') })).toBe(true)
-    expect(isRenderableComponent({ $$typeof: Symbol.for('react.memo') })).toBe(true)
-    // Anything else is not a component, and must leave the caller on its fallback.
-    expect(isRenderableComponent(undefined)).toBe(false)
-    expect(isRenderableComponent(null)).toBe(false)
-    expect(isRenderableComponent('Modal')).toBe(false)
-    expect(isRenderableComponent({})).toBe(false)
   })
 })
 

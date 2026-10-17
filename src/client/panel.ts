@@ -6,7 +6,7 @@ import { IC } from './icons.js'
 import { LINT_TITLES, ansiRuns, cleanCliLine, exitCodeOf, fmtDur, lintStatusLine, shortPath } from './format.js'
 import { notices, ACTION_PREFIX } from './notice.js'
 import { preferenceStore } from './host-store.js'
-import { authHint, deviceLabel, isRenderableComponent, keepScannedProject, mountSwitchTitle, pickDevice, pickModule, statusTone } from './view-model.js'
+import { authHint, deviceLabel, keepScannedProject, mountSwitchTitle, pickDevice, pickModule, statusTone } from './view-model.js'
 export const { createElement: h, useEffect, useRef, useState } = require('react')
 
 /**
@@ -108,29 +108,6 @@ const LOG_TIMES = [
   { value: '30m', label: '30 分钟前' },
   { value: '60m', label: '1 小时前' },
 ]
-
-/** The shell's dialog, as this panel uses it. */
-interface HostDialog {
-  readonly Modal: (props: any) => unknown
-}
-
-/**
- * Resolve the shell's dialog, lazily and never fatally.
- *
- * The panel loads on hosts that publish none of the shared primitives — the same rule the notice
- * banner follows — and the dialog is only needed once a switch is asked for. A confirmation belongs to
- * the shell's layer rather than this panel's chrome, so it takes the shell's own dialog; the buttons
- * inside it are this panel's own, which is one export less to depend on.
- * @returns the dialog, or null when this host does not publish one.
- */
-function hostDialog(): HostDialog | null {
-  try {
-    const primitives = require('@deepseek-ai/dsh-client-ui-primitives') as Partial<HostDialog> | undefined
-    return isRenderableComponent(primitives?.Modal) ? primitives as HostDialog : null
-  } catch {
-    return null
-  }
-}
 
 /**
  * The build of the workbench this page publishes, or '' when it reports none.
@@ -300,7 +277,7 @@ export function Panel(props: { scope?: { sessionId?: string; cwd?: string }; ctx
   useEffect(() => {
     const svc = mount.services
     const build = betterBuild(ctx)
-    pushLog('info', `挂载探测:slots=${svc.slots ? '有' : '无'} sidebarRightTabs=${svc.tabs ? '有' : '无'} betterSidebar=${svc.better ? `有${build === '' ? '' : `@${build}`}` : '无'} 确认对话框=${hostDialog() === null ? '无' : '有'}`)
+    pushLog('info', `挂载探测:slots=${svc.slots ? '有' : '无'} sidebarRightTabs=${svc.tabs ? '有' : '无'} betterSidebar=${svc.better ? `有${build === '' ? '' : `@${build}`}` : '无'}`)
   }, [])
   const pickMount = (mode) => {
     const result = switchMount(ctx, mode)
