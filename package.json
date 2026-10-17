@@ -1,6 +1,6 @@
 {
   "name": "dsh-hmos-emulator",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "DSH 侧边栏标签页：该面板提供鸿蒙模拟器管理、HarmonyOS 应用构建与部署，以及设备日志、设备截图与代码检查结果。同时向 AI 提供 8 个鸿蒙调试工具。",
   "type": "module",
   "main": "./lib/index.js",
