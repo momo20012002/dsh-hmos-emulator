@@ -52,6 +52,11 @@ await build({
   footer: { js: clientFooter },
   sourcemap: false,
   logLevel: 'warning',
+  // The entry writes `module.exports = { apply }` on purpose: it is a CommonJS module for the
+  // loader above, and the banner supplies the `module` it writes to. esbuild sees the enclosing
+  // package as ESM and warns that such a `module` would be a global; here it is the banner's own
+  // binding in the factory scope, so the warning is expected and the output is correct.
+  logOverride: { 'commonjs-variable-in-esm': 'silent' },
 })
 
 console.log('build ok -> lib/index.js, lib/client.js')
