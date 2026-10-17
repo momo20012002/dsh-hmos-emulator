@@ -2,5 +2,5 @@ url: https://github.com/momo20012002/dsh-hmos-emulator
 name: momo20012002/dsh-hmos-emulator
 category: ui
 description:
-  en: 'A DSH sidebar tab that runs the HarmonyOS emulator and builds, installs and deploys the selected HarmonyOS project to the target device.'
-  zh: 'DSH 侧边栏标签页：启动鸿蒙模拟器，将选定的 HarmonyOS 工程构建、安装并部署到目标设备。'
+  en: 'A DSH sidebar tab: the panel covers HarmonyOS emulator management, HarmonyOS app build and deployment, and device logs, screenshots and code check results. It also gives the AI eight HarmonyOS debugging tools.'
+  zh: 'DSH 侧边栏标签页：该面板提供鸿蒙模拟器管理、HarmonyOS 应用构建与部署，以及设备日志、设备截图与代码检查结果。同时向 AI 提供 8 个鸿蒙调试工具。'
